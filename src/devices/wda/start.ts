@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -87,7 +88,14 @@ async function releaseDeviceLock(): Promise<void> {
 await acquireDeviceLock();
 
 const require = createRequire(import.meta.url);
-const factoryPath = path.join(driverPath, 'build/lib/device-connections-factory.js');
+// The driver moved this module from build/lib/ to build/lib/device/ between
+// xcuitest 7 (which the repo's install script pins) and 12 (which Appium 3
+// requires). Resolve whichever layout is installed.
+const factoryPath = [
+    path.join(driverPath, 'build/lib/device/device-connections-factory.js'),
+    path.join(driverPath, 'build/lib/device-connections-factory.js'),
+].find((candidate) => existsSync(candidate))
+    ?? path.join(driverPath, 'build/lib/device/device-connections-factory.js');
 interface DeviceConnections {
     requestConnection(udid: string, localPort: number, options: {
         usePortForwarding: boolean;
@@ -99,9 +107,24 @@ interface IosUtilities {
     getConnectedDevices(): Promise<string[]>;
 }
 
-const { DEVICE_CONNECTIONS_FACTORY: deviceConnections } = require(factoryPath) as {
-    DEVICE_CONNECTIONS_FACTORY: DeviceConnections;
+// xcuitest 7 exported a process-wide singleton (DEVICE_CONNECTIONS_FACTORY);
+// 12 exports the class instead. Each supervisor owns its own device's port
+// forwards, so a private instance is equivalent here.
+const factoryModule = require(factoryPath) as {
+    DEVICE_CONNECTIONS_FACTORY?: DeviceConnections;
+    DeviceConnectionsFactory?: new (log?: unknown) => DeviceConnections;
 };
+const deviceConnections: DeviceConnections = factoryModule.DEVICE_CONNECTIONS_FACTORY
+    ?? (() => {
+        const Factory = factoryModule.DeviceConnectionsFactory;
+        if (!Factory) throw new Error(`No device connections factory export in ${factoryPath}`);
+        // 12.x takes an AppiumLogger; the driver ships one. Port-forward
+        // bookkeeping is static inside the class, so a private instance still
+        // coordinates local ports with anything else in this process.
+        const { logger } = require(path.join(driverPath, 'node_modules/@appium/support'))
+            ?? require('@appium/support');
+        return new Factory(logger.getLogger('wda-service'));
+    })();
 const { utilities } = require('appium-ios-device') as { utilities: IosUtilities };
 
 const args = [

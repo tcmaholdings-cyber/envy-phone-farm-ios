@@ -20,6 +20,7 @@ import type {
 import { type RemoteAction } from '../devices/wda-remote.js';
 import { requestWdaService } from '../devices/wda-service-client.js';
 import type { DeviceConnectionStatus } from '../devices/connection-manager.js';
+import { brandHtml, brandingFromEnv, footerHtml, logoContentType, type Branding } from '../branding.js';
 import type { AuthProvider, PluginNavLink } from '../plugin.js';
 import type { PluginRegistry } from '../registry.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming } from '../types.js';
@@ -73,17 +74,15 @@ function escapeHtml(value: unknown): string {
     })[character] ?? character);
 }
 
-// Shown at the foot of every dashboard page. Override the link with
-// PHONE_FARM_BRAND_URL; the text is fixed.
-const FOOTER_HTML = `Built by <a href="${escapeHtml(process.env.PHONE_FARM_BRAND_URL ?? 'https://agniverse.co')}" target="_blank" rel="noopener">Agniverse</a>, with love and curry &#10084;&#65039;`;
-
-function page(title: string, body: string, logoutPath?: string, navLinks: readonly PluginNavLink[] = []): string {
+// Brand name, credit, logo and footer come from the environment (src/branding.ts)
+// so a licensee can white-label the dashboard without forking.
+function page(title: string, body: string, logoutPath: string | undefined, navLinks: readonly PluginNavLink[], branding: Branding, footer: string): string {
     const logout = logoutPath ? `<a href="${escapeHtml(logoutPath)}" style="float:right;margin-right:0">Log out</a>` : '';
     const extra = navLinks.map((link) => `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join('');
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(title)}</title><style>
+<title>${escapeHtml(title)} · ${escapeHtml(branding.title)}</title><style>
 body{font:15px system-ui,sans-serif;margin:0;background:#f6f7f9;color:#17202a}nav{padding:16px 24px;background:#111827;color:white}nav a{color:white;margin-right:18px}main{max-width:1100px;margin:24px auto;padding:0 20px}.card{background:white;border:1px solid #dde2e8;border-radius:10px;padding:18px;margin:14px 0}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #e5e7eb}code{font-size:12px}.muted{color:#64748b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}button,.button{background:#2563eb;color:white;border:0;border-radius:6px;padding:8px 12px;text-decoration:none;cursor:pointer}input,select,textarea{padding:8px;border:1px solid #cbd5e1;border-radius:6px}</style></head>
-<body><nav><a href="/">Devices</a><a href="/tasks">Tasks</a><a href="/docs">API</a>${extra}${logout}</nav><main>${body}</main><footer style="max-width:1100px;margin:24px auto;padding:16px 20px;color:#94a3b8;font-size:12px">${FOOTER_HTML}</footer></body></html>`;
+<body><nav><a href="/"><strong>${escapeHtml(branding.name)}</strong></a><a href="/">Devices</a><a href="/tasks">Tasks</a><a href="/docs">API</a>${extra}${logout}</nav><main>${body}</main><footer style="max-width:1100px;margin:24px auto;padding:16px 20px;color:#94a3b8;font-size:12px">${footer}</footer></body></html>`;
 }
 
 async function registeredWithStatus() {
@@ -157,8 +156,26 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     const pluginNavHtml = navLinks
         .map((link) => `<a class="button secondary" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`)
         .join('');
-    const renderPage = (title: string, body: string) => page(title, body, logoutPath, navLinks);
-    const assetHash = (body: string) => crypto.createHash('sha1').update(body).digest('base64url').slice(0, 10);
+    const assetHash = (body: string | Buffer) => crypto.createHash('sha1').update(body).digest('base64url').slice(0, 10);
+
+    const branding = brandingFromEnv();
+    const footer = footerHtml(branding);
+    let logo: { body: Buffer; contentType: string; hash: string } | null = null;
+    if (branding.logoPath) {
+        const contentType = logoContentType(branding.logoPath);
+        if (!contentType) {
+            console.warn(`PHONE_FARM_BRAND_LOGO: unsupported file type for ${branding.logoPath} (use .png, .svg, .jpg or .webp); logo not shown`);
+        } else {
+            try {
+                const body = await readFile(branding.logoPath);
+                logo = { body, contentType, hash: assetHash(body) };
+            } catch (error) {
+                console.warn(`PHONE_FARM_BRAND_LOGO: cannot read ${branding.logoPath} (${errorMessage(error)}); logo not shown`);
+            }
+        }
+    }
+    const brand = brandHtml(branding, logo ? `/assets/brand-logo?v=${logo.hash}` : null);
+    const renderPage = (title: string, body: string) => page(title, body, logoutPath, navLinks, branding, footer);
 
     let themed: LoadedDashboardTheme | null = null;
     if (options.dashboardTheme) {
@@ -184,7 +201,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         };
         const finalize = (html: string) => {
             let out = html.replaceAll('__AUTH_NAV__', authNavHtml).replaceAll('__PLUGIN_NAV__', pluginNavHtml)
-                .replaceAll('__FOOTER__', FOOTER_HTML);
+                .replaceAll('__BRAND__', brand).replaceAll('__BRAND_TITLE__', escapeHtml(branding.title))
+                .replaceAll('__FOOTER__', footer);
             for (const [name, v] of Object.entries(versions)) out = out.replaceAll(`/assets/${name}`, `/assets/${name}?v=${v}`);
             return out;
         };
@@ -553,7 +571,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const theme = themed;
         // Templates request these with a ?v=<contenthash>. A versioned request is
         // safe to cache forever; a bare one (bookmark) must revalidate via ETag.
-        const asset = (contentType: string, body: string) => {
+        const asset = (contentType: string, body: string | Buffer) => {
             const etag = `"${crypto.createHash('sha1').update(body).digest('base64url')}"`;
             return async (request: FastifyRequest, reply: FastifyReply) => {
                 const versioned = Boolean((request.query as { v?: string }).v);
@@ -568,6 +586,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         app.get('/assets/tasks.js', asset('text/javascript', theme.tasksScript));
         app.get('/assets/register-device.js', asset('text/javascript', theme.registerDeviceScript));
         app.get('/assets/htmx.min.js', asset('text/javascript', theme.htmx));
+        if (logo) app.get('/assets/brand-logo', asset(logo.contentType, logo.body));
         app.get('/api/fragments/devices', async (_request, reply) => {
             const devices = await registeredWithStatus();
             const active = devices.filter((device) => !device.disabled);

@@ -25,7 +25,9 @@ p { margin-bottom: 0; color: var(--muted); line-height: 1.55; }
 .shell { width: min(1060px, calc(100% - 32px)); margin: 0 auto; padding: 36px 0 80px; }
 .topbar { position: sticky; top: 0; z-index: 60; border-bottom: 1px solid var(--border); background: rgb(8 11 16 / 84%); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
 .topbar-inner { display: flex; align-items: center; justify-content: space-between; gap: 18px; width: min(1060px, calc(100% - 32px)); margin: 0 auto; padding: 9px 0; }
-.brand { display: flex; flex-direction: column; line-height: 1.2; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.2; }
+.brand-logo { display: block; height: 30px; width: auto; max-width: 140px; object-fit: contain; border-radius: 6px; }
 .brand-name { font-size: 17px; font-weight: 800; letter-spacing: -.02em; text-decoration: none; }
 .brand-by { color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: .02em; text-decoration: none; }
 .brand-by:hover { color: var(--text); }

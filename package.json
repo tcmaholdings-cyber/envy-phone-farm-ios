@@ -26,7 +26,7 @@
   },
   "scripts": {
     "appium": "APPIUM_HOME=.appium2 node node_modules/appium/index.js --address 127.0.0.1 --base-path / --port 4725 --log-level info",
-    "appium:install-driver": "APPIUM_HOME=.appium2 appium driver install xcuitest@7.26.3",
+    "appium:install-driver": "APPIUM_HOME=.appium2 appium driver install xcuitest@12.9.0",
     "wda:prepare": "node --env-file-if-exists=.env --env-file-if-exists=.env.devices --import tsx src/devices/wda/prepare.ts",
     "wda:service": "node --env-file-if-exists=.env --env-file-if-exists=.env.devices --import tsx src/devices/wda-service.ts",
     "db:up": "docker compose up -d --wait postgres",

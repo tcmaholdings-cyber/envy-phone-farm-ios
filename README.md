@@ -8,6 +8,13 @@ It runs locally as-is; authentication is optional on a loopback bind. Harden it 
 
 ## Documentation
 
+- [docs/install-mac-mini.md](docs/install-mac-mini.md) — **fresh-host runbook**: macOS, Xcode, phones, signing, launchd agents, acceptance checklist
+- [docs/configuration.md](docs/configuration.md) — every `.env` key, `devices.json`, ports, exposure, state directories
+- [docs/operations.md](docs/operations.md) — start/stop/restart, watching, common failures, backups, upgrades
+- [docs/branding.md](docs/branding.md) — white-label the dashboard (name, credit, logo, footer) from `.env`
+- [docs/handover.md](docs/handover.md) — transferring a farm to another operator or licensee via git
+- [AGENTS.md](AGENTS.md) — orientation for engineers and AI coding agents working in this repository
+- [LICENSE-GRANT.md](LICENSE-GRANT.md) — licence grant / handover agreement template (Apache-2.0 base)
 - [docs/getting-started.md](docs/getting-started.md) — install, configure, run, register a device
 - [docs/architecture.md](docs/architecture.md) — the four processes, data stores, task model, source map
 - [docs/plugins.md](docs/plugins.md) — write a plugin: tasks, execution context, versioning, panels, routes
@@ -36,6 +43,8 @@ npm run wda:service
 npm run worker
 npm run web
 ```
+
+For an always-on host, `deploy/launchd/install-agents.sh` installs five launchd agents (db, appium, wda-service, worker, web) that start at login, restart on crash and log to `logs/`. The dashboard's name, credit, logo and footer are white-label settings in `.env` (`PHONE_FARM_BRAND_*`, see [docs/branding.md](docs/branding.md)).
 
 TikTok support is enabled by default. Set `PHONE_FARM_PLUGINS` to comma-separated ESM package names to add more task plugins. Set `PHONE_FARM_AUTH_PLUGIN` to an ESM authentication provider before binding `WEB_HOST` outside loopback; startup deliberately fails otherwise.
 
