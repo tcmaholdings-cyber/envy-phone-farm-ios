@@ -10,5 +10,3 @@ static/assets/
 *.log
 .appium2/
 logs/
-static/brand/*
-!static/brand/.gitkeep

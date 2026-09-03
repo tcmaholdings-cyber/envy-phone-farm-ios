@@ -24,16 +24,17 @@ PHONE_FARM_BRAND_NAME=Envy Farm
 PHONE_FARM_BRAND_TITLE=Envy
 PHONE_FARM_BRAND_BY=by Envy LLC
 PHONE_FARM_BRAND_BY_URL=https://envy.example
-PHONE_FARM_BRAND_LOGO=static/brand/logo.png
+PHONE_FARM_BRAND_LOGO=static/brand/envy-logo.png
 PHONE_FARM_FOOTER_TEXT=© 2026 Envy LLC · Powered by Phone Farm iOS Core
 PHONE_FARM_BRAND_URL=https://envy.example
 ```
 
-Put the logo file at `static/brand/logo.png` (that folder is git-ignored apart
-from its `.gitkeep`, so each deployment keeps its own artwork out of the shared
-history). The path may also be absolute. Restart the `web` process; the logo is
-read once at startup and served at `/assets/brand-logo?v=<content-hash>` with
-immutable caching, like the other assets.
+Brand artwork lives in `static/brand/` and is committed with the repository —
+Envy's wordmark ships as `static/brand/envy-logo.png` (408 × 120, transparent
+background; the source-resolution cut-out is `envy-logo-full.png`). The path may
+also be absolute. Restart the `web` process; the logo is read once at startup
+and served at `/assets/brand-logo?v=<content-hash>` with immutable caching,
+like the other assets.
 
 A dark top bar is the default theme, so a light-on-transparent logo (white or
 pale mark, transparent background) reads best. Anything that renders cleanly at

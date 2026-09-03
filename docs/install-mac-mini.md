@@ -78,7 +78,7 @@ Edit `.env`. The minimum for a working farm:
 | `WDA_BUNDLE_ID` | a bundle id you control, e.g. `com.envy.WebDriverAgentRunner` — must be unique per Team |
 | `IOS_PLATFORM_VERSION` | the iOS version on the phones, e.g. `18.6` |
 | `POSTGRES_PASSWORD` / `DATABASE_URL` | pick a real password; put the same one in both |
-| branding block | see [branding.md](branding.md) — for Envy LLC use the values in [handover.md](handover.md) and drop the logo at `static/brand/logo.png` |
+| branding block | see [branding.md](branding.md) — for Envy LLC use the values in [handover.md](handover.md); the Envy wordmark is already in the repo at `static/brand/envy-logo.png` |
 
 Leave `WEB_HOST=127.0.0.1`. If the dashboard must be reachable from other
 machines, read the *Exposure* section in [configuration.md](configuration.md)
