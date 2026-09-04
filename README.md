@@ -8,6 +8,7 @@ It runs locally as-is; authentication is optional on a loopback bind. Harden it 
 
 ## Documentation
 
+- [docs/setup-for-beginners.md](docs/setup-for-beginners.md) — **start here if you are not technical**: click-by-click setup with what-you-should-see checks
 - [docs/install-mac-mini.md](docs/install-mac-mini.md) — **fresh-host runbook**: macOS, Xcode, phones, signing, launchd agents, acceptance checklist
 - [docs/configuration.md](docs/configuration.md) — every `.env` key, `devices.json`, ports, exposure, state directories
 - [docs/operations.md](docs/operations.md) — start/stop/restart, watching, common failures, backups, upgrades
