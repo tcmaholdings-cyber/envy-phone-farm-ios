@@ -90,7 +90,7 @@ time and instantly during the failure cooldown.
 
 1. Prepare it (install guide §5), connect it, `xcrun xctrace list devices` shows it.
 2. `npm run wda:prepare -- --udid <udid>` from the GUI session.
-3. Dashboard → **Register a phone** → checks → **Finish registration**. Pick free `wdaLocalPort` / `mjpegLocalPort` (the wizard proposes the next ones), and record the **rack slot** so the phone can be found later.
+3. Dashboard → **Register a phone** (admins) → checks → **Finish registration**. Pick free `wdaLocalPort` / `mjpegLocalPort` (the wizard proposes the next ones), set the **rack** (access can be granted per rack) and the **rack slot** so the phone can be found later. The model is detected and saved automatically.
 4. Device page → *Touch points* → calibrate; run a `doomscroll` once.
 
 ### Signing on another Mac
@@ -105,6 +105,77 @@ A farm host does not have to hold the Apple ID. Sign on a Mac that does, copy th
    and set `WDA_XCTESTRUN=/Users/<user>/phone-farm/.wda/prebuilt/WebDriverAgentRunner_iphoneos<sdk>-arm64.xctestrun`
    in the host's `.env` (once).
 4. Restart `wda-service` on the host. Skip `wda:prepare` there; the wizard's *Prepare* step signs locally and does not apply.
+
+## Team access and VAs
+
+With `PHONE_FARM_AUTH_PLUGIN=builtin` ([configuration](configuration.md#built-in-accounts))
+everyone signs in with their own account.
+
+**First admins** (on the host, once, after `npm run db:migrate`):
+
+```sh
+npm run users -- create kash --role admin --name "Kash"
+npm run users -- create rex --role admin --name "Rex"
+npm run users -- list
+```
+
+Each `create` prints a temporary password on stdout, once — nothing else
+stores it. Hand it over privately; the person must choose their own password
+(12+ characters) at first sign-in. Re-running `create` for an existing user
+changes nothing. A forgotten password: `npm run users -- reset-password <username>`
+(or **Reset password** on the Team page) — it also signs that person out
+everywhere.
+
+**Roles**
+
+| Role | Can |
+| --- | --- |
+| Admin | Everything: all phones, registering phones, device settings (name, passcode, rack, slot, disconnect, remove), the Team page. |
+| Operator | Only the phones granted to them, at the granted level. Never device settings, registration or the Team page. |
+
+**Access levels** (per phone)
+
+| Level | An operator can |
+| --- | --- |
+| View | See the phone in the grid, its screen and live stream, its device page read-only, and its schedules and run history. |
+| Operate | Everything in View, plus drive the phone (tap, swipe, unlock, wake, home, volume), run and schedule doomscrolls and posts, pause/resume/cancel schedules, stop and retry runs, edit TikTok accounts and calibrate touch points. |
+
+A **grant** gives a person or a group a level on a scope: **all phones**, a
+**rack** (every phone whose `rack` matches), a **model** (every phone whose
+`model` matches, e.g. `iPhone 12 mini`) or **one phone**. A person's level on a
+phone is the highest of their own grants and their groups' grants; with no
+matching grant the phone does not exist for them (its pages and API answer
+404). Grants follow the phones: move a phone to rack 2 and rack-1 access to it
+ends at once.
+
+**Adding a VA** (admin, from **Team** in the navigation):
+
+1. **Add person** → username, display name, role *Operator*, optional groups →
+   **Save**. Copy the temporary password from the dialog — it is shown once.
+2. Under **Phone access**, choose the person (or their group), a scope and a
+   level → **Grant access**. Granting the same scope again changes its level.
+3. Check **What each operator can reach** at the bottom of the page.
+
+Groups ("Night shift", "Rack 1 team") save repeating grants: grant the group
+once, then add or remove members. **Disable** blocks sign-in and ends the
+person's sessions at once without losing their setup; **Delete** removes the
+account, its grants and memberships. The last active admin cannot be demoted,
+disabled or deleted, and nobody can disable or delete their own account.
+
+**Rack and model on existing phones.** Models fill themselves in the first
+time the dashboard sees each phone connected (open the grid once with the
+phones plugged in). Racks are set by an admin: per phone on the device page
+(*Rack & slot*), or in bulk on the host:
+
+```sh
+npm run devices -- list                          # name, UDID, rack, slot, model
+npm run devices -- set-rack 1 --all              # every registered phone
+npm run devices -- set-rack 2 <udid> <udid> …    # just these
+```
+
+Every sign-in and every user, group and grant change is written to
+`logs/web.log` as an `audit` line with the actor, e.g.
+`grep '"audit"' logs/web.log | tail`.
 
 ## Retiring a phone
 
@@ -150,5 +221,6 @@ health. Update `IOS_PLATFORM_VERSION` when the whole fleet has moved.
 
 - `.env` and `devices.json` are `0600`; never commit them, never paste them in tickets.
 - Rotate `POSTGRES_PASSWORD` (edit `.env`, `ALTER ROLE … PASSWORD`, restart web + worker) when staff change.
-- The dashboard stays on loopback or behind a VPN + auth provider (`configuration.md` → Exposure).
+- The dashboard stays on loopback, or behind a VPN or tunnel **with sign-in on** (`configuration.md` → Exposure).
+- Review **Team** when staff change: disable or delete leavers, remove grants nobody needs. Temporary passwords are shown once; if one leaks before first use, reset it.
 - Plugins are trusted code: install only reviewed, pinned packages (`PLUGIN_DEVELOPMENT.md`).

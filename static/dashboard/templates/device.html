@@ -26,7 +26,7 @@
             <button id="open-tasks" class="button secondary" type="button">Tasks &amp; schedules</button>
             <button id="open-accounts" class="button secondary" type="button">Accounts</button>
             <button id="open-passcode" class="button secondary" type="button">Passcode</button>
-            <button id="open-rackslot" class="button secondary" type="button">Rack slot</button>
+            <button id="open-rackslot" class="button secondary" type="button">Rack &amp; slot</button>
             <button id="open-calibrate" class="button secondary" type="button">Touch points</button>
             <span class="spacer"></span>
             <button id="open-remove" class="button danger" type="button">Remove device</button>
@@ -65,14 +65,14 @@
                 <p class="hint">Click to tap and drag to swipe. Remote input pauses while a doomscroll session is running.</p>
             </section>
             <div class="action-stack">
-                <section class="panel">
+                <section class="panel requires-operate">
                     <div class="section-heading">
                         <div><span class="eyebrow">TikTok</span><h2>Doomscroll</h2></div>
                         <button id="open-doomscroll" class="button secondary" type="button">Configure</button>
                     </div>
                     <p>Run a timed, personality-driven doomscrolling session on this device.</p>
                 </section>
-                <section class="panel post-card">
+                <section class="panel post-card requires-operate">
                     <div><span class="eyebrow">TikTok</span><h2>Create a post</h2></div>
                     <p>Upload a video or ordered slideshow, then save it as a draft or publish it.</p>
                     <button id="open-post" class="button secondary" type="button">Prepare post</button>
@@ -131,15 +131,17 @@
     <dialog id="rackslot-dialog">
         <form id="rackslot-form" class="modal" autocomplete="off">
             <div class="modal-head">
-                <div><span class="eyebrow">This device</span><h2>Rack slot</h2></div>
+                <div><span class="eyebrow">This device</span><h2>Rack &amp; slot</h2></div>
                 <button id="close-rackslot" class="icon-button" type="button">Close</button>
             </div>
             <p>Where this phone physically sits, so an offline device can be found without tracing cables. Free text — whatever is written on the rack, for example <code>A3</code> or <code>hub 2 · port 7</code>.</p>
+            <label for="device-rack">Rack <span class="field-help">A short label shared by every phone in the rack, e.g. <code>1</code>. Team access can be granted per rack.</span></label>
+            <input id="device-rack" type="text" maxlength="20" value="__DEVICE_RACK__" placeholder="1">
             <label for="device-rackslot">Slot</label>
             <input id="device-rackslot" type="text" maxlength="40" value="__DEVICE_RACKSLOT__" placeholder="A3">
             <div class="form-actions">
                 <span id="rackslot-result" class="run-meta" aria-live="polite"></span><span class="spacer"></span>
-                <button class="button primary" type="submit">Save slot</button>
+                <button class="button primary" type="submit">Save</button>
             </div>
         </form>
     </dialog>

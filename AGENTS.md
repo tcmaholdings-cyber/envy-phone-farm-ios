@@ -15,6 +15,8 @@ npm run web / worker / wda:service / appium    # the four processes (see docs/ge
 npm run db:up && npm run db:migrate            # bundled Postgres + schema
 npm run db:generate                            # after editing src/database/schema.ts -> new drizzle migration
 npm run wda:prepare -- --udid <udid>           # sign/build WebDriverAgent (graphical session only)
+npm run users -- create <name> --role admin     # built-in accounts: first admin (prints a temp password once)
+npm run devices -- set-rack <rack> --all        # label every registered phone's rack
 ```
 
 There is no server build step: TypeScript runs through `tsx`. Browser code in
@@ -29,6 +31,7 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 | `src/branding.ts` | env-driven white-label (name, label, credit, logo, footer) |
 | `static/dashboard/styles.css` | the Envy theme; every colour is a `:root` token (`test/styles-lint.test.ts`) — re-skin by editing `:root` only |
 | `src/plugin.ts` | **stable** plugin + auth interfaces; `src/registry.ts` resolves `{pluginId, taskType, taskVersion}` |
+| `src/auth/` | built-in accounts (`PHONE_FARM_AUTH_PLUGIN=builtin`): `policy.ts` (pure access rules), `route-access.ts` (the route → requirement table every request is checked against), `accounts.ts` (sign-in, sessions, Team rules), `pg-store.ts` (schema `auth`), `routes.ts` (login, password, Team pages + API), `cli.ts` (`npm run users`) |
 | `src/scheduler/` | pg-boss queue, recurrence, executor, worker |
 | `src/devices/` | discovery (usbmux), `devices.json` registry, registration wizard, WDA supervisor + remote, coordinate profiles |
 | `src/tiktok/`, `src/tiktok-plugin.ts` | the built-in plugin and its standalone entrypoints |
@@ -50,7 +53,7 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
    `.env`, `devices.json` and `.appium2/` are git-ignored on purpose. Brand artwork
    in `static/brand/` is tracked (it is not secret); secrets never go there.
 5. **Escape everything rendered.** Templates are trusted code; device/user values
-   go through `escapeHtml`. Plugin panels too.
+   go through `escapeHtml` (`src/html.ts`). Plugin panels too.
 6. **Persisted contract keys are not branding.** `com.git-agni.tiktok` and the
    package name `@git-agni/phone-farm-core` stay as they are; the UI brand is
    configured through `src/branding.ts`, not by editing templates.
@@ -59,6 +62,10 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
    overrides cover only the 15 calibratable points.
 8. **Idempotent operations.** Migrations, `wda:prepare`, the launchd installer
    and the registry mutators are safe to re-run; keep new operations that way.
+9. **Every route is in the access table.** A new route needs an entry in
+   `ROUTE_REQUIREMENTS` (`src/auth/route-access.ts`) or its plugin's
+   `routeAccess`; `test/auth-route-coverage.test.ts` fails otherwise. Lists
+   filter to the caller's phones; an ungranted phone is a 404, never a 403.
 
 ## Conventions
 

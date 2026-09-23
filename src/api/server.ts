@@ -44,7 +44,7 @@ export async function startServer(options: StartServerOptions = {}) {
     console.log(`Phone Farm listening on http://${host}:${address.port}`);
     return {
         app, plugins,
-        async close() { await app.close(); await registrations.close(); await scheduler.close(); },
+        async close() { await app.close(); await registrations.close(); await scheduler.close(); await authProvider?.close?.(); },
     };
 }
 

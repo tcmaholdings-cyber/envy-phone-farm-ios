@@ -15,6 +15,13 @@
       "when": 1787917825806,
       "tag": "0001_busy_bastion",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790195248670,
+      "tag": "0002_builtin_auth",
+      "breakpoints": true
     }
   ]
 }

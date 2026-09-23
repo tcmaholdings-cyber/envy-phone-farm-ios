@@ -2,6 +2,8 @@ export {};
 
 interface Schedule {
     id: string;
+    /** The signed-in user's level on the phone; 'view' lists the row without actions. */
+    access?: 'view' | 'operate';
     deviceUdid: string;
     taskType: 'doomscroll' | 'post';
     status: 'active' | 'paused' | 'completed' | 'cancelled';
@@ -13,6 +15,7 @@ interface Schedule {
 
 interface Execution {
     id: string;
+    access?: 'view' | 'operate';
     deviceUdid: string;
     taskType: 'doomscroll' | 'post';
     status: string;
@@ -116,6 +119,7 @@ function renderSchedules(items: Schedule[]): void {
         const state = statusPill(schedule.status);
         const actions = document.createElement('div'); actions.className = 'inline-actions';
         const subject = `${schedule.taskType} schedule for ${shortDevice(schedule.deviceUdid)}`;
+        if (schedule.access === 'view') { row.append(state, copy, actions); return row; }
         if (schedule.status === 'active' || schedule.status === 'paused') actions.append(button('Edit', subject, async () => {
             const timingText = window.prompt('Edit timing JSON', JSON.stringify(schedule.timing));
             if (!timingText) return false;
@@ -151,6 +155,7 @@ function renderExecutions(items: Execution[]): void {
         const state = statusPill(execution.status);
         const actions = document.createElement('div'); actions.className = 'inline-actions';
         const subject = `${execution.taskType} run on ${shortDevice(execution.deviceUdid)}`;
+        if (execution.access === 'view') { row.append(state, copy, actions); return row; }
         if (execution.status === 'queued' || (execution.status === 'running' && execution.taskType === 'doomscroll')) {
             const label = execution.status === 'queued' ? 'Cancel' : 'Stop';
             actions.append(button(label, subject, async () => {

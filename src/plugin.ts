@@ -100,6 +100,16 @@ export interface PluginRouteContext {
     renderActivity(deviceUdid: string, message?: string): Promise<string>;
 }
 
+/**
+ * Who may call a plugin route when scoped access is on (the built-in accounts).
+ * `device` checks the user's level on the phone named by the route's `:udid`
+ * parameter. A plugin route without a declaration is admin-only.
+ */
+export type PluginRouteAccess =
+    | { kind: 'signed-in' }
+    | { kind: 'admin' }
+    | { kind: 'device'; level: DeviceAccessLevel };
+
 export interface PhoneFarmPlugin {
     id: string;
     version: string;
@@ -110,12 +120,46 @@ export interface PhoneFarmPlugin {
     registrationChecks?: readonly RegistrationCheck[];
     wdaExtensions?: readonly WdaExtension[];
     registerRoutes?(context: PluginRouteContext): Promise<void> | void;
+    /** Keys are `METHOD /url/:pattern`, exactly as registered, e.g. `POST /api/devices/:udid/posts`. */
+    routeAccess?: Readonly<Record<string, PluginRouteAccess>>;
+}
+
+/** How far a user may go with one phone: see it, or also drive it. */
+export type DeviceAccessLevel = 'view' | 'operate';
+
+/**
+ * One access grant, to a user (`userId`) or a group (`groupId`). `scopeValue`
+ * is null for `all`, the rack label for `rack`, the marketing model name for
+ * `model` and the UDID for `device`.
+ */
+export interface DeviceAccessGrant {
+    userId?: string | null;
+    groupId?: string | null;
+    scopeType: 'all' | 'rack' | 'model' | 'device';
+    scopeValue?: string | null;
+    level: DeviceAccessLevel;
+}
+
+/**
+ * Scoped access for a signed-in user. A provider that returns it gets per-device
+ * authorization (src/auth/policy.ts); a provider that omits it keeps the
+ * original all-or-nothing behaviour, where every signed-in user can do everything.
+ */
+export interface UserAccess {
+    role: 'admin' | 'operator';
+    groupIds: string[];
+    grants: DeviceAccessGrant[];
 }
 
 export interface AuthenticatedUser {
     id: string;
     email?: string;
     roles: string[];
+    /** Shown in the navigation next to "Log out". */
+    displayName?: string;
+    /** When true, every page except the provider's password page is refused until the password changes. */
+    mustChangePassword?: boolean;
+    access?: UserAccess;
 }
 
 export interface AuthProvider {
@@ -125,4 +169,11 @@ export interface AuthProvider {
     isPublicPath(path: string): boolean;
     /** Path a "Log out" link points at, e.g. "/auth/logout". Omit to hide the link. */
     logoutPath?: string;
+    /** `POST` renders Log out as a same-origin form (CSRF-safe) instead of a link. Default `GET`. */
+    logoutMethod?: 'GET' | 'POST';
+    /** Where an unauthenticated browser page navigation is redirected. Omit to answer 401. */
+    loginPath?: string;
+    /** Where a user with `mustChangePassword` is sent. */
+    passwordChangePath?: string;
+    close?(): Promise<void>;
 }

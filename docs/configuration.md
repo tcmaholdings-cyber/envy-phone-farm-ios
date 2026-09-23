@@ -60,8 +60,46 @@ big rack that feels sluggish, lower them on a two-phone bench.
 | Key | Meaning |
 | --- | --- |
 | `PHONE_FARM_PLUGINS` | Comma-separated ESM package names of extra task plugins. Empty = only the built-in TikTok plugin. `web` and `worker` must have identical values. |
-| `PHONE_FARM_AUTH_PLUGIN` | ESM module exporting an `AuthProvider` (`src/plugin.ts`). Mandatory before `WEB_HOST` leaves loopback. |
+| `PHONE_FARM_AUTH_PLUGIN` | `builtin` for the accounts shipped with the farm (users, groups and per-phone access in Postgres — see [Built-in accounts](#built-in-accounts)), or an ESM module exporting an `AuthProvider` (`src/plugin.ts`). Unset = no sign-in (loopback only). Mandatory before `WEB_HOST` leaves loopback, **and before the dashboard is published through a tunnel**. |
+| `PHONE_FARM_SESSION_IDLE_HOURS` | Built-in accounts only. A session ends after this many hours without a request (default `12`). |
+| `PHONE_FARM_SESSION_MAX_DAYS` | Built-in accounts only. A session ends this many days after sign-in however active it is (default `7`). |
 | `TIKTOK_BUNDLE_ID` | `com.zhiliaoapp.musically` — the TikTok app the built-in plugin drives. |
+
+### Built-in accounts
+
+`PHONE_FARM_AUTH_PLUGIN=builtin` turns on sign-in with accounts stored in the
+same Postgres database (schema `auth`, created by `npm run db:migrate` —
+migration `drizzle/0002_builtin_auth.sql`). Nothing else is required; the
+database connection is `DATABASE_URL`.
+
+- **Users** have a username (lower-case), a display name, a role and a password
+  hash (scrypt, per-user salt). Passwords are at least 12 characters. New users
+  and reset passwords get a generated temporary password that is shown once and
+  must be changed at first sign-in.
+- **Roles**: `admin` can do everything, including the Team page, registering
+  phones and device settings. `operator` sees and acts only on the phones
+  granted to them — see [the access model](operations.md#team-access-and-vas).
+- **Sessions** are server-side: the browser holds an `HttpOnly`,
+  `SameSite=Lax` cookie `pf_session`; the database holds only a SHA-256 hash of
+  it. The cookie is `Secure` whenever the request arrived over HTTPS — directly,
+  or from a loopback proxy that says so (`X-Forwarded-Proto: https` or
+  Cloudflare's `CF-Visitor`) — and stays usable on plain `http://127.0.0.1`.
+- **Sign-in throttling**: after 5 failed attempts for one username, or 20 from
+  one client IP, further attempts wait 30 s, doubling up to 15 min. Behind a
+  Cloudflare tunnel the client IP is `CF-Connecting-IP`, trusted **only** when
+  the TCP peer is loopback (the local `cloudflared`). Throttle state is in
+  memory and resets when `web` restarts.
+- **Audit**: sign-ins (success, failure, throttled), sign-outs, password
+  changes and every user / group / grant change are logged by `web` as
+  `audit` entries naming the actor. Passwords and tokens never appear.
+
+Public without a session: `/login`, `/logout`, `/health`, and the stylesheet,
+fonts and logo the sign-in page uses. Everything else redirects a browser to
+`/login` or answers `401`.
+
+A third-party `AuthProvider` keeps working as before: every user it signs in
+can do everything, unless it returns `access` (`UserAccess` in
+`src/plugin.ts`) with the user, in which case the same per-phone rules apply.
 
 ### Branding
 
@@ -108,6 +146,8 @@ while the processes are stopped. Mode `0600`.
     "wdaLocalPort": 8101,                        // unique per device
     "mjpegLocalPort": 9101,                      // unique per device
     "rackSlot": "hub 2 · port 7",                // optional: where the phone physically sits
+    "rack": "1",                                 // optional: which rack (short label); access can be granted per rack
+    "model": "iPhone 12 mini",                   // filled in from USB discovery; access can be granted per model
     "passcode": "123456",                        // unlock code; never returned by the API
     "disabled": false,                           // true = keep the entry, supervise nothing
     "pluginData": {
@@ -126,6 +166,15 @@ Rules:
   nothing resolves it. It exists so "Rack A · 03 is offline" maps to a phone
   someone can walk up to. Set it in the registration wizard, on the device page
   (*Rack slot*), or with `PATCH /api/devices/:udid`; `""` clears it.
+- `rack` is a short label (trimmed, 20 characters) shared by every phone in
+  one rack, e.g. `1`. Team access can be granted per rack, so keep it
+  consistent. Set it in the registration wizard, on the device page
+  (*Rack & slot*), with `PATCH /api/devices/:udid` (`{"rack":"1"}`, `""` clears
+  it), or for many phones at once with `npm run devices -- set-rack 1 --all`.
+- `model` is the marketing name (`iPhone 12 mini`). The dashboard fills it in
+  the first time it sees the phone connected over USB and the field is empty;
+  it never overwrites a value. The registration wizard sets it at once. Team
+  access can be granted per model.
 - `pluginData` is per plugin id and never holds secrets.
 - The worker re-reads the file every 30 s; `wda-service` and `web` watch it
   too. Prefer `PATCH /api/devices/:udid` over editing while running.
@@ -147,7 +196,8 @@ The safe default is loopback only. Options, in order of preference:
 
 1. **SSH tunnel** from the operator's laptop: `ssh -N -L 3000:127.0.0.1:3000 farm@<mac-mini>` then open `http://127.0.0.1:3000`. No config change.
 2. **Tailscale / VPN** plus an auth provider: set `PHONE_FARM_AUTH_PLUGIN`, then `WEB_HOST=<tailscale-ip>`. Add the browser origin to `PHONE_FARM_TRUSTED_ORIGINS` if it differs from the bind host.
-3. Never publish port 3000 to the internet. Appium and Postgres stay on loopback in every configuration.
+3. **Cloudflare Tunnel** (`cloudflared` → `http://127.0.0.1:3000`) plus `PHONE_FARM_AUTH_PLUGIN=builtin`. `WEB_HOST` stays `127.0.0.1`, so the startup check (`assertSafeBind`) cannot tell the dashboard is public: **turning on sign-in is on you**. The CSRF guard compares the browser's `Origin` with the `Host` cloudflared forwards, which is the public hostname by default; only if the tunnel rewrites `Host` (`httpHostHeader`) set `PUBLIC_ORIGIN=https://<your hostname>` — and then also `PHONE_FARM_TRUSTED_ORIGINS=http://127.0.0.1:3000` if people still use the dashboard locally. Session cookies become `Secure` automatically and sign-in throttling uses the visitor's `CF-Connecting-IP`.
+4. Never publish port 3000 directly (port forward, `0.0.0.0` without auth). Appium and Postgres stay on loopback in every configuration.
 
 ## State directories
 

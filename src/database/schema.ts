@@ -1,4 +1,5 @@
-import { bigint, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { bigint, boolean, check, index, integer, jsonb, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 import type { JsonObject, ScheduleTiming } from '../types.js';
 
@@ -69,6 +70,66 @@ export const assets = schedulerSchema.table('assets', {
     mimeType: text('mime_type').notNull(), size: bigint('size', { mode: 'number' }).notNull(), sha256: text('sha256').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
 }, (table) => [index('assets_schedule_idx').on(table.scheduleId), index('assets_execution_idx').on(table.executionId)]);
+
+// ---------- built-in accounts (PHONE_FARM_AUTH_PLUGIN=builtin) ----------
+// Only password hashes and session-token hashes are stored; never a raw
+// password or cookie token.
+export const authSchema = pgSchema('auth');
+export const authUserRole = authSchema.enum('user_role', ['admin', 'operator']);
+export const authGrantScope = authSchema.enum('grant_scope', ['all', 'rack', 'model', 'device']);
+export const authGrantLevel = authSchema.enum('grant_level', ['view', 'operate']);
+
+export const authUsers = authSchema.table('users', {
+    id: uuid('id').primaryKey().defaultRandom(),
+    username: text('username').notNull().unique(),
+    displayName: text('display_name').notNull(),
+    role: authUserRole('role').notNull().default('operator'),
+    passwordHash: text('password_hash').notNull(),
+    mustChangePassword: boolean('must_change_password').notNull().default(true),
+    disabled: boolean('disabled').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    lastLoginAt: timestamp('last_login_at', { withTimezone: true, mode: 'date' }),
+}, (table) => [check('users_username_lowercase', sql`${table.username} = lower(${table.username})`)]);
+
+export const authGroups = authSchema.table('groups', {
+    id: uuid('id').primaryKey().defaultRandom(),
+    name: text('name').notNull().unique(),
+    description: text('description').notNull().default(''),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+});
+
+export const authGroupMembers = authSchema.table('group_members', {
+    groupId: uuid('group_id').notNull().references(() => authGroups.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id').notNull().references(() => authUsers.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+}, (table) => [primaryKey({ columns: [table.groupId, table.userId] }), index('group_members_user_idx').on(table.userId)]);
+
+export const authGrants = authSchema.table('grants', {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id').references(() => authUsers.id, { onDelete: 'cascade' }),
+    groupId: uuid('group_id').references(() => authGroups.id, { onDelete: 'cascade' }),
+    scopeType: authGrantScope('scope_type').notNull(),
+    scopeValue: text('scope_value'),
+    level: authGrantLevel('level').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+}, (table) => [
+    check('grants_one_subject', sql`(${table.userId} is null) <> (${table.groupId} is null)`),
+    check('grants_scope_value', sql`(${table.scopeType} = 'all') = (${table.scopeValue} is null)`),
+    index('grants_user_idx').on(table.userId),
+    index('grants_group_idx').on(table.groupId),
+]);
+
+export const authSessions = authSchema.table('sessions', {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tokenHash: text('token_hash').notNull().unique(),
+    userId: uuid('user_id').notNull().references(() => authUsers.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    ip: text('ip'),
+    userAgent: text('user_agent'),
+}, (table) => [index('sessions_user_idx').on(table.userId), index('sessions_expires_idx').on(table.expiresAt)]);
 
 export type ScheduleRow = typeof schedules.$inferSelect;
 export type ExecutionRow = typeof executions.$inferSelect;

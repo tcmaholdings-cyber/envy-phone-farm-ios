@@ -8,6 +8,8 @@ const form = document.querySelector('#registration-details');
 const nameInput = document.querySelector('#registration-name');
 const profileInput = document.querySelector('#registration-profile');
 const rackSlotInput = document.querySelector('#registration-rackslot');
+const rackInput = document.querySelector('#registration-rack');
+const modelInput = document.querySelector('#registration-model');
 const accountsInput = document.querySelector('#registration-accounts');
 const passcodeInput = document.querySelector('#registration-passcode');
 const ports = document.querySelector('#registration-ports');
@@ -150,6 +152,10 @@ function render(snapshot) {
     }
     if (document.activeElement !== rackSlotInput)
         rackSlotInput.value = snapshot.rackSlot ?? '';
+    if (document.activeElement !== rackInput)
+        rackInput.value = snapshot.rack ?? '';
+    modelInput.value = snapshot.device.modelName ?? '';
+    modelInput.placeholder = snapshot.device.modelName ? '' : 'Unknown model — an admin can set it later';
     if (document.activeElement !== accountsInput)
         accountsInput.value = snapshot.tiktokAccounts.join(', ');
     passcodeInput.placeholder = snapshot.hasPasscode ? 'Passcode saved in this setup session' : 'Optional numeric passcode';
@@ -236,7 +242,7 @@ form.addEventListener('submit', async (event) => {
     try {
         const snapshot = await request(`/api/device-registrations/${encodeURIComponent(currentId)}`, {
             method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-                name: nameInput.value, coordinateProfile: profileInput.value, rackSlot: rackSlotInput.value,
+                name: nameInput.value, coordinateProfile: profileInput.value, rackSlot: rackSlotInput.value, rack: rackInput.value,
                 tiktokAccounts: accountsInput.value.split(','), passcode: passcodeInput.value || undefined,
             }),
         });

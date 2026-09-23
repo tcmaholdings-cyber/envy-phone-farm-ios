@@ -160,6 +160,12 @@ export function createTikTokPlugin(configuration: TikTokPluginConfiguration = {}
             id: 'tiktok-controls', title: 'TikTok',
             fragmentPath: fileURLToPath(new URL('../static/tiktok/device-panel.html', import.meta.url)), order: 100,
         }],
+        routeAccess: {
+            'PATCH /api/devices/:udid/accounts': { kind: 'device', level: 'operate' },
+            'POST /api/devices/:udid/fragments/scroll-run': { kind: 'device', level: 'operate' },
+            'GET /api/devices/:udid/posts/current': { kind: 'device', level: 'view' },
+            'POST /api/devices/:udid/posts': { kind: 'device', level: 'operate' },
+        },
         async registerRoutes(context) {
             const deviceData = async (udid: string) => (await context.loadDevices()).find((device) => device.udid === udid);
             context.app.patch<{ Params: { udid: string }; Body: { accounts?: string[] } }>('/api/devices/:udid/accounts', async (request, reply) => {

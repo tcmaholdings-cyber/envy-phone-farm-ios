@@ -9,7 +9,7 @@ import { remote, type Browser } from 'webdriverio';
 import { switchTikTokAccount, tapCoordinate } from '../tiktok/actions.js';
 import { coordinateProfiles, coordinatesForProfile, profileForProductType, type CoordinateProfile } from './coordinates.js';
 import { connectedDevices, type Device } from './discovery.js';
-import { loadRegisteredDevices, mutateRegisteredDevices, RACK_SLOT_MAX_LENGTH, type RegisteredDevice } from './registry.js';
+import { loadRegisteredDevices, mutateRegisteredDevices, RACK_MAX_LENGTH, RACK_SLOT_MAX_LENGTH, type RegisteredDevice } from './registry.js';
 import { passcodeForDevice, setDevicePasscode } from './secrets.js';
 import { WdaRemoteControl } from './wda-remote.js';
 import { diagnoseWdaLaunchFailure } from './wda/diagnostics.js';
@@ -36,6 +36,8 @@ export interface RegistrationSnapshot {
     mjpegLocalPort: number;
     /** Free-text physical location in the rack; optional, purely an operator label. */
     rackSlot: string;
+    /** Which rack the phone goes into (short label, e.g. `1`); grants can target a rack. */
+    rack?: string;
     tiktokAccounts: string[];
     hasPasscode: boolean;
     busy: boolean;
@@ -49,6 +51,7 @@ export interface RegistrationUpdate {
     name?: string;
     coordinateProfile?: string;
     rackSlot?: string;
+    rack?: string;
     tiktokAccounts?: string[];
     passcode?: string;
 }
@@ -175,6 +178,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
                     coordinateProfile: stored.coordinateProfile ?? recommendedProfile,
                     // Drafts written before rack slots existed have no value for it.
                     rackSlot: stored.rackSlot ?? '',
+                    rack: stored.rack ?? '',
                     busy: false,
                     hasPasscode,
                     };
@@ -221,6 +225,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
             coordinateProfile: profileForProductType(candidate.productType),
             ...ports,
             rackSlot: '',
+            rack: '',
             tiktokAccounts: [],
             hasPasscode: false,
             busy: false,
@@ -254,6 +259,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
             session.coordinateProfile = input.coordinateProfile as CoordinateProfile;
         }
         if (input.rackSlot !== undefined) session.rackSlot = input.rackSlot.trim().slice(0, RACK_SLOT_MAX_LENGTH);
+        if (input.rack !== undefined) session.rack = String(input.rack).trim().slice(0, RACK_MAX_LENGTH);
         if (input.tiktokAccounts !== undefined) session.tiktokAccounts = normalizeAccounts(input.tiktokAccounts);
         if (input.passcode !== undefined) {
             if (input.passcode && !/^\d{4,}$/.test(input.passcode)) throw new Error('Device passcode must contain at least four digits');
@@ -474,6 +480,9 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
                 wdaLocalPort: session.wdaLocalPort,
                 mjpegLocalPort: session.mjpegLocalPort,
                 ...(session.rackSlot ? { rackSlot: session.rackSlot } : {}),
+                ...(session.rack ? { rack: session.rack } : {}),
+                // The marketing name USB discovery reported, so model grants cover it at once.
+                ...(session.device.modelName ? { model: session.device.modelName } : {}),
                 ...(session.passcode ? { passcode: session.passcode } : {}),
                 // coordinateProfile is a top-level field; don't duplicate it into pluginData.
                 pluginData: { 'com.git-agni.tiktok': { accounts: session.tiktokAccounts } },

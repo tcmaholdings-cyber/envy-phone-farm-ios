@@ -193,6 +193,24 @@ registerRoutes(ctx) {
 }
 ```
 
+#### Access for plugin routes
+
+With the built-in accounts on, every request is authorized against a route
+table. Declare how each of your routes is authorized, keyed exactly as
+registered:
+
+```ts
+routeAccess: {
+    'GET /plugins/com.example.stats/summary': { kind: 'signed-in' },           // any signed-in user
+    'POST /api/devices/:udid/stats/reset': { kind: 'device', level: 'operate' }, // level on the phone in :udid
+    'GET /api/devices/:udid/stats': { kind: 'device', level: 'view' },
+},
+```
+
+A route you do not declare is **admin-only**. A `device` route answers 404 for
+a phone the caller cannot see. A signed-in route that returns per-phone data
+must filter it itself. You cannot change the requirement of a core route.
+
 ### WDA extensions
 `wdaExtensions` declares patch files (path + sha256) your plugin needs applied
 to WebDriverAgent. This is a declaration for review/audit; the build still runs

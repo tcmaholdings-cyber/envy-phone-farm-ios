@@ -38,6 +38,8 @@ interface PostRun {
 
 interface DeviceSchedule {
     id: string;
+    /** The signed-in user's level on this phone; 'view' shows the row without actions. */
+    access?: 'view' | 'operate';
     status: 'active' | 'paused' | 'completed' | 'cancelled';
     taskType: 'doomscroll' | 'post';
     timing: { kind: string; localTime?: string; timezone?: string; weekdays?: number[]; runAt?: string };
@@ -53,6 +55,7 @@ interface DeviceSchedule {
 
 interface DeviceExecution {
     id: string;
+    access?: 'view' | 'operate';
     taskType: 'doomscroll' | 'post';
     status: string;
     scheduledFor: string;
@@ -68,6 +71,8 @@ function element<T extends Element>(selector: string): T {
 }
 
 const udid = decodeURIComponent(location.pathname.split('/').filter(Boolean).at(-1) ?? '');
+// The server marks a view-only page on <body>; it also refuses the requests, this only avoids offering them.
+const canOperate = document.body.dataset.deviceAccess !== 'view';
 const elements = {
     screen: element<HTMLImageElement>('#screen'),
     status: element<HTMLElement>('#status'),
@@ -149,6 +154,7 @@ const elements = {
     closeRackslot: element<HTMLButtonElement>('#close-rackslot'),
     rackslotForm: element<HTMLFormElement>('#rackslot-form'),
     deviceRackslot: element<HTMLInputElement>('#device-rackslot'),
+    deviceRack: element<HTMLInputElement>('#device-rack'),
     rackslotResult: element<HTMLElement>('#rackslot-result'),
     openCalibrate: element<HTMLButtonElement>('#open-calibrate'),
     calibrateDialog: element<HTMLDialogElement>('#calibrate-dialog'),
@@ -434,6 +440,7 @@ function pointFromEvent(event: PointerEvent): Point {
 }
 
 async function sendAction(action: RemoteAction): Promise<void> {
+    if (!canOperate) return;
     setStatus('Sending input…', 'busy');
     elements.remoteButtons.forEach((button) => { button.disabled = true; });
     const liveState = () => (elements.phone.classList.contains('is-live') ? 'live' : 'ready');
@@ -495,7 +502,7 @@ elements.remoteButtons.forEach((button) => {
 });
 
 elements.screen.addEventListener('pointerdown', (event) => {
-    if (!screenSize) return;
+    if (!screenSize || !canOperate) return;
     elements.screen.setPointerCapture(event.pointerId);
     pointerStart = { ...pointFromEvent(event), time: performance.now() };
 });
@@ -701,6 +708,7 @@ function renderDeviceSchedules(schedules: DeviceSchedule[]): void {
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
         const subject = title.textContent;
+        if (schedule.access === 'view') { row.append(state, copy, actions); return row; }
         if (schedule.status === 'active') actions.append(taskActionButton('Pause', subject, async () => {
             await jsonRequest(`/api/schedules/${schedule.id}/pause`, { method: 'POST' });
         }, 'Schedule paused.'));
@@ -737,6 +745,7 @@ function renderDeviceExecutions(executions: DeviceExecution[]): void {
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
         const subject = `${title.textContent} run`;
+        if (execution.access === 'view') { row.append(state, copy, actions); return row; }
         if (execution.status === 'queued' || (execution.status === 'running' && execution.taskType === 'doomscroll')) {
             const label = execution.status === 'queued' ? 'Cancel' : 'Stop';
             actions.append(taskActionButton(label, subject, async () => {
@@ -1084,22 +1093,24 @@ elements.closeRackslot.addEventListener('click', () => elements.rackslotDialog.c
 
 elements.rackslotForm.addEventListener('submit', async (event) => {
     event.preventDefault();
-    // An empty field clears the slot — the API treats '' the same way it does for the passcode.
+    // An empty field clears the value — the API treats '' the same way it does for the passcode.
     const rackSlot = elements.deviceRackslot.value.trim();
+    const rack = elements.deviceRack.value.trim();
     elements.rackslotResult.textContent = 'Saving…';
     try {
         const response = await fetch(`/api/devices/${encodeURIComponent(udid)}`, {
             method: 'PATCH',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ rackSlot }),
+            body: JSON.stringify({ rack, rackSlot }),
         });
         if (!response.ok) {
             const data = await response.json().catch(() => ({})) as { error?: string };
             throw new Error(data.error ?? `Request failed (${response.status})`);
         }
-        const data = await response.json() as { rackSlot?: string };
+        const data = await response.json() as { rackSlot?: string; rack?: string };
         elements.deviceRackslot.value = data.rackSlot ?? '';
-        elements.rackslotResult.textContent = data.rackSlot ? 'Slot saved.' : 'Slot cleared.';
+        elements.deviceRack.value = data.rack ?? '';
+        elements.rackslotResult.textContent = data.rackSlot || data.rack ? 'Saved.' : 'Rack and slot cleared.';
         toast(elements.rackslotResult.textContent);
     } catch (error) {
         elements.rackslotResult.textContent = errorMessage(error);

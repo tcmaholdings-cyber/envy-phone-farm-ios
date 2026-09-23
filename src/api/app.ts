@@ -8,8 +8,16 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
+import { FULL_ACCESS, requestAccessFor, type RequestAccess } from '../auth/access.js';
+import { isBuiltinAuthProvider } from '../auth/builtin.js';
+import { levelSatisfies, type AccessLevel } from '../auth/policy.js';
+import { buildRouteRequirements, routeKey, type RouteRequirement } from '../auth/route-access.js';
+import { registerBuiltinAuthRoutes, safeNextPath, type ShellOptions } from '../auth/routes.js';
 import { connectedDevices, type Device } from '../devices/discovery.js';
-import { loadRegisteredDevices, mutateRegisteredDevices, saveRegisteredDevices, redactDevice, PASSCODE_PATTERN, type RegisteredDevice } from '../devices/registry.js';
+import {
+    backfillDeviceModels, loadRegisteredDevices, missingModels, mutateRegisteredDevices, saveRegisteredDevices, redactDevice,
+    PASSCODE_PATTERN, type RegisteredDevice,
+} from '../devices/registry.js';
 import { createScreenshotCache } from '../devices/screenshot-cache.js';
 import { createThumbnailCache, thumbnailWidth } from '../devices/thumbnail.js';
 import {
@@ -22,8 +30,9 @@ import type {
 import { RemoteDeviceError, type RemoteAction, type RemoteControl } from '../devices/wda-remote.js';
 import { requestWdaService } from '../devices/wda-service-client.js';
 import type { DeviceConnectionStatus } from '../devices/connection-manager.js';
+import { escapeHtml } from '../html.js';
 import { brandHtml, brandingFromEnv, footerHtml, logoContentType, type Branding } from '../branding.js';
-import type { AuthProvider, PluginNavLink } from '../plugin.js';
+import type { AuthenticatedUser, AuthProvider, PluginNavLink } from '../plugin.js';
 import type { PluginRegistry } from '../registry.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming } from '../types.js';
 import { ScheduleTransitionError, type SchedulerRepository } from '../scheduler/repository.js';
@@ -47,6 +56,9 @@ export interface DashboardTheme {
 }
 
 interface LoadedDashboardTheme {
+    /** Content hashes of the versioned assets, for pages built in code (sign-in, Team). */
+    versions: Record<string, string>;
+    teamScript: string;
     indexHtml: string;
     deviceHtml: string;
     tasksHtml: string;
@@ -84,16 +96,10 @@ function csrfBlocked(reply: FastifyReply): FastifyReply {
     });
 }
 
-function escapeHtml(value: unknown): string {
-    return String(value ?? '').replace(/[&<>"']/g, (character) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    })[character] ?? character);
-}
 
 // Brand name, credit, logo and footer come from the environment (src/branding.ts)
 // so a licensee can white-label the dashboard without forking.
-function page(title: string, body: string, logoutPath: string | undefined, navLinks: readonly PluginNavLink[], branding: Branding, footer: string): string {
-    const logout = logoutPath ? `<a class="logout" href="${escapeHtml(logoutPath)}">Log out</a>` : '';
+function page(title: string, body: string, authNav: string, navLinks: readonly PluginNavLink[], branding: Branding, footer: string): string {
     const extra = navLinks.map((link) => `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join('');
     // A minimal copy of the dashboard tokens (static/dashboard/styles.css :root),
     // system fonts only, so un-themed pages and errors match the dark dashboard.
@@ -102,7 +108,7 @@ function page(title: string, body: string, logoutPath: string | undefined, navLi
 :root{color-scheme:dark;--bg:#0a0a0c;--bg-2:#101014;--panel:#141419;--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--ink:#f6f6f8;--muted:#a9a9b4;--pink-2:#ff5fae;--pink-deep:#d6166f}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Helvetica Neue",sans-serif}
 nav{display:flex;flex-wrap:wrap;align-items:center;gap:6px 20px;padding:14px 24px;border-bottom:1px solid var(--line);background:var(--bg-2)}
-nav a{color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;text-decoration:none}nav a:hover{color:var(--ink)}nav .home{margin-right:auto;color:var(--ink);letter-spacing:.18em}
+nav form{display:inline}nav .nav-user{color:var(--muted);font-size:12px}nav a{color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;text-decoration:none}nav a:hover{color:var(--ink)}nav .home{margin-right:auto;color:var(--ink);letter-spacing:.18em}
 main{max-width:1100px;margin:24px auto;padding:0 20px}h1{font-size:28px;letter-spacing:.01em;text-transform:uppercase;margin:0 0 12px}h2{font-size:15px;letter-spacing:.06em;text-transform:uppercase}
 .card{margin:14px 0;padding:18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left}
 code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
@@ -110,7 +116,7 @@ button,.button{display:inline-flex;align-items:center;min-height:36px;padding:0 
 .button.secondary{border:1px solid var(--line-strong);background:transparent;color:var(--ink)}a{color:var(--pink-2)}
 input,select,textarea{min-height:36px;padding:8px 10px;border:1px solid var(--line-strong);border-radius:10px;background:var(--bg-2);color:var(--ink);font:inherit}
 :focus-visible{outline:2px solid var(--pink-2);outline-offset:2px}footer{max-width:1100px;margin:24px auto;padding:16px 20px;color:var(--muted);font-size:12px}footer a{color:var(--muted)}</style></head>
-<body><nav><a class="home" href="/">${escapeHtml(branding.name)}</a><a href="/">Devices</a><a href="/tasks">Tasks</a><a href="/docs">API</a>${extra}${logout}</nav><main>${body}</main><footer>${footer}</footer></body></html>`;
+<body><nav><a class="home" href="/">${escapeHtml(branding.name)}</a><a href="/">Devices</a><a href="/tasks">Tasks</a><a href="/docs">API</a>${extra}${authNav}</nav><main>${body}</main><footer>${footer}</footer></body></html>`;
 }
 
 /**
@@ -181,6 +187,17 @@ function ageText(at: number | undefined): string {
 
 async function registeredWithStatus(discover: () => Promise<Device[]> = connectedDevices) {
     const [registered, connected] = await Promise.all([loadRegisteredDevices(), discover()]);
+    // A phone seen on USB without a stored model gets the one discovery reports,
+    // once; model grants depend on it. Steady state: no write.
+    const missing = missingModels(registered, connected);
+    if (missing.size) {
+        try {
+            await backfillDeviceModels(connected);
+            for (const device of registered) device.model ??= missing.get(device.udid);
+        } catch (error) {
+            console.warn(`could not record device models (${errorMessage(error)})`);
+        }
+    }
     const online = new Map(connected.map((device) => [device.udid, device]));
     return registered.map((device) => ({
         ...redactDevice(device),
@@ -188,8 +205,45 @@ async function registeredWithStatus(discover: () => Promise<Device[]> = connecte
     }));
 }
 
+export interface RegisteredRoute {
+    method: string;
+    url: string;
+}
+
+export interface RouteAccessEntry extends RegisteredRoute {
+    requirement: RouteRequirement | undefined;
+}
+
+const appRoutes = new WeakMap<FastifyInstance, { routes: RegisteredRoute[]; requirements: Map<string, RouteRequirement> }>();
+
+/**
+ * Every route the app registered, with the requirement the authorization hook
+ * applies to it. `requirement: undefined` means admin-only by default —
+ * test/auth-route-coverage.test.ts insists there are none.
+ */
+export function routeAccessReport(app: FastifyInstance): RouteAccessEntry[] {
+    const entry = appRoutes.get(app);
+    if (!entry) return [];
+    return entry.routes.map((route) => ({ ...route, requirement: entry.requirements.get(routeKey(route.method, route.url)) }));
+}
+
+/** Browser page navigations get redirects and HTML; API and asset requests get JSON. */
+function wantsPage(request: FastifyRequest): boolean {
+    const pathname = request.url.split('?')[0] ?? '';
+    if (!['GET', 'HEAD'].includes(request.method) || pathname.startsWith('/api/') || pathname.startsWith('/assets/')) return false;
+    const accept = request.headers.accept ?? '';
+    return !request.headers['hx-request'] && (accept === '' || accept.includes('text/html') || accept.includes('*/*'));
+}
+
+
 export async function createApp(options: CreateAppOptions): Promise<FastifyInstance> {
     const app = Fastify({ logger: options.logger ?? false, bodyLimit: 50 * 1024 * 1024 });
+    const routes: RegisteredRoute[] = [];
+    const requirements = buildRouteRequirements(options.plugins.list());
+    appRoutes.set(app, { routes, requirements });
+    app.addHook('onRoute', (route) => {
+        for (const method of [route.method].flat()) routes.push({ method: String(method), url: route.url ?? route.path });
+    });
     await app.register(formbody);
     await app.register(cookie);
     await app.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 * 1024, files: 20 } });
@@ -231,12 +285,106 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         if (!hostMatches) return csrfBlocked(reply);
     });
 
-    if (options.authProvider) {
-        await options.authProvider.registerRoutes(app);
+    // Authentication (who) runs on every request; authorization (what) runs in
+    // the preHandler below, once the route and body are known. With no provider
+    // the dashboard is the loopback-only, everything-allowed tool it always was.
+    const provider = options.authProvider ?? null;
+    const requestUsers = new WeakMap<FastifyRequest, AuthenticatedUser>();
+    const accessOf = (request: FastifyRequest): RequestAccess => (provider ? requestAccessFor(requestUsers.get(request)) : FULL_ACCESS);
+    const pathOf = (request: FastifyRequest) => request.url.split('?')[0] ?? request.url;
+    if (provider) {
+        await provider.registerRoutes(app);
         app.addHook('onRequest', async (request, reply) => {
-            if (options.authProvider?.isPublicPath(request.url.split('?')[0] ?? request.url)) return;
-            const user = await options.authProvider?.authenticate(request, reply);
-            if (!user && !reply.sent) await reply.code(401).send({ error: 'Authentication required' });
+            const pathname = pathOf(request);
+            if (provider.isPublicPath(pathname)) return;
+            const user = await provider.authenticate(request, reply);
+            if (reply.sent) return reply;
+            if (!user) {
+                if (provider.loginPath && request.headers['hx-request']) {
+                    return reply.code(401).header('hx-redirect', provider.loginPath).send({ error: 'Authentication required' });
+                }
+                if (provider.loginPath && wantsPage(request)) {
+                    const next = safeNextPath(request.url);
+                    return reply.redirect(next === '/' ? provider.loginPath : `${provider.loginPath}?next=${encodeURIComponent(next)}`);
+                }
+                return reply.code(401).send({ error: 'Authentication required' });
+            }
+            requestUsers.set(request, user);
+            const changePath = provider.passwordChangePath;
+            if (user.mustChangePassword && changePath) {
+                const allowed = pathname === changePath || pathname === provider.logoutPath
+                    || pathname === '/api/me' || pathname.startsWith('/assets/');
+                if (!allowed) {
+                    if (wantsPage(request)) return reply.redirect(changePath);
+                    return reply.code(403).send({ error: 'Change your password before continuing' });
+                }
+            }
+        });
+    }
+
+    // Authorization, centrally: every route is looked up in the requirement
+    // table (src/auth/route-access.ts). Admins, and users of a provider without
+    // scoped access, pass straight through; operators are checked against the
+    // phone the route touches. Unknown and ungranted phones are both a 404.
+    const deny = (request: FastifyRequest, reply: FastifyReply, statusCode: 403 | 404, message: string) => {
+        if (!pathOf(request).startsWith('/api/') && request.method === 'GET') {
+            const title = statusCode === 404 ? 'Not found' : 'Not allowed';
+            return reply.code(statusCode).type('text/html').send(renderPage(title, `<section class="card"><h1>${escapeHtml(title)}</h1><p class="muted">${escapeHtml(message)}</p><p><a class="button" href="/">Back to devices</a></p></section>`, request));
+        }
+        return reply.code(statusCode).send({ error: message });
+    };
+    const authorizeDevice = async (
+        request: FastifyRequest, reply: FastifyReply, access: RequestAccess, udid: unknown, level: AccessLevel, notFound = 'Device not found',
+    ) => {
+        const device = typeof udid === 'string' && udid ? (await loadRegisteredDevices()).find((entry) => entry.udid === udid) : undefined;
+        const granted = device ? access.levelFor(device) : null;
+        if (!granted) return deny(request, reply, 404, notFound);
+        if (!levelSatisfies(granted, level)) return deny(request, reply, 403, 'You have view-only access to this phone');
+        return undefined;
+    };
+    if (provider) {
+        app.addHook('preHandler', async (request, reply) => {
+            const url = request.routeOptions.url;
+            if (!url || provider.isPublicPath(pathOf(request))) return;
+            const access = accessOf(request);
+            if (access.admin) return;
+            const requirement = requirements.get(routeKey(request.method, url));
+            const params = (request.params ?? {}) as Record<string, string | undefined>;
+            const body = (request.body && typeof request.body === 'object' ? request.body : {}) as Record<string, unknown>;
+            switch (requirement?.kind) {
+                case 'public':
+                case 'signed-in':
+                    return;
+                case 'any-operate':
+                    return access.anyOperate ? undefined : deny(request, reply, 403, 'You need operate access to at least one phone');
+                case 'device':
+                    return authorizeDevice(request, reply, access, params.udid, requirement.level);
+                case 'device-settings': {
+                    // Calibration saves touch points through the device PATCH; that
+                    // alone is an operator action. Everything else is device setup.
+                    const keys = Object.keys(body);
+                    if (keys.length && keys.every((key) => key === 'coordinates')) {
+                        return authorizeDevice(request, reply, access, params.udid, 'operate');
+                    }
+                    const refused = await authorizeDevice(request, reply, access, params.udid, 'view');
+                    return refused ?? deny(request, reply, 403, 'Only an admin can change device settings');
+                }
+                case 'schedule-create':
+                    return authorizeDevice(request, reply, access, body.deviceUdid, 'operate');
+                case 'schedule': {
+                    const schedule = params.id ? await options.scheduler.schedule(params.id) : null;
+                    if (!schedule) return deny(request, reply, 404, 'Schedule not found');
+                    return authorizeDevice(request, reply, access, schedule.deviceUdid, requirement.level, 'Schedule not found');
+                }
+                case 'execution': {
+                    const execution = params.id ? await options.scheduler.execution(params.id) : null;
+                    if (!execution) return deny(request, reply, 404, 'Execution not found');
+                    return authorizeDevice(request, reply, access, execution.deviceUdid, requirement.level, 'Execution not found');
+                }
+                default:
+                    // 'admin', and any route nobody declared: admins only.
+                    return deny(request, reply, 403, 'Admin access required');
+            }
         });
     }
 
@@ -250,9 +398,24 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         screenshots.forget(udid);
         thumbnails.forget(udid);
     };
-    const logoutPath = options.authProvider?.logoutPath;
-    const authNavHtml = logoutPath
-        ? `<a class="button secondary app-logout" href="${escapeHtml(logoutPath)}">Log out</a>` : '';
+    const teamEnabled = isBuiltinAuthProvider(provider);
+    /** The signed-in part of the navigation: Team (admins), the user's name, Log out. */
+    const authNav = (request: FastifyRequest | null, current?: string): string => {
+        const user = request ? requestUsers.get(request) : undefined;
+        if (!provider || !request || !user) return '';
+        const parts: string[] = [];
+        if (teamEnabled && accessOf(request).admin) {
+            parts.push(`<a class="nav-link" href="/team"${current === '/team' ? ' aria-current="page"' : ''}>Team</a>`);
+        }
+        if (user.displayName) parts.push(`<span class="nav-user">${escapeHtml(user.displayName)}</span>`);
+        const logoutPath = provider.logoutPath;
+        if (logoutPath) {
+            parts.push(provider.logoutMethod === 'POST'
+                ? `<form class="nav-logout" method="post" action="${escapeHtml(logoutPath)}"><button class="button secondary app-logout" type="submit">Log out</button></form>`
+                : `<a class="button secondary app-logout" href="${escapeHtml(logoutPath)}">Log out</a>`);
+        }
+        return parts.join('');
+    };
     const navLinks: PluginNavLink[] = options.plugins.list()
         .flatMap((plugin) => plugin.navLinks ?? [])
         .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
@@ -278,13 +441,14 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         }
     }
     const brand = brandHtml(branding, logo ? `/assets/brand-logo?v=${logo.hash}` : null);
-    const renderPage = (title: string, body: string) => page(title, body, logoutPath, navLinks, branding, footer);
+    const renderPage = (title: string, body: string, request?: FastifyRequest) =>
+        page(title, body, authNav(request ?? null), navLinks, branding, footer);
 
     let themed: LoadedDashboardTheme | null = null;
     if (options.dashboardTheme) {
         const root = options.dashboardTheme.rootDirectory;
         const require = createRequire(import.meta.url);
-        const [indexHtml, deviceHtml, tasksHtml, registerDeviceHtml, rawStyles, deviceScript, tasksScript, registerDeviceScript, gridScript, htmx] = await Promise.all([
+        const [indexHtml, deviceHtml, tasksHtml, registerDeviceHtml, rawStyles, deviceScript, tasksScript, registerDeviceScript, gridScript, htmx, teamScript] = await Promise.all([
             readFile(path.join(root, 'templates/index.html'), 'utf8'),
             readFile(path.join(root, 'templates/device.html'), 'utf8'),
             readFile(path.join(root, 'templates/tasks.html'), 'utf8'),
@@ -295,6 +459,10 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             readFile(path.join(root, 'assets/register-device.js'), 'utf8'),
             readFile(path.join(root, 'assets/grid.js'), 'utf8'),
             readFile(require.resolve('htmx.org/dist/htmx.min.js'), 'utf8'),
+            // The Team panel script ships with the package; a custom theme may override it.
+            readFile(path.join(root, 'assets/team.js'), 'utf8')
+                .catch(() => readFile(new URL('../../static/dashboard/assets/team.js', import.meta.url), 'utf8'))
+                .catch(() => ''),
         ]);
         const fonts = new Map<string, Buffer>();
         for (const name of DASHBOARD_FONTS) {
@@ -315,24 +483,70 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const versions: Record<string, string> = {
             'styles.css': assetHash(styles), 'device.js': assetHash(deviceScript),
             'tasks.js': assetHash(tasksScript), 'register-device.js': assetHash(registerDeviceScript),
-            'grid.js': assetHash(gridScript), 'htmx.min.js': assetHash(htmx),
+            'grid.js': assetHash(gridScript), 'htmx.min.js': assetHash(htmx), 'team.js': assetHash(teamScript),
             ...fontVersions,
         };
         const finalize = (html: string) => {
-            let out = html.replaceAll('__AUTH_NAV__', authNavHtml).replaceAll('__PLUGIN_NAV__', pluginNavHtml)
+            // __AUTH_NAV__ stays: it names the signed-in user, so it is filled per request.
+            let out = html.replaceAll('__PLUGIN_NAV__', pluginNavHtml)
                 .replaceAll('__BRAND__', brand).replaceAll('__BRAND_TITLE__', escapeHtml(branding.title))
                 .replaceAll('__FOOTER__', footer);
             for (const [name, v] of Object.entries(versions)) out = out.replaceAll(`/assets/${name}`, `/assets/${name}?v=${v}`);
             return out;
         };
         themed = {
+            versions, teamScript,
             indexHtml: finalize(indexHtml), deviceHtml: finalize(deviceHtml),
             tasksHtml: finalize(tasksHtml), registerDeviceHtml: finalize(registerDeviceHtml),
             styles, deviceScript, tasksScript, registerDeviceScript, gridScript, htmx, fonts,
         };
     }
 
-    const renderActivity = async (deviceUdid: string, message?: string): Promise<string> => {
+    /**
+     * Fill a themed template for this request: the signed-in navigation, and
+     * body markers the stylesheet uses to hide controls the user cannot use
+     * (the server still refuses them — this is presentation only).
+     */
+    const personalize = (html: string, request: FastifyRequest, deviceLevel?: AccessLevel | null): string => {
+        const access = accessOf(request);
+        let out = html.replaceAll('__AUTH_NAV__', authNav(request));
+        const markers = [
+            ...(access.admin ? [] : ['data-role="operator"']),
+            ...(deviceLevel === 'view' ? ['data-device-access="view"'] : []),
+        ];
+        if (markers.length) out = out.replace('<body ', `<body ${markers.join(' ')} `);
+        return out;
+    };
+
+    /** A page built in code (sign-in, password, Team) in the dashboard's own shell. */
+    const renderShell = (request: FastifyRequest | null, shell: ShellOptions): string => {
+        const main = `<main class="shell ${escapeHtml(shell.mainClass ?? '')}">${shell.main}</main>`;
+        if (!themed) return page(shell.title, shell.main, authNav(request), shell.bare ? [] : navLinks, branding, footer);
+        const v = themed.versions;
+        const access = request ? accessOf(request) : FULL_ACCESS;
+        const nav = shell.bare ? '' : `<nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/">Devices</a><a class="nav-link" href="/tasks">Tasks</a>${access.admin ? '<a class="nav-link" href="/devices/register">Register</a>' : ''}${pluginNavHtml}${authNav(request, shell.current)}</nav>`;
+        const scripts = (shell.scripts ?? []).map((name) => `<script type="module" src="/assets/${escapeHtml(name)}?v=${escapeHtml(v[name] ?? '')}"></script>`).join('');
+        return `<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(shell.title)} · ${escapeHtml(branding.title)}</title>
+    <link rel="preload" href="/assets/fonts/oswald-latin-variable.woff2?v=${v['fonts/oswald-latin-variable.woff2'] ?? ''}" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/assets/fonts/poppins-latin-400.woff2?v=${v['fonts/poppins-latin-400.woff2'] ?? ''}" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="/assets/styles.css?v=${v['styles.css']}">
+</head>
+<body class="${escapeHtml(shell.bodyClass ?? '')}">
+    <header class="topbar"><div class="topbar-inner">${brand}${nav}</div></header>
+    ${main}
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    ${scripts}
+    <footer class="app-footer">${footer}</footer>
+</body>
+</html>`;
+    };
+
+    const renderActivity = async (deviceUdid: string, message?: string, canOperate = true): Promise<string> => {
         const executions = await options.scheduler.listExecutions(25, deviceUdid);
         const execution = executions.find(({ status }) => status === 'running') ?? executions[0];
         const errorBanner = message
@@ -351,7 +565,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const summary = definition
             ? definition.summarize(execution.payload)
             : `${execution.pluginId}/${execution.taskType}@${execution.taskVersion} (plugin not installed)`;
-        const canStop = execution.status === 'queued' || (execution.status === 'running' && (definition?.supportsStop(execution.payload) ?? true));
+        const canStop = canOperate && execution.status === 'queued' || (execution.status === 'running' && (definition?.supportsStop(execution.payload) ?? true));
         const stop = canStop
             ? `<form hx-post="/api/executions/${execution.id}/stop" hx-target="#device-activity" hx-swap="outerHTML"><button class="button secondary" type="submit">Stop</button></form>` : '';
         return `<section id="device-activity" class="run-panel" hx-get="/api/devices/${encodeURIComponent(deviceUdid)}/fragments/activity" hx-trigger="every 1s" hx-swap="outerHTML"><div class="run-heading"><span class="status ${escapeHtml(execution.status)}"><span class="dot"></span>${escapeHtml(execution.status)}</span><span class="run-meta">${escapeHtml(summary)} · <time datetime="${escapeHtml(execution.scheduledFor.toISOString())}" data-local-time>${escapeHtml(execution.scheduledFor.toISOString().slice(0, 16).replace('T', ' '))} UTC</time></span></div>${errorBanner}${stop}<pre role="log" aria-live="polite">${detail?.logs.length ? detail.logs.map(escapeHtml).join('\n') : escapeHtml(execution.error ?? 'Waiting for worker output…')}</pre></section>`;
@@ -373,7 +587,26 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         id: plugin.id, version: plugin.version, displayName: plugin.displayName,
         tasks: plugin.tasks.map(({ type, version, displayName }) => ({ type, version, displayName })),
     })));
-    app.get('/api/devices', async () => registeredWithStatus(discover));
+    /** Registered phones this request may see, each with the caller's level on it. */
+    const visibleDevices = async (request: FastifyRequest) => {
+        const access = accessOf(request);
+        return (await registeredWithStatus(discover)).flatMap((device) => {
+            const level = access.levelFor(device);
+            return level ? [{ ...device, access: level }] : [];
+        });
+    };
+    /** Phones whose schedules and runs this request may list: UDID → level. Null means every phone. */
+    const listableUdids = async (request: FastifyRequest, only?: string): Promise<Map<string, AccessLevel> | null> => {
+        const access = accessOf(request);
+        if (access.admin) return null;
+        const visible = new Map<string, AccessLevel>();
+        for (const device of await loadRegisteredDevices()) {
+            const level = access.levelFor(device);
+            if (level && (!only || device.udid === only)) visible.set(device.udid, level);
+        }
+        return visible;
+    };
+    app.get('/api/devices', async (request) => visibleDevices(request));
     app.get('/api/devices/discovered', async () => connectedDevices());
     app.get('/api/device-registrations/candidates', async (_request, reply) => {
         if (!options.registrations) return reply.code(503).send({ error: 'Device registration is not configured' });
@@ -409,9 +642,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         await options.registrations.cancel(request.params.id);
         return reply.code(204).send();
     });
-    app.post<{ Body: { name?: string; udid?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinateProfile?: string; rackSlot?: string; pluginData?: Record<string, JsonObject> } }>(
+    app.post<{ Body: { name?: string; udid?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinateProfile?: string; rackSlot?: string; rack?: string; model?: string; pluginData?: Record<string, JsonObject> } }>(
         '/api/devices', async (request, reply) => {
-            const { name, udid, wdaLocalPort, mjpegLocalPort, passcode, coordinateProfile, rackSlot, pluginData } = request.body;
+            const { name, udid, wdaLocalPort, mjpegLocalPort, passcode, coordinateProfile, rackSlot, rack, model, pluginData } = request.body;
             if (!udid) return reply.code(400).send({ error: 'A device UDID is required' });
             if (passcode !== undefined && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
@@ -425,6 +658,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     ...(mjpegLocalPort !== undefined ? { mjpegLocalPort } : {}),
                     ...(coordinateProfile !== undefined ? { coordinateProfile: coordinateProfile as RegisteredDevice['coordinateProfile'] } : {}),
                     ...(rackSlot !== undefined ? { rackSlot } : {}),
+                    ...(rack !== undefined ? { rack: String(rack) } : {}),
+                    ...(model !== undefined ? { model: String(model) } : {}),
                     ...(passcode !== undefined ? { passcode } : {}),
                 };
                 devices.push(device);
@@ -433,9 +668,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             return reply.code(201).send(redactDevice(created));
         },
     );
-    app.patch<{ Params: { udid: string }; Body: { name?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinates?: unknown; disabled?: boolean; coordinateProfile?: string; rackSlot?: string; pluginData?: Record<string, JsonObject> } }>(
+    app.patch<{ Params: { udid: string }; Body: { name?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinates?: unknown; disabled?: boolean; coordinateProfile?: string; rackSlot?: string; rack?: string; model?: string; pluginData?: Record<string, JsonObject> } }>(
         '/api/devices/:udid', async (request, reply) => {
-            const { passcode, coordinates, name, wdaLocalPort, mjpegLocalPort, disabled, coordinateProfile, rackSlot, pluginData } = request.body;
+            const { passcode, coordinates, name, wdaLocalPort, mjpegLocalPort, disabled, coordinateProfile, rackSlot, rack, model, pluginData } = request.body;
             if (passcode !== undefined && passcode !== '' && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
             }
@@ -451,6 +686,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 if (coordinateProfile !== undefined) device.coordinateProfile = coordinateProfile as RegisteredDevice['coordinateProfile'];
                 // rackSlot: a value sets it, '' clears it (saveRegisteredDevices trims and drops empties)
                 if (rackSlot !== undefined) device.rackSlot = rackSlot;
+                // rack / model: same rule — a value sets it, '' clears it
+                if (rack !== undefined) device.rack = String(rack);
+                if (model !== undefined) device.model = String(model);
                 if (pluginData !== undefined) device.pluginData = pluginData;
                 if (disabled === true) device.disabled = true;
                 else if (disabled === false) delete device.disabled;
@@ -611,12 +849,32 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return reply.code(202).send({ ok: true, message: 'The shared WDA supervisor will reconnect automatically' });
     });
 
-    app.get<{ Querystring: { deviceUdid?: string } }>('/api/schedules', async (request) => ({
-        schedules: await options.scheduler.listSchedules(200, request.query.deviceUdid),
-    }));
-    app.get<{ Querystring: { deviceUdid?: string } }>('/api/executions', async (request) => ({
-        executions: await options.scheduler.listExecutions(200, request.query.deviceUdid),
-    }));
+    app.get<{ Querystring: { deviceUdid?: string } }>('/api/schedules', async (request) => {
+        const scope = await listableUdids(request, request.query.deviceUdid);
+        if (!scope) {
+            const schedules = await options.scheduler.listSchedules(200, request.query.deviceUdid);
+            return { schedules: schedules.map((schedule) => ({ ...schedule, access: 'operate' })) };
+        }
+        if (!scope.size) return { schedules: [] };
+        const schedules = await options.scheduler.listSchedules(200, [...scope.keys()]);
+        return {
+            schedules: schedules.filter(({ deviceUdid }) => scope.has(deviceUdid))
+                .map((schedule) => ({ ...schedule, access: scope.get(schedule.deviceUdid) })),
+        };
+    });
+    app.get<{ Querystring: { deviceUdid?: string } }>('/api/executions', async (request) => {
+        const scope = await listableUdids(request, request.query.deviceUdid);
+        if (!scope) {
+            const executions = await options.scheduler.listExecutions(200, request.query.deviceUdid);
+            return { executions: executions.map((execution) => ({ ...execution, access: 'operate' })) };
+        }
+        if (!scope.size) return { executions: [] };
+        const executions = await options.scheduler.listExecutions(200, [...scope.keys()]);
+        return {
+            executions: executions.filter(({ deviceUdid }) => scope.has(deviceUdid))
+                .map((execution) => ({ ...execution, access: scope.get(execution.deviceUdid) })),
+        };
+    });
     app.get<{ Params: { id: string } }>('/api/executions/:id', async (request, reply) => {
         const execution = await options.scheduler.execution(request.params.id);
         return execution ?? reply.code(404).send({ error: 'Execution not found' });
@@ -738,6 +996,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         app.get('/assets/register-device.js', asset('text/javascript', theme.registerDeviceScript));
         app.get('/assets/grid.js', asset('text/javascript', theme.gridScript));
         app.get('/assets/htmx.min.js', asset('text/javascript', theme.htmx));
+        if (theme.teamScript) app.get('/assets/team.js', asset('text/javascript', theme.teamScript));
         if (logo) app.get('/assets/brand-logo', asset(logo.contentType, logo.body));
         // Whitelisted by name: the parameter is only ever a map key, never a path.
         const fontRoutes = new Map([...theme.fonts].map(([name, body]) => [name, asset('font/woff2', body, 'public, max-age=86400')]));
@@ -746,9 +1005,10 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             if (!serve) return reply.code(404).send({ error: 'Font not found' });
             return serve(request, reply);
         });
-        app.get('/api/fragments/devices', async (_request, reply) => {
+        app.get('/api/fragments/devices', async (request, reply) => {
+            const admin = accessOf(request).admin;
             const [devices, supervisor] = await Promise.all([
-                registeredWithStatus(discover),
+                visibleDevices(request),
                 // One supervisor read per poll. If the socket is down we cannot tell
                 // ready from not-ready, so connected phones render a preview as before.
                 wdaStatuses().catch(() => null),
@@ -757,7 +1017,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             const active = devices.filter((device) => !device.disabled);
             const disabled = devices.filter((device) => device.disabled);
             const refreshMs = gridPollSeconds(active.length) * 1000;
-            const toggleButton = (udid: string, label: string, next: boolean) =>
+            // Disconnect / Reconnect change device settings: admins only.
+            const toggleButton = (udid: string, label: string, next: boolean) => !admin ? '' :
                 `<button type="button" id="toggle-${deviceKey(udid)}" class="button secondary device-toggle" data-toggle-device="${encodeURIComponent(udid)}" data-disabled="${next}">${label}</button>`;
             let online = 0;
             let attention = 0;
@@ -777,7 +1038,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 // The rack slot is what turns "iPhone 14 is offline" into a phone
                 // somebody can walk up to, so it shows online and offline alike,
                 // as a badge on the phone frame.
-                const slot = device.rackSlot ? `<p class="rack-slot" title="Slot ${escapeHtml(device.rackSlot)}">Slot ${escapeHtml(device.rackSlot)}</p>` : '';
+                const place = [device.rack ? `Rack ${device.rack}` : '', device.rackSlot ? `Slot ${device.rackSlot}` : ''].filter(Boolean).join(' · ');
+                const slot = place ? `<p class="rack-slot" title="${escapeHtml(place)}">${escapeHtml(place)}</p>` : '';
                 const preview = state === 'ready'
                     ? `<div class="device-preview-frame">${slot}<img id="${previewId(device.udid)}" class="device-preview" hx-preserve="true" data-thumb-src="/api/devices/${encodeURIComponent(device.udid)}/remote/thumbnail" data-refresh-ms="${refreshMs}" alt="Screen of ${escapeHtml(device.name)}" draggable="false" decoding="async"></div>`
                     : `<div class="device-preview-frame unavailable">${slot}<div class="device-icon" aria-hidden="true"></div></div>`;
@@ -790,14 +1052,16 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                         : '<span class="connected offline"><span></span>Offline</span>';
                 const age = state === 'ready' ? `<p class="preview-age">${escapeHtml(ageText(screenshots.peek(device.udid).at))}</p>` : '';
                 const accountList = accounts.map(escapeHtml).join(', ');
-                return `<article class="device-card" data-state="${state}"${ratio}>${preview}<div class="device-copy"><h2 title="${escapeHtml(device.name)}">${escapeHtml(device.name)}</h2>${pill}<p class="device-meta" title="${escapeHtml(device.udid)}">${device.connected ? `iOS ${escapeHtml(device.connected.osVersion)}` : escapeHtml(device.udid)}</p>${accounts.length ? `<p class="accounts" title="${accountList}">${accountList}</p>` : ''}${age}</div><div class="device-card-actions"><a id="open-${deviceKey(device.udid)}" class="button secondary" href="/devices/${encodeURIComponent(device.udid)}" aria-label="Open ${escapeHtml(device.name)}">Open</a>${toggleButton(device.udid, 'Disconnect', true)}</div></article>`;
+                return `<article class="device-card" data-state="${state}"${ratio}>${preview}<div class="device-copy"><h2 title="${escapeHtml(device.name)}">${escapeHtml(device.name)}</h2>${pill}<p class="device-meta" title="${escapeHtml(device.model ? `${device.model} · ${device.udid}` : device.udid)}">${device.connected ? `iOS ${escapeHtml(device.connected.osVersion)}` : escapeHtml(device.udid)}</p>${accounts.length ? `<p class="accounts" title="${accountList}">${accountList}</p>` : ''}${age}</div><div class="device-card-actions"><a id="open-${deviceKey(device.udid)}" class="button secondary" href="/devices/${encodeURIComponent(device.udid)}" aria-label="Open ${escapeHtml(device.name)}">Open</a>${toggleButton(device.udid, 'Disconnect', true)}</div></article>`;
             }).join('');
             const summary = active.length
                 ? `<p class="grid-summary">${online} online · ${attention} need attention · ${active.length} total</p>` : '';
             const disabledPanel = disabled.length
                 ? `<details class="disabled-devices"><summary>Disconnected devices (${disabled.length})</summary><ul>${disabled.map((device) => `<li><span>${escapeHtml(device.name)}</span>${toggleButton(device.udid, 'Reconnect', false)}</li>`).join('')}</ul></details>`
                 : '';
-            return reply.type('text/html').send(`<section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="every ${gridPollSeconds(active.length)}s" hx-swap="outerHTML" data-refresh-ms="${refreshMs}">${summary}${cards || `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones yet</h2><p>${disabled.length ? 'Every registered phone is disconnected. Reconnect one below, or register another.' : 'Plug an iPhone in over USB, trust this Mac, then register it.'}</p><a class="button primary" href="/devices/register">Register a phone</a></div>`}${disabledPanel}</section>`);
+            return reply.type('text/html').send(`<section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="every ${gridPollSeconds(active.length)}s" hx-swap="outerHTML" data-refresh-ms="${refreshMs}">${summary}${cards || (admin
+                ? `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones yet</h2><p>${disabled.length ? 'Every registered phone is disconnected. Reconnect one below, or register another.' : 'Plug an iPhone in over USB, trust this Mac, then register it.'}</p><a class="button primary" href="/devices/register">Register a phone</a></div>`
+                : `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones shared with you</h2><p>${disabled.length ? 'Your phones are disconnected right now. An admin can reconnect them.' : 'An admin has not given you access to any phone yet. Ask them to add you on the Team page.'}</p></div>`)}${disabledPanel}</section>`);
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/summary', async (request, reply) => {
             const [connectedList, registeredList] = await Promise.all([connectedDevices(), loadRegisteredDevices()]);
@@ -807,40 +1071,49 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 // operator still knows which phone this is. Unknown UDIDs are a 404.
                 const known = registeredList.find(({ udid }) => udid === request.params.udid);
                 if (!known) return reply.code(404).type('text/html').send('<section id="device-summary" class="device-summary error"><div class="banner err" role="alert"><strong>Device not found</strong><p>No registered phone has this UDID.</p></div></section>');
-                const knownSlot = known.rackSlot ? `<p>Slot ${escapeHtml(known.rackSlot)}</p>` : '';
+                const knownPlace = [known.model, known.rack ? `Rack ${known.rack}` : '', known.rackSlot ? `Slot ${known.rackSlot}` : ''].filter(Boolean).join(' · ');
+                const knownSlot = knownPlace ? `<p>${escapeHtml(knownPlace)}</p>` : '';
                 return reply.type('text/html').send(`<section id="device-summary" class="device-summary error"><div class="device-summary-head"><div><span class="eyebrow">Registered device</span><h1>${escapeHtml(known.name)}</h1><span class="connected offline"><span></span>Offline</span>${knownSlot}</div><code title="UDID">${escapeHtml(known.udid)}</code></div><div class="banner err" role="alert"><strong>Device disconnected</strong><p>This phone is not visible over USB. Check the cable and hub port, unlock the phone and accept Trust, then reload this page.</p></div></section>`);
             }
             const screen = await remote.getScreenInfo(device.udid);
-            const rackSlot = registeredList.find(({ udid }) => udid === device.udid)?.rackSlot;
-            const slot = rackSlot ? ` · slot ${escapeHtml(rackSlot)}` : '';
+            const known = registeredList.find(({ udid }) => udid === device.udid);
+            const slot = [known?.rack ? `rack ${known.rack}` : '', known?.rackSlot ? `slot ${known.rackSlot}` : '']
+                .filter(Boolean).map((part) => ` · ${escapeHtml(part)}`).join('');
             return reply.type('text/html').send(`<section id="device-summary" class="device-summary" data-screen-width="${screen.screenSize.width}" data-screen-height="${screen.screenSize.height}"><div><span class="eyebrow">Connected device</span><h1>${escapeHtml(device.name)}</h1><p>iOS ${escapeHtml(device.osVersion)} · ${screen.screenSize.width} × ${screen.screenSize.height} points · ${screen.scale}×${slot}</p></div><code title="UDID">${escapeHtml(device.udid)}</code></section>`);
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/activity', async (request, reply) => {
-            return reply.type('text/html').send(await renderActivity(request.params.udid));
+            const access = accessOf(request);
+            const device = access.admin ? undefined : (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
+            const canOperate = access.admin || levelSatisfies(device ? access.levelFor(device) : null, 'operate');
+            return reply.type('text/html').send(await renderActivity(request.params.udid, undefined, canOperate));
         });
     }
 
-    app.get('/', async (_request, reply) => {
-        if (themed) return reply.type('text/html').send(themed.indexHtml);
-        const devices = await registeredWithStatus(discover);
+    app.get('/', async (request, reply) => {
+        if (themed) return reply.type('text/html').send(personalize(themed.indexHtml, request));
+        const admin = accessOf(request).admin;
+        const devices = await visibleDevices(request);
         const cards = devices.map((device) => `<div class="card"><h2>${escapeHtml(device.name)}</h2><p class="muted"><code>${escapeHtml(device.udid)}</code></p><p>${device.disabled ? 'Disconnected' : device.connected ? `Online · iOS ${escapeHtml(device.connected.osVersion)}` : 'Offline'}</p><a class="button" href="/devices/${encodeURIComponent(device.udid)}">Open device</a></div>`).join('');
-        const connected = await connectedDevices();
+        const connected = admin ? await connectedDevices() : [];
         const registeredIds = new Set(devices.map(({ udid }) => udid));
         const candidates = connected.filter(({ udid }) => !registeredIds.has(udid)).map((device) => `<option value="${escapeHtml(device.udid)}" data-name="${escapeHtml(device.name)}">${escapeHtml(device.name)} · ${escapeHtml(device.osVersion)}</option>`).join('');
         const registration = candidates ? `<section class="card"><h2>Register connected device</h2><form id="register-device"><select name="udid">${candidates}</select> <button>Register</button></form><p id="register-result" class="muted"></p><script>document.getElementById('register-device').addEventListener('submit',async function(e){e.preventDefault();var s=e.currentTarget.udid;var o=s.options[s.selectedIndex];var r=await fetch('/api/devices',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({udid:o.value,name:o.dataset.name,pluginData:{}})});document.getElementById('register-result').textContent=r.ok?'Registered. Reloading…':(await r.json()).error;if(r.ok)setTimeout(function(){location.reload()},500)});</script></section>` : '';
-        return reply.type('text/html').send(renderPage('Devices', `<h1>Devices</h1>${registration}<div class="grid">${cards || '<p>No devices registered.</p>'}</div>`));
+        return reply.type('text/html').send(renderPage('Devices', `<h1>Devices</h1>${registration}<div class="grid">${cards || '<p>No devices registered.</p>'}</div>`, request));
     });
-    app.get('/devices/register', async (_request, reply) => {
-        if (!themed) return reply.type('text/html').send(renderPage('Register device', '<h1>Register device</h1><p>Use <code>POST /api/device-registrations</code> to start device setup.</p>'));
-        return reply.type('text/html').send(themed.registerDeviceHtml);
+    app.get('/devices/register', async (request, reply) => {
+        if (!themed) return reply.type('text/html').send(renderPage('Register device', '<h1>Register device</h1><p>Use <code>POST /api/device-registrations</code> to start device setup.</p>', request));
+        return reply.type('text/html').send(personalize(themed.registerDeviceHtml, request));
     });
     app.get<{ Params: { udid: string } }>('/devices/:udid', async (request, reply) => {
         const device = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
-        if (!device) return reply.code(404).type('text/html').send(renderPage('Not found', '<section class="card"><h1>Device not found</h1><p class="muted">No registered phone has this UDID. It may have been removed, or the link is from another farm.</p><p><a class="button" href="/">Back to devices</a></p></section>'));
+        if (!device) return reply.code(404).type('text/html').send(renderPage('Not found', '<section class="card"><h1>Device not found</h1><p class="muted">No registered phone has this UDID. It may have been removed, or the link is from another farm.</p><p><a class="button" href="/">Back to devices</a></p></section>', request));
+        const access = accessOf(request);
+        const level = access.levelFor(device);
+        const canOperate = levelSatisfies(level, 'operate');
         if (themed) {
             const rendered = options.dashboardTheme?.renderDevice
                 ? options.dashboardTheme.renderDevice(themed.deviceHtml, device) : themed.deviceHtml;
-            return reply.type('text/html').send(rendered.replaceAll('__DEVICE_UDID__', encodeURIComponent(device.udid)));
+            return reply.type('text/html').send(personalize(rendered.replaceAll('__DEVICE_UDID__', encodeURIComponent(device.udid)), request, level));
         }
         const schedules = await options.scheduler.listSchedules(50, device.udid);
         const executions = await options.scheduler.listExecutions(50, device.udid);
@@ -854,17 +1127,26 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 }
             }
         }
-        const scheduleRows = schedules.map((item) => `<tr><td>${escapeHtml(item.pluginId)}/${escapeHtml(item.taskType)}</td><td>${escapeHtml(JSON.stringify(item.timing))}<br><span class="muted">Next: ${escapeHtml(item.nextRunAt?.toISOString() ?? '—')}</span></td><td>${escapeHtml(item.status)}</td><td>${item.status === 'active' ? `<button data-schedule="${item.id}" data-status="paused">Pause</button>` : item.status === 'paused' ? `<button data-schedule="${item.id}" data-status="active">Resume</button>` : ''} ${!['cancelled', 'completed'].includes(item.status) ? `<button data-schedule="${item.id}" data-status="cancelled">Cancel</button>` : ''}</td></tr>`).join('');
-        const executionRows = executions.map((item) => `<tr><td>${escapeHtml(item.pluginId)}/${escapeHtml(item.taskType)}</td><td>${escapeHtml(item.status)}<br><span class="muted">${escapeHtml(item.scheduledFor.toISOString())}</span></td><td><a href="/api/executions/${item.id}"><code>${escapeHtml(item.id)}</code></a></td><td>${['queued', 'running'].includes(item.status) ? `<button data-stop="${item.id}">Stop</button>` : ['failed', 'stopped'].includes(item.status) ? `<button data-retry="${item.id}">Retry</button>` : ''}</td></tr>`).join('');
+        const scheduleRows = schedules.map((item) => `<tr><td>${escapeHtml(item.pluginId)}/${escapeHtml(item.taskType)}</td><td>${escapeHtml(JSON.stringify(item.timing))}<br><span class="muted">Next: ${escapeHtml(item.nextRunAt?.toISOString() ?? '—')}</span></td><td>${escapeHtml(item.status)}</td><td>${!canOperate ? '' : item.status === 'active' ? `<button data-schedule="${item.id}" data-status="paused">Pause</button>` : item.status === 'paused' ? `<button data-schedule="${item.id}" data-status="active">Resume</button>` : ''} ${canOperate && !['cancelled', 'completed'].includes(item.status) ? `<button data-schedule="${item.id}" data-status="cancelled">Cancel</button>` : ''}</td></tr>`).join('');
+        const executionRows = executions.map((item) => `<tr><td>${escapeHtml(item.pluginId)}/${escapeHtml(item.taskType)}</td><td>${escapeHtml(item.status)}<br><span class="muted">${escapeHtml(item.scheduledFor.toISOString())}</span></td><td><a href="/api/executions/${item.id}"><code>${escapeHtml(item.id)}</code></a></td><td>${!canOperate ? '' : ['queued', 'running'].includes(item.status) ? `<button data-stop="${item.id}">Stop</button>` : ['failed', 'stopped'].includes(item.status) ? `<button data-retry="${item.id}">Retry</button>` : ''}</td></tr>`).join('');
         const udidJs = encodeURIComponent(device.udid);
-        const passcodeCard = `<section class="card"><h2>Unlock passcode</h2><p class="muted">${device.passcode ? 'A passcode is set.' : 'No passcode set.'} Stored in devices.json, never shown.</p><form id="pc"><input id="pcv" type="password" inputmode="numeric" placeholder="4+ digits" autocomplete="new-password"> <button class="button secondary">Save</button> <button type="button" id="pcc" class="button secondary">Clear</button> <span id="pcr" class="muted"></span></form></section><script>(function(){var f=document.getElementById('pc'),v=document.getElementById('pcv'),r=document.getElementById('pcr');async function set(p){r.textContent='…';var x=await fetch('/api/devices/${udidJs}',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({passcode:p})});if(x.ok){r.textContent=p?'Saved.':'Cleared.';v.value=''}else{r.textContent=((await x.json().catch(function(){return{}})).error)||'Failed'}}f.addEventListener('submit',function(e){e.preventDefault();if(!/^\\d{4,}$/.test(v.value.trim())){r.textContent='4+ digits';return}set(v.value.trim())});document.getElementById('pcc').addEventListener('click',function(){if(confirm('Clear passcode?'))set('')})})();</script>`;
+        const passcodeCard = !access.admin ? '' : `<section class="card"><h2>Unlock passcode</h2><p class="muted">${device.passcode ? 'A passcode is set.' : 'No passcode set.'} Stored in devices.json, never shown.</p><form id="pc"><input id="pcv" type="password" inputmode="numeric" placeholder="4+ digits" autocomplete="new-password"> <button class="button secondary">Save</button> <button type="button" id="pcc" class="button secondary">Clear</button> <span id="pcr" class="muted"></span></form></section><script>(function(){var f=document.getElementById('pc'),v=document.getElementById('pcv'),r=document.getElementById('pcr');async function set(p){r.textContent='…';var x=await fetch('/api/devices/${udidJs}',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({passcode:p})});if(x.ok){r.textContent=p?'Saved.':'Cleared.';v.value=''}else{r.textContent=((await x.json().catch(function(){return{}})).error)||'Failed'}}f.addEventListener('submit',function(e){e.preventDefault();if(!/^\\d{4,}$/.test(v.value.trim())){r.textContent='4+ digits';return}set(v.value.trim())});document.getElementById('pcc').addEventListener('click',function(){if(confirm('Clear passcode?'))set('')})})();</script>`;
         const controls = `<script>document.addEventListener('click',async function(e){var b=e.target.closest('button');if(!b)return;var url,body,method='POST';if(b.dataset.schedule){url='/api/schedules/'+b.dataset.schedule+'/status';body={status:b.dataset.status}}else if(b.dataset.stop){url='/api/executions/'+b.dataset.stop+'/stop'}else if(b.dataset.retry){url='/api/executions/'+b.dataset.retry+'/retry'}else if(b.dataset.remove){if(!confirm('Remove this device? Its schedules will be cancelled.'))return;url='/api/devices/'+encodeURIComponent(b.dataset.remove);method='DELETE'}else{return}b.disabled=true;var r=await fetch(url,{method:method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):'{}'});if(r.ok){location.href=b.dataset.remove?'/':location.href;if(!b.dataset.remove)location.reload()}else{b.disabled=false;alert((await r.json().catch(function(){return{}})).error||'Request failed')}});</script>`;
-        return reply.type('text/html').send(renderPage(device.name, `<h1>${escapeHtml(device.name)}</h1><p><code>${escapeHtml(device.udid)}</code></p>${panels.join('')}<section class="card"><h2>Scheduled and recurring jobs</h2><table><tr><th>Task</th><th>Timing</th><th>Status</th><th>Actions</th></tr>${scheduleRows || '<tr><td colspan="4">No schedules.</td></tr>'}</table></section><section class="card"><h2>Execution history</h2><table><tr><th>Task</th><th>Status</th><th>ID/logs</th><th>Actions</th></tr>${executionRows || '<tr><td colspan="4">No executions.</td></tr>'}</table></section>${passcodeCard}<section class="card"><h2>Danger zone</h2><p class="muted">Removing a device cancels its schedules and forgets its configuration. WebDriverAgent stays installed on the phone.</p><button data-remove="${escapeHtml(device.udid)}" class="button secondary">Remove device</button></section>${controls}`));
+        return reply.type('text/html').send(renderPage(device.name, `<h1>${escapeHtml(device.name)}</h1><p><code>${escapeHtml(device.udid)}</code></p>${panels.join('')}<section class="card"><h2>Scheduled and recurring jobs</h2><table><tr><th>Task</th><th>Timing</th><th>Status</th><th>Actions</th></tr>${scheduleRows || '<tr><td colspan="4">No schedules.</td></tr>'}</table></section><section class="card"><h2>Execution history</h2><table><tr><th>Task</th><th>Status</th><th>ID/logs</th><th>Actions</th></tr>${executionRows || '<tr><td colspan="4">No executions.</td></tr>'}</table></section>${passcodeCard}${access.admin ? `<section class="card"><h2>Danger zone</h2><p class="muted">Removing a device cancels its schedules and forgets its configuration. WebDriverAgent stays installed on the phone.</p><button data-remove="${escapeHtml(device.udid)}" class="button secondary">Remove device</button></section>` : ''}${controls}`, request));
     });
-    app.get('/tasks', async (_request, reply) => reply.type('text/html').send(
-        themed?.tasksHtml ?? renderPage('Tasks', '<h1>Tasks</h1><p>The JSON API exposes schedules and execution history. Installed plugins add task forms to each device page.</p>'),
+    app.get('/tasks', async (request, reply) => reply.type('text/html').send(
+        themed ? personalize(themed.tasksHtml, request)
+            : renderPage('Tasks', '<h1>Tasks</h1><p>The JSON API exposes schedules and execution history. Installed plugins add task forms to each device page.</p>', request),
     ));
-    app.get('/docs', async (_request, reply) => reply.type('text/html').send(renderPage('API', '<h1>API</h1><p>Use <code>/api/plugins</code>, <code>/api/devices</code>, <code>/api/schedules</code>, and <code>/api/executions</code>. This route follows the configured authentication policy.</p>')));
+    app.get('/docs', async (request, reply) => reply.type('text/html').send(renderPage('API', '<h1>API</h1><p>Use <code>/api/plugins</code>, <code>/api/devices</code>, <code>/api/schedules</code>, and <code>/api/executions</code>. Lists answer only with the phones the signed-in user may see.</p>', request)));
+
+    if (isBuiltinAuthProvider(provider)) {
+        registerBuiltinAuthRoutes(app, {
+            provider, renderShell, accessOf,
+            loadDevices: loadRegisteredDevices,
+            log: (event) => app.log.info({ audit: event }, `audit ${event.event}`),
+        });
+    }
 
     app.setErrorHandler((error, request, reply) => {
         request.log.error(error);

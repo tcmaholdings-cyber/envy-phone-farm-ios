@@ -5,6 +5,8 @@ function element(selector) {
     return value;
 }
 const udid = decodeURIComponent(location.pathname.split('/').filter(Boolean).at(-1) ?? '');
+// The server marks a view-only page on <body>; it also refuses the requests, this only avoids offering them.
+const canOperate = document.body.dataset.deviceAccess !== 'view';
 const elements = {
     screen: element('#screen'),
     status: element('#status'),
@@ -86,6 +88,7 @@ const elements = {
     closeRackslot: element('#close-rackslot'),
     rackslotForm: element('#rackslot-form'),
     deviceRackslot: element('#device-rackslot'),
+    deviceRack: element('#device-rack'),
     rackslotResult: element('#rackslot-result'),
     openCalibrate: element('#open-calibrate'),
     calibrateDialog: element('#calibrate-dialog'),
@@ -367,6 +370,8 @@ function pointFromEvent(event) {
     };
 }
 async function sendAction(action) {
+    if (!canOperate)
+        return;
     setStatus('Sending input…', 'busy');
     elements.remoteButtons.forEach((button) => { button.disabled = true; });
     const liveState = () => (elements.phone.classList.contains('is-live') ? 'live' : 'ready');
@@ -429,7 +434,7 @@ elements.remoteButtons.forEach((button) => {
     });
 });
 elements.screen.addEventListener('pointerdown', (event) => {
-    if (!screenSize)
+    if (!screenSize || !canOperate)
         return;
     elements.screen.setPointerCapture(event.pointerId);
     pointerStart = { ...pointFromEvent(event), time: performance.now() };
@@ -650,6 +655,10 @@ function renderDeviceSchedules(schedules) {
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
         const subject = title.textContent;
+        if (schedule.access === 'view') {
+            row.append(state, copy, actions);
+            return row;
+        }
         if (schedule.status === 'active')
             actions.append(taskActionButton('Pause', subject, async () => {
                 await jsonRequest(`/api/schedules/${schedule.id}/pause`, { method: 'POST' });
@@ -687,6 +696,10 @@ function renderDeviceExecutions(executions) {
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
         const subject = `${title.textContent} run`;
+        if (execution.access === 'view') {
+            row.append(state, copy, actions);
+            return row;
+        }
         if (execution.status === 'queued' || (execution.status === 'running' && execution.taskType === 'doomscroll')) {
             const label = execution.status === 'queued' ? 'Cancel' : 'Stop';
             actions.append(taskActionButton(label, subject, async () => {
@@ -1051,14 +1064,15 @@ elements.openRackslot.addEventListener('click', () => {
 elements.closeRackslot.addEventListener('click', () => elements.rackslotDialog.close());
 elements.rackslotForm.addEventListener('submit', async (event) => {
     event.preventDefault();
-    // An empty field clears the slot — the API treats '' the same way it does for the passcode.
+    // An empty field clears the value — the API treats '' the same way it does for the passcode.
     const rackSlot = elements.deviceRackslot.value.trim();
+    const rack = elements.deviceRack.value.trim();
     elements.rackslotResult.textContent = 'Saving…';
     try {
         const response = await fetch(`/api/devices/${encodeURIComponent(udid)}`, {
             method: 'PATCH',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ rackSlot }),
+            body: JSON.stringify({ rack, rackSlot }),
         });
         if (!response.ok) {
             const data = await response.json().catch(() => ({}));
@@ -1066,7 +1080,8 @@ elements.rackslotForm.addEventListener('submit', async (event) => {
         }
         const data = await response.json();
         elements.deviceRackslot.value = data.rackSlot ?? '';
-        elements.rackslotResult.textContent = data.rackSlot ? 'Slot saved.' : 'Slot cleared.';
+        elements.deviceRack.value = data.rack ?? '';
+        elements.rackslotResult.textContent = data.rackSlot || data.rack ? 'Saved.' : 'Rack and slot cleared.';
         toast(elements.rackslotResult.textContent);
     }
     catch (error) {

@@ -58,6 +58,13 @@ Fastify app on `WEB_PORT` (default 3000).
   page and its **routes** under `/plugins/<pluginId>`.
 - `assertSafeBind(host, authProvider)` refuses a non‑loopback bind with no
   auth provider.
+- **Authentication then authorization.** An `onRequest` hook asks the auth
+  provider who is calling; a `preHandler` looks the matched route up in one
+  table (`src/auth/route-access.ts`) and checks the caller's level on the phone
+  the route touches (`src/auth/policy.ts`). List routes filter to the caller's
+  phones. With `PHONE_FARM_AUTH_PLUGIN=builtin` users, groups, grants and
+  sessions live in Postgres schema `auth`; with no provider everything is
+  allowed (loopback-only use). The worker is system-level and never checks users.
 - Owns device **registration** (`DeviceRegistrationService`) and creates the
   scheduler runtime used to enqueue work.
 
@@ -183,6 +190,7 @@ in `src/scheduler/recurrence.ts`; the next occurrence is written to
 | `src/tiktok/` | TikTok automation entrypoints (`doomscroll.ts`, `post.ts`), OCR, coordinates |
 | `src/tiktok-plugin.ts` | The built‑in plugin: task definitions, device panel, routes |
 | `src/plugin.ts` | **Stable plugin & auth interfaces** |
+| `src/auth/` | Built-in accounts: access policy, route requirement table, sessions and sign-in, Team pages/API, `npm run users` |
 | `src/registry.ts` | `PluginRegistry` — task resolution and validation |
 | `src/loader.ts` | Dynamic import of `PHONE_FARM_PLUGINS` / `PHONE_FARM_AUTH_PLUGIN` |
 | `src/example-plugin.ts` | Minimal reference plugin |

@@ -23,6 +23,8 @@ export const defaultDashboardTheme: DashboardTheme = {
         return template.replaceAll('__TIKTOK_ACCOUNT_OPTIONS__', options)
             .replaceAll('__TIKTOK_ACCOUNTS_VALUE__', escapeHtml(configured.join(', ')))
             .replaceAll('__DEVICE_HASPASSCODE__', device.passcode ? '· set' : '· not set')
-            .replaceAll('__DEVICE_RACKSLOT__', escapeHtml(device.rackSlot ?? ''));
+            .replaceAll('__DEVICE_RACKSLOT__', escapeHtml(device.rackSlot ?? ''))
+            .replaceAll('__DEVICE_RACK__', escapeHtml(device.rack ?? ''))
+            .replaceAll('__DEVICE_MODEL__', escapeHtml(device.model ?? ''));
     },
 };

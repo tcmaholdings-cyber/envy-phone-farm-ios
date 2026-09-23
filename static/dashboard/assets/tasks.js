@@ -109,6 +109,10 @@ function renderSchedules(items) {
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
         const subject = `${schedule.taskType} schedule for ${shortDevice(schedule.deviceUdid)}`;
+        if (schedule.access === 'view') {
+            row.append(state, copy, actions);
+            return row;
+        }
         if (schedule.status === 'active' || schedule.status === 'paused')
             actions.append(button('Edit', subject, async () => {
                 const timingText = window.prompt('Edit timing JSON', JSON.stringify(schedule.timing));
@@ -158,6 +162,10 @@ function renderExecutions(items) {
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
         const subject = `${execution.taskType} run on ${shortDevice(execution.deviceUdid)}`;
+        if (execution.access === 'view') {
+            row.append(state, copy, actions);
+            return row;
+        }
         if (execution.status === 'queued' || (execution.status === 'running' && execution.taskType === 'doomscroll')) {
             const label = execution.status === 'queued' ? 'Cancel' : 'Stop';
             actions.append(button(label, subject, async () => {

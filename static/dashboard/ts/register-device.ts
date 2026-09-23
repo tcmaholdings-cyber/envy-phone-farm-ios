@@ -7,7 +7,7 @@ interface Snapshot {
     id: string; device: Device & { productType?: string; modelName?: string }; name: string; coordinateProfile?: string;
     availableProfiles: Array<{ name: string; displayName: string; screenSize: { width: number; height: number } }>;
     recommendedProfile?: string;
-    wdaLocalPort: number; mjpegLocalPort: number; rackSlot: string; tiktokAccounts: string[]; hasPasscode: boolean;
+    wdaLocalPort: number; mjpegLocalPort: number; rackSlot: string; rack?: string; tiktokAccounts: string[]; hasPasscode: boolean;
     busy: boolean; checks: Record<string, RegistrationCheck>; logs: string[]; canFinalize: boolean; finalized: boolean;
 }
 
@@ -21,6 +21,8 @@ const form = document.querySelector<HTMLFormElement>('#registration-details')!;
 const nameInput = document.querySelector<HTMLInputElement>('#registration-name')!;
 const profileInput = document.querySelector<HTMLSelectElement>('#registration-profile')!;
 const rackSlotInput = document.querySelector<HTMLInputElement>('#registration-rackslot')!;
+const rackInput = document.querySelector<HTMLInputElement>('#registration-rack')!;
+const modelInput = document.querySelector<HTMLInputElement>('#registration-model')!;
 const accountsInput = document.querySelector<HTMLInputElement>('#registration-accounts')!;
 const passcodeInput = document.querySelector<HTMLInputElement>('#registration-passcode')!;
 const ports = document.querySelector<HTMLElement>('#registration-ports')!;
@@ -129,6 +131,9 @@ function render(snapshot: Snapshot): void {
         profileInput.value = snapshot.coordinateProfile ?? (snapshot.availableProfiles.some(({ name }) => name === previous) ? previous : '');
     }
     if (document.activeElement !== rackSlotInput) rackSlotInput.value = snapshot.rackSlot ?? '';
+    if (document.activeElement !== rackInput) rackInput.value = snapshot.rack ?? '';
+    modelInput.value = snapshot.device.modelName ?? '';
+    modelInput.placeholder = snapshot.device.modelName ? '' : 'Unknown model — an admin can set it later';
     if (document.activeElement !== accountsInput) accountsInput.value = snapshot.tiktokAccounts.join(', ');
     passcodeInput.placeholder = snapshot.hasPasscode ? 'Passcode saved in this setup session' : 'Optional numeric passcode';
     ports.textContent = `WDA ${snapshot.wdaLocalPort} · video ${snapshot.mjpegLocalPort}`;
@@ -186,7 +191,7 @@ form.addEventListener('submit', async (event) => {
     try {
         const snapshot = await request<Snapshot>(`/api/device-registrations/${encodeURIComponent(currentId)}`, {
             method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-                name: nameInput.value, coordinateProfile: profileInput.value, rackSlot: rackSlotInput.value,
+                name: nameInput.value, coordinateProfile: profileInput.value, rackSlot: rackSlotInput.value, rack: rackInput.value,
                 tiktokAccounts: accountsInput.value.split(','), passcode: passcodeInput.value || undefined,
             }),
         });

@@ -102,9 +102,14 @@ export class SchedulerRepository {
 
     async deleteAssets(assetIds: string[]): Promise<void> { await this.purgeAssetIds(assetIds); }
 
-    async listSchedules(limit = 100, deviceUdid?: string): Promise<ScheduleRow[]> {
+    /** Newest first. `deviceUdid` narrows to one phone, or to a set of phones (an operator's). */
+    async listSchedules(limit = 100, deviceUdid?: string | readonly string[]): Promise<ScheduleRow[]> {
         const query = this.connection.db.select().from(schedules);
-        return deviceUdid
+        if (Array.isArray(deviceUdid)) {
+            if (!deviceUdid.length) return [];
+            return query.where(inArray(schedules.deviceUdid, [...deviceUdid])).orderBy(desc(schedules.createdAt)).limit(limit);
+        }
+        return typeof deviceUdid === 'string' && deviceUdid
             ? query.where(eq(schedules.deviceUdid, deviceUdid)).orderBy(desc(schedules.createdAt)).limit(limit)
             : query.orderBy(desc(schedules.createdAt)).limit(limit);
     }
@@ -114,9 +119,14 @@ export class SchedulerRepository {
         return row ?? null;
     }
 
-    async listExecutions(limit = 100, deviceUdid?: string): Promise<ExecutionRow[]> {
+    /** Newest first. `deviceUdid` narrows to one phone, or to a set of phones (an operator's). */
+    async listExecutions(limit = 100, deviceUdid?: string | readonly string[]): Promise<ExecutionRow[]> {
         const query = this.connection.db.select().from(executions);
-        return deviceUdid
+        if (Array.isArray(deviceUdid)) {
+            if (!deviceUdid.length) return [];
+            return query.where(inArray(executions.deviceUdid, [...deviceUdid])).orderBy(desc(executions.createdAt)).limit(limit);
+        }
+        return typeof deviceUdid === 'string' && deviceUdid
             ? query.where(eq(executions.deviceUdid, deviceUdid)).orderBy(desc(executions.createdAt)).limit(limit)
             : query.orderBy(desc(executions.createdAt)).limit(limit);
     }

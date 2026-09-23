@@ -21,8 +21,15 @@ export async function loadPlugins(moduleNames: readonly string[]): Promise<Phone
     }));
 }
 
+/** `builtin` selects the accounts shipped in this package (src/auth); anything else is an ESM module name. */
+export const BUILTIN_AUTH_PROVIDER = 'builtin';
+
 export async function loadAuthProvider(moduleName: string | undefined): Promise<AuthProvider | null> {
     if (!moduleName) return null;
+    if (moduleName.trim() === BUILTIN_AUTH_PROVIDER) {
+        const { createBuiltinAuthProviderFromEnv } = await import('./auth/builtin.js');
+        return createBuiltinAuthProviderFromEnv();
+    }
     const loaded = await import(moduleName) as AuthModule;
     const provider = loaded.default ?? loaded.authProvider;
     if (!provider?.id || typeof provider.authenticate !== 'function') {

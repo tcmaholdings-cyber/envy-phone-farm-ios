@@ -88,7 +88,7 @@ passcodes stay out of `.env` too — see [devices & secrets](#devices-and-secret
 
 ```sh
 npm run db:up        # start the bundled Postgres (skip if you run your own)
-npm run db:migrate   # apply scheduler + pg-boss schema
+npm run db:migrate   # apply scheduler, auth and pg-boss schema (safe to re-run)
 ```
 
 ## 5. Build WebDriverAgent
@@ -135,13 +135,36 @@ From a device page you can run the built‑in TikTok tasks (`doomscroll`,
 
 ## Authentication
 
-On a loopback bind (`WEB_HOST=127.0.0.1`) auth is optional. Before binding to
-anything else, set `PHONE_FARM_AUTH_PLUGIN` to an ESM module exporting an
-`AuthProvider`; startup **deliberately fails** otherwise (`assertSafeBind`).
-Write the provider against the `AuthProvider` interface in `src/plugin.ts` —
-it hands you the Fastify instance to register login routes on, an
-`authenticate(request)` hook, and `isPublicPath()` for the unauthenticated
-allow‑list.
+On a loopback bind (`WEB_HOST=127.0.0.1`) that nobody else can reach, sign-in
+is optional. Turn it on before the dashboard is reachable from anywhere else —
+another interface **or a tunnel** (a Cloudflare tunnel connects to loopback, so
+the startup check cannot see it). Before binding to a non-loopback address,
+startup **deliberately fails** without it (`assertSafeBind`).
+
+The simplest way is the built-in accounts:
+
+```sh
+# .env
+PHONE_FARM_AUTH_PLUGIN=builtin
+
+npm run db:migrate                                    # creates the auth tables
+npm run users -- create alice --role admin --name "Alice"
+# prints a temporary password once, on stdout — hand it over privately
+npm run web
+```
+
+Open the dashboard, sign in as `alice` with the temporary password, and choose
+a real one (12+ characters). Add more people from **Team** in the navigation;
+[operations.md](operations.md#team-access-and-vas) explains roles, groups and
+per-phone access. Other CLI commands: `npm run users -- reset-password <username>`
+and `npm run users -- list`.
+
+To use your own identity system instead, set `PHONE_FARM_AUTH_PLUGIN` to an
+ESM module exporting an `AuthProvider` (`src/plugin.ts`) — it gets the Fastify
+instance to register login routes on, an `authenticate(request)` hook, and
+`isPublicPath()` for the unauthenticated allow‑list. Return `access`
+(`UserAccess`) with the user to get the same per-phone rules as the built-in
+accounts; without it every signed-in user can do everything.
 
 ## Devices and secrets
 

@@ -20,6 +20,16 @@ export interface RegisteredDevice {
      * "iPhone 14 is offline" maps to a slot in the rack without unplugging cables.
      */
     rackSlot?: string;
+    /**
+     * Which rack the phone is in — a short label such as `1`. Access grants can
+     * target a whole rack (src/auth/policy.ts), so keep it consistent per rack.
+     */
+    rack?: string;
+    /**
+     * Marketing model name, e.g. `iPhone 12 mini`. Filled in automatically from
+     * USB discovery the first time the phone is seen connected; grants can target it.
+     */
+    model?: string;
     /** When true the farm keeps the entry but stops supervising it — no WDA, no worker, no discovery polling. */
     disabled?: boolean;
     pluginData: Record<string, JsonObject>;
@@ -34,6 +44,55 @@ export const PASSCODE_PATTERN = /^\d{4,}$/;
 
 /** Long enough for "hub 2 · port 7", short enough to stay on one line in the grid. */
 export const RACK_SLOT_MAX_LENGTH = 40;
+/** A rack is a short label ("1", "B"), not a location description. */
+export const RACK_MAX_LENGTH = 20;
+export const MODEL_MAX_LENGTH = 60;
+
+/** Trim and cap an optional label; an empty value removes the field. */
+function normalizeLabel<K extends 'rackSlot' | 'rack' | 'model'>(device: RegisteredDevice, key: K, max: number): void {
+    const value = device[key];
+    if (value === undefined) return;
+    const cleaned = String(value).trim().slice(0, max);
+    if (cleaned) device[key] = cleaned;
+    else delete device[key];
+}
+
+/**
+ * Model names USB discovery can supply for registered phones that have none.
+ * Pure: the caller persists the result (see `backfillDeviceModels`).
+ */
+export function missingModels(
+    devices: readonly RegisteredDevice[],
+    connected: ReadonlyArray<{ udid: string; modelName?: string }>,
+): Map<string, string> {
+    const names = new Map(connected.filter(({ modelName }) => modelName).map(({ udid, modelName }) => [udid, modelName!]));
+    const updates = new Map<string, string>();
+    for (const device of devices) {
+        const name = names.get(device.udid);
+        if (!device.model?.trim() && name) updates.set(device.udid, name);
+    }
+    return updates;
+}
+
+/**
+ * Record the model of every connected phone that has none yet. Idempotent: a
+ * phone that already has a model (including one an admin typed) is left alone.
+ * Check `missingModels` against an already-loaded list first, so the steady
+ * state costs no write.
+ */
+export async function backfillDeviceModels(
+    connected: ReadonlyArray<{ udid: string; modelName?: string }>,
+    registryPath = defaultRegistryPath,
+): Promise<Map<string, string>> {
+    return mutateRegisteredDevices((devices) => {
+        const updates = missingModels(devices, connected);
+        for (const device of devices) {
+            const model = updates.get(device.udid);
+            if (model) device.model = model;
+        }
+        return updates;
+    }, registryPath);
+}
 
 /** A device with its passcode removed and a boolean marker in its place — safe to serialize. */
 export function redactDevice<T extends { passcode?: string }>(device: T): Omit<T, 'passcode'> & { hasPasscode: boolean } {
@@ -75,11 +134,9 @@ export async function saveRegisteredDevices(devices: RegisteredDevice[], registr
             device.coordinates = validateCoordinateOverrides(device.coordinates, device.coordinateProfile);
             if (Object.keys(device.coordinates).length === 0) delete device.coordinates;
         }
-        if (device.rackSlot !== undefined) {
-            const slot = device.rackSlot.trim().slice(0, RACK_SLOT_MAX_LENGTH);
-            if (slot) device.rackSlot = slot;
-            else delete device.rackSlot;
-        }
+        normalizeLabel(device, 'rackSlot', RACK_SLOT_MAX_LENGTH);
+        normalizeLabel(device, 'rack', RACK_MAX_LENGTH);
+        normalizeLabel(device, 'model', MODEL_MAX_LENGTH);
         if (device.disabled !== true) delete device.disabled;
         if (unique.has(device.udid)) throw new Error(`Device ${device.udid} is already registered`);
         unique.add(device.udid);
