@@ -7,12 +7,7 @@ import path from 'node:path';
 import { diagnoseWdaLaunchFailure, wdaUnavailableTooLong } from './diagnostics.js';
 import { resolveDeveloperDir } from './xcode-env.js';
 import { resolveTargetUdid } from './target-device.js';
-
-function required(name: string): string {
-    const value = process.env[name];
-    if (!value) throw new Error(`${name} is required in .env`);
-    return value;
-}
+import { wdaLaunchArgs } from './runner-args.js';
 
 function delay(milliseconds: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -30,7 +25,6 @@ function report(state: WdaState, message: string): void {
 
 // `--udid <udid>`, or the sole registered / connected device, or IOS_UDID.
 const udid = await resolveTargetUdid();
-const teamId = required('XCODE_ORG_ID');
 const developerDir = resolveDeveloperDir();
 const driverPath = path.resolve(process.env.XCUITEST_DRIVER_PATH
     ?? '.appium2/node_modules/appium-xcuitest-driver');
@@ -43,7 +37,7 @@ const remotePort = Number.parseInt(process.env.WDA_REMOTE_PORT ?? '8100', 10);
 const mjpegLocalPort = Number.parseInt(process.env.MJPEG_LOCAL_PORT ?? '9100', 10);
 const mjpegRemotePort = Number.parseInt(process.env.MJPEG_REMOTE_PORT ?? '9100', 10);
 
-await access(projectPath);
+await access(process.env.WDA_XCTESTRUN ?? projectPath);
 if (![localPort, remotePort, mjpegLocalPort, mjpegRemotePort].every(Number.isSafeInteger)) {
     throw new Error('WDA and MJPEG port values must be integers');
 }
@@ -127,19 +121,7 @@ const deviceConnections: DeviceConnections = factoryModule.DEVICE_CONNECTIONS_FA
     })();
 const { utilities } = require('appium-ios-device') as { utilities: IosUtilities };
 
-const args = [
-    'test-without-building',
-    '-project', projectPath,
-    '-scheme', 'WebDriverAgentRunner',
-    '-destination', `id=${udid}`,
-    `IPHONEOS_DEPLOYMENT_TARGET=${process.env.IOS_PLATFORM_VERSION ?? '16.7'}`,
-    `DEVELOPMENT_TEAM=${teamId}`,
-    `PRODUCT_BUNDLE_IDENTIFIER=${required('WDA_BUNDLE_ID')}`,
-    `CODE_SIGN_IDENTITY=${process.env.XCODE_SIGNING_ID ?? 'Apple Development'}`,
-    'CODE_SIGN_STYLE=Automatic',
-    'GCC_TREAT_WARNINGS_AS_ERRORS=0',
-    'COMPILER_INDEX_STORE_ENABLE=NO',
-];
+const args = wdaLaunchArgs(process.env, udid, projectPath);
 
 let child: ChildProcess | undefined;
 let forwarding = false;
