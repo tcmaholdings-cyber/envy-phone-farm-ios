@@ -26,7 +26,8 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 | Path | What |
 | --- | --- |
 | `src/api/app.ts` | the whole HTTP surface: dashboard pages, `/api/*`, fragments, remote control, CSRF guard, asset routes |
-| `src/branding.ts` | env-driven white-label (name, credit, logo, footer) |
+| `src/branding.ts` | env-driven white-label (name, label, credit, logo, footer) |
+| `static/dashboard/styles.css` | the Envy theme; every colour is a `:root` token (`test/styles-lint.test.ts`) — re-skin by editing `:root` only |
 | `src/plugin.ts` | **stable** plugin + auth interfaces; `src/registry.ts` resolves `{pluginId, taskType, taskVersion}` |
 | `src/scheduler/` | pg-boss queue, recurrence, executor, worker |
 | `src/devices/` | discovery (usbmux), `devices.json` registry, registration wizard, WDA supervisor + remote, coordinate profiles |
@@ -46,7 +47,8 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
    without `PHONE_FARM_AUTH_PLUGIN`. Appium and Postgres bind 127.0.0.1. Keep it so.
 4. **Secrets never enter the tree, logs, summaries or HTML.** Passcodes live only
    in `devices.json` (0600) and are redacted by the API (`hasPasscode`).
-   `.env`, `devices.json`, `.appium2/`, `static/brand/*` are git-ignored on purpose.
+   `.env`, `devices.json` and `.appium2/` are git-ignored on purpose. Brand artwork
+   in `static/brand/` is tracked (it is not secret); secrets never go there.
 5. **Escape everything rendered.** Templates are trusted code; device/user values
    go through `escapeHtml`. Plugin panels too.
 6. **Persisted contract keys are not branding.** `com.git-agni.tiktok` and the

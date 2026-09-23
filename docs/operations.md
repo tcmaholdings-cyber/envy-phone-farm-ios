@@ -37,11 +37,43 @@ Postgres: `docker compose ps`, `npm run db:up`, `docker compose stop postgres`.
 Set up an external uptime check against `/health` (through the SSH tunnel or
 VPN) and alert if any phone is not `ready` for more than 15 minutes.
 
+### Grid timings
+
+Run these on the Mac mini (or through the SSH tunnel) before and after a change
+to see what the grid costs. Replace `<udid>` with a phone whose WDA is ready.
+
+```sh
+# The card fragment: should be small and fast (no screenshots are taken for it).
+curl -s -o /dev/null -w 'fragment  %{http_code} %{size_download}B %{time_total}s\n' \
+  http://127.0.0.1:3000/api/fragments/devices
+
+# Full-size PNG (device page) versus the grid thumbnail.
+curl -s -o /dev/null -w 'screenshot %{http_code} %{size_download}B %{time_total}s\n' \
+  'http://127.0.0.1:3000/api/devices/<udid>/remote/screenshot?fresh=1'
+curl -s -o /dev/null -D - -w 'thumbnail %{http_code} %{size_download}B %{time_total}s\n' \
+  http://127.0.0.1:3000/api/devices/<udid>/remote/thumbnail | grep -iE 'etag|thumbnail'
+
+# An unchanged screen should answer 304 with no body (paste the ETag from above).
+curl -s -o /dev/null -H 'if-none-match: "t-…"' -w 'revalidate %{http_code} %{size_download}B\n' \
+  http://127.0.0.1:3000/api/devices/<udid>/remote/thumbnail
+
+# A phone without WDA should fail fast (503 with x-device-state), not hang.
+curl -s -o /dev/null -D - -w '%{time_total}s\n' \
+  http://127.0.0.1:3000/api/devices/<other-udid>/remote/thumbnail | grep -iE 'HTTP|x-device-state|s$'
+```
+
+Expect the thumbnail at roughly 10–40 KB against hundreds of KB for the PNG,
+and a dead phone's 503 within `PHONE_FARM_GRID_SCREENSHOT_TIMEOUT_MS` the first
+time and instantly during the failure cooldown.
+
 ## Common failures
 
 | Symptom | Cause → fix |
 | --- | --- |
-| Phone shows **Offline**, `xctrace` lists it under *Devices Offline* | USB. Reseat the cable/hub port; charge-only cable; phone rebooted and is locked → unlock once. |
+| Phone shows **Offline**, `xctrace` lists it under *Devices Offline* | USB. The card prints its `rackSlot` — reseat that cable/hub port; charge-only cable; phone rebooted and is locked → unlock once. |
+| The grid feels slow, or phones flap between Online and Offline on a big rack | Too much polling for one USB tree. Raise `PHONE_FARM_GRID_POLL_SECONDS` / `PHONE_FARM_SCREENSHOT_TTL_MS` / `PHONE_FARM_DISCOVERY_TTL_MS` ([configuration.md](configuration.md#fleet-scale-polling)), and close spare dashboard tabs. Measure first with the commands under *Grid timings* below. |
+| A card says **WDA not ready** instead of showing the screen | The phone is on USB but the WDA supervisor has not got WebDriverAgent running on it. Hover the pill for the supervisor's message; check `curl -s --unix-socket .wda/wda-service.sock http://x/health`. The grid no longer asks such a phone for a screenshot, so it cannot slow the other cards. |
+| A card's still is dimmed and its "updated … ago" stops moving | Its thumbnail requests are failing (WDA wedged or slower than `PHONE_FARM_GRID_SCREENSHOT_TIMEOUT_MS`). The browser keeps the last frame and backs off to at most one try a minute; it recovers by itself when the phone answers. |
 | `wda: unlock-required` | Unlock the phone once (Auto-Lock should be *Never*). Check the passcode in `devices.json`. |
 | `wda: error … stale or corrupted` / empty `.app` | `rm -rf ~/Library/Developer/Xcode/DerivedData/WebDriverAgent-*` then `npm run wda:prepare -- --udid <udid>` from the GUI session. |
 | WDA fails right after adding a phone | The provisioning profile does not list its UDID: re-run `wda:prepare` with the phone connected. |
@@ -58,12 +90,25 @@ VPN) and alert if any phone is not `ready` for more than 15 minutes.
 
 1. Prepare it (install guide §5), connect it, `xcrun xctrace list devices` shows it.
 2. `npm run wda:prepare -- --udid <udid>` from the GUI session.
-3. Dashboard → **Register device** → checks → Finalize. Pick free `wdaLocalPort` / `mjpegLocalPort` (the wizard proposes the next ones).
+3. Dashboard → **Register a phone** → checks → **Finish registration**. Pick free `wdaLocalPort` / `mjpegLocalPort` (the wizard proposes the next ones), and record the **rack slot** so the phone can be found later.
 4. Device page → *Touch points* → calibrate; run a `doomscroll` once.
+
+### Signing on another Mac
+
+A farm host does not have to hold the Apple ID. Sign on a Mac that does, copy the build:
+
+1. Register the new phone's UDID with the Team: developer.apple.com → *Devices* →
+   *+* (or *Register Multiple Devices* with a tab-separated `Device ID / Device Name / Device Platform` file).
+2. On the signing Mac: `npm run wda:prepare -- --generic` → `.wda/prebuilt/Build/Products`.
+   Automatic signing puts every registered device into the profile, so re-run it after each registration.
+3. Copy that folder to the host, e.g. `rsync -a .wda/prebuilt/Build/Products/ host:phone-farm/.wda/prebuilt/`,
+   and set `WDA_XCTESTRUN=/Users/<user>/phone-farm/.wda/prebuilt/WebDriverAgentRunner_iphoneos<sdk>-arm64.xctestrun`
+   in the host's `.env` (once).
+4. Restart `wda-service` on the host. Skip `wda:prepare` there; the wizard's *Prepare* step signs locally and does not apply.
 
 ## Retiring a phone
 
-Dashboard → device → *Danger zone* → **Remove device** (cancels its schedules,
+Dashboard → device → **Remove device** (right end of the settings row; cancels its schedules,
 forgets its entry; WebDriverAgent stays installed on the phone). To pause
 without forgetting: **Disconnect** on the grid (`"disabled": true`).
 

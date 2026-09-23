@@ -13,7 +13,13 @@ Plan for **one afternoon** for the Mac and the first phone, then about
       the Mac. Do everything on the Mac itself, not by remote control.**
 - [ ] A powered USB hub with one port per phone, and **data** cables (the
       cable that came with the iPhone is fine; cheap "charging only" cables
-      will not work).
+      will not work). Do not buy an "OTG" hub — those are for Android phones
+      and the iPhones will not show up. If someone is choosing the hub or a
+      phone rack, have them read *USB hubs and racks* in
+      [install-mac-mini.md](install-mac-mini.md) first.
+- [ ] A sticker or marker pen to number the slots on the rack, so you can write
+      down where each phone sits. The software will show that number next to
+      the phone.
 - [ ] The iPhones, each already signed in to its own Apple ID and with the
       TikTok app installed and logged in.
 - [ ] Envy's **Apple Developer** login (the paid one, US$99/year). Ask whoever
@@ -177,7 +183,9 @@ On the phone:
 5. Make sure the phone has a **6-digit passcode**. Write it next to the
    phone's label in your table.
 6. Plug the phone into the hub. Unlock it. Tap **Trust** on the phone, enter
-   the passcode.
+   the passcode. Write down which hub port you used — you will type it in as
+   the phone's **rack slot** later, and that is how you find this exact phone
+   when the dashboard says it has gone offline.
 7. On the Mac, in Xcode: menu **Window → Devices and Simulators**. The phone
    appears on the left. Wait until it says **Connected** (not *Preparing*).
    This can take a few minutes the first time.
@@ -229,15 +237,16 @@ Wait one minute, then open **Safari** and go to:
 
 ## Part 9 — Register each phone in the dashboard (5 minutes per phone)
 
-1. Click **Register device** (top right).
+1. Click **Register a phone** (the pink button, top right).
 2. Pick the phone from the list. Give it the **same label** as its sticker.
 3. Leave the coordinate profile on **iPhone 8**. (Yes, for iPhone 12 mini too — see the note below.)
-4. Type the phone's **passcode** and its **TikTok @handle**.
+4. Type the phone's **passcode**, its **rack slot** (the hub port you wrote
+   down in Part 6 — for example `A3`), and its **TikTok @handle**.
 5. Click through the checks. Each should turn green. If the phone's screen
    lights up asking to unlock, **unlock it once**.
-6. Click **Finalize**. The phone now appears on the Devices page as **Online**
+6. Click **Finish registration**. The phone now appears on the Devices page as **Online**
    with a picture of its screen.
-7. Click **Open device**. Find **Touch points**. For each target in the list
+7. Click **Open** on the phone's card. Find **Touch points** in the row of buttons under the phone's name. For each target in the list
    (Profile tab, Home tab, Create, …): click the target's name, then click on
    the live picture of the screen exactly where that button is on this phone,
    and **Save**. Use **Control device** to tap around and reach the screen a

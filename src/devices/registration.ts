@@ -8,8 +8,8 @@ import { remote, type Browser } from 'webdriverio';
 
 import { switchTikTokAccount, tapCoordinate } from '../tiktok/actions.js';
 import { coordinateProfiles, coordinatesForProfile, profileForProductType, type CoordinateProfile } from './coordinates.js';
-import { discoverConnectedDevices, type Device } from './discovery.js';
-import { loadRegisteredDevices, mutateRegisteredDevices, type RegisteredDevice } from './registry.js';
+import { connectedDevices, type Device } from './discovery.js';
+import { loadRegisteredDevices, mutateRegisteredDevices, RACK_SLOT_MAX_LENGTH, type RegisteredDevice } from './registry.js';
 import { passcodeForDevice, setDevicePasscode } from './secrets.js';
 import { WdaRemoteControl } from './wda-remote.js';
 import { diagnoseWdaLaunchFailure } from './wda/diagnostics.js';
@@ -34,6 +34,8 @@ export interface RegistrationSnapshot {
     recommendedProfile?: CoordinateProfile;
     wdaLocalPort: number;
     mjpegLocalPort: number;
+    /** Free-text physical location in the rack; optional, purely an operator label. */
+    rackSlot: string;
     tiktokAccounts: string[];
     hasPasscode: boolean;
     busy: boolean;
@@ -46,6 +48,7 @@ export interface RegistrationSnapshot {
 export interface RegistrationUpdate {
     name?: string;
     coordinateProfile?: string;
+    rackSlot?: string;
     tiktokAccounts?: string[];
     passcode?: string;
 }
@@ -68,7 +71,7 @@ export interface DeviceRegistrationManager {
 
 interface RegistrationManagerOptions {
     repositoryRoot?: string;
-    discoverDevices?: () => Promise<Device[]>;
+    discoverDevices?: (maxAgeMs?: number) => Promise<Device[]>;
     loadDevices?: () => Promise<RegisteredDevice[]>;
     stateDirectory?: string;
     fetchImpl?: typeof fetch;
@@ -138,7 +141,7 @@ export function allocateDevicePorts(devices: RegisteredDevice[], reserved: Array
 export class DeviceRegistrationService implements DeviceRegistrationManager {
     private readonly workspaceRoot: string;
     private readonly packageRoot: string;
-    private readonly discoverDevices: () => Promise<Device[]>;
+    private readonly discoverDevices: (maxAgeMs?: number) => Promise<Device[]>;
     private readonly loadDevices: () => Promise<RegisteredDevice[]>;
     private readonly stateDirectory: string;
     private readonly fetch: typeof fetch;
@@ -148,7 +151,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
     constructor(options: RegistrationManagerOptions = {}) {
         this.workspaceRoot = options.repositoryRoot ?? process.cwd();
         this.packageRoot = fileURLToPath(new URL('../../', import.meta.url));
-        this.discoverDevices = options.discoverDevices ?? discoverConnectedDevices;
+        this.discoverDevices = options.discoverDevices ?? connectedDevices;
         this.loadDevices = options.loadDevices ?? loadRegisteredDevices;
         this.stateDirectory = options.stateDirectory ?? path.join(this.workspaceRoot, '.wda/registrations');
         this.fetch = options.fetchImpl ?? fetch;
@@ -170,6 +173,8 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
                     availableProfiles: coordinateProfiles().map(({ name, displayName, screenSize }) => ({ name, displayName, screenSize })),
                     ...(recommendedProfile ? { recommendedProfile } : {}),
                     coordinateProfile: stored.coordinateProfile ?? recommendedProfile,
+                    // Drafts written before rack slots existed have no value for it.
+                    rackSlot: stored.rackSlot ?? '',
                     busy: false,
                     hasPasscode,
                     };
@@ -187,7 +192,9 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
     }
 
     async candidates(): Promise<Device[]> {
-        const [connected, registered] = await Promise.all([this.discoverDevices(), this.loadDevices()]);
+        // User-initiated ("Recheck"), and the answer decides whether a phone the
+        // operator just plugged in is offered at all — always read fresh.
+        const [connected, registered] = await Promise.all([this.discoverDevices(0), this.loadDevices()]);
         const known = new Set(registered.map(({ udid }) => udid));
         return connected.filter(({ udid }) => !known.has(udid) || this.sessions.get(udid)?.finalized === false);
     }
@@ -213,6 +220,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
             recommendedProfile: profileForProductType(candidate.productType),
             coordinateProfile: profileForProductType(candidate.productType),
             ...ports,
+            rackSlot: '',
             tiktokAccounts: [],
             hasPasscode: false,
             busy: false,
@@ -245,6 +253,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
             }
             session.coordinateProfile = input.coordinateProfile as CoordinateProfile;
         }
+        if (input.rackSlot !== undefined) session.rackSlot = input.rackSlot.trim().slice(0, RACK_SLOT_MAX_LENGTH);
         if (input.tiktokAccounts !== undefined) session.tiktokAccounts = normalizeAccounts(input.tiktokAccounts);
         if (input.passcode !== undefined) {
             if (input.passcode && !/^\d{4,}$/.test(input.passcode)) throw new Error('Device passcode must contain at least four digits');
@@ -320,7 +329,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
         } catch {
             session.checks.host = check('blocked', 'Install the repository XCUITest driver and configure XCODE_DEVELOPER_DIR');
         }
-        const connected = (await this.discoverDevices()).find(({ udid }) => udid === session.device.udid);
+        const connected = (await this.discoverDevices(0)).find(({ udid }) => udid === session.device.udid);
         if (connected) {
             session.device = connected;
             session.recommendedProfile = profileForProductType(connected.productType);
@@ -464,6 +473,7 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
                 coordinateProfile: session.coordinateProfile,
                 wdaLocalPort: session.wdaLocalPort,
                 mjpegLocalPort: session.mjpegLocalPort,
+                ...(session.rackSlot ? { rackSlot: session.rackSlot } : {}),
                 ...(session.passcode ? { passcode: session.passcode } : {}),
                 // coordinateProfile is a top-level field; don't duplicate it into pluginData.
                 pluginData: { 'com.git-agni.tiktok': { accounts: session.tiktokAccounts } },

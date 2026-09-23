@@ -16,7 +16,7 @@ function snapshot(): RegistrationSnapshot {
         id: device.udid, device, name: device.name, coordinateProfile: 'iphone8',
         availableProfiles: [{ name: 'iphone8', displayName: 'iPhone 8', screenSize: { width: 375, height: 667 } }],
         recommendedProfile: 'iphone8', wdaLocalPort: 8100, mjpegLocalPort: 9100,
-        tiktokAccounts: [], hasPasscode: false, busy: false,
+        rackSlot: '', tiktokAccounts: [], hasPasscode: false, busy: false,
         checks: {
             host: passed, connection: passed, signing: passed, developer: passed, wda: passed,
             appium: passed, video: passed, touch: passed, tiktok: passed, accounts: passed,
@@ -158,4 +158,30 @@ test('serves and drives the public registration wizard', async (context) => {
     });
     assert.equal(finalized.statusCode, 200);
     assert.equal(finalized.json().finalized, true);
+});
+
+test('the grid script is served, versioned and referenced from the index page', async (context) => {
+    const app = await createApp({
+        plugins: new PluginRegistry([]), scheduler: {} as SchedulerRepository, dashboardTheme: defaultDashboardTheme,
+    });
+    context.after(() => app.close());
+
+    const index = await inject(app, { method: 'GET', url: '/' });
+    const version = index.body.match(/\/assets\/grid\.js\?v=([\w-]+)/)?.[1];
+    assert.ok(version, 'index.html loads /assets/grid.js with a content hash');
+    assert.doesNotMatch(index.body, /id="device-list"[^>]*aria-live/, 'the grid must not re-announce every poll');
+    assert.match(index.body, /id="connection-banner"[^>]*hidden/);
+    assert.match(index.body, /id="grid-announcer"[^>]*role="status"/);
+    assert.equal((index.body.match(/device-card skeleton/g) ?? []).length, 8);
+
+    const script = await inject(app, { method: 'GET', url: `/assets/grid.js?v=${version}` });
+    assert.equal(script.statusCode, 200);
+    assert.match(String(script.headers['content-type']), /^text\/javascript/);
+    assert.match(String(script.headers['cache-control']), /immutable/);
+    assert.match(script.body, /data-thumb-src/);
+
+    const revalidated = await inject(app, {
+        method: 'GET', url: `/assets/grid.js?v=${version}`, headers: { 'if-none-match': String(script.headers.etag) },
+    });
+    assert.equal(revalidated.statusCode, 304);
 });

@@ -8,8 +8,10 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
-import { discoverConnectedDevices } from '../devices/discovery.js';
+import { connectedDevices, type Device } from '../devices/discovery.js';
 import { loadRegisteredDevices, mutateRegisteredDevices, saveRegisteredDevices, redactDevice, PASSCODE_PATTERN, type RegisteredDevice } from '../devices/registry.js';
+import { createScreenshotCache } from '../devices/screenshot-cache.js';
+import { createThumbnailCache, thumbnailWidth } from '../devices/thumbnail.js';
 import {
     CALIBRATABLE_POINTS, POINT_LABELS, coordinatesForProfile, resolveDeviceCoordinates, validateCoordinateOverrides,
 } from '../devices/coordinates.js';
@@ -17,7 +19,7 @@ import { RegistryWdaRemoteControl } from '../devices/registry-remote.js';
 import type {
     DeviceRegistrationManager, RegistrationAction, RegistrationUpdate,
 } from '../devices/registration.js';
-import { type RemoteAction } from '../devices/wda-remote.js';
+import { RemoteDeviceError, type RemoteAction, type RemoteControl } from '../devices/wda-remote.js';
 import { requestWdaService } from '../devices/wda-service-client.js';
 import type { DeviceConnectionStatus } from '../devices/connection-manager.js';
 import { brandHtml, brandingFromEnv, footerHtml, logoContentType, type Branding } from '../branding.js';
@@ -33,6 +35,10 @@ export interface CreateAppOptions {
     dashboardTheme?: DashboardTheme;
     registrations?: DeviceRegistrationManager;
     logger?: boolean;
+    /** Test seams: default to the registry-backed WDA client, usbmux discovery and the wda-service supervisor. */
+    remote?: RemoteControl;
+    discoverDevices?: () => Promise<Device[]>;
+    wdaStatuses?: () => Promise<DeviceConnectionStatus[]>;
 }
 
 export interface DashboardTheme {
@@ -49,8 +55,18 @@ interface LoadedDashboardTheme {
     tasksScript: string;
     registerDeviceHtml: string;
     registerDeviceScript: string;
+    gridScript: string;
     htmx: string;
+    fonts: Map<string, Buffer>;
 }
+
+/**
+ * The self-hosted dashboard fonts (static/dashboard/fonts, SIL OFL). The font
+ * route serves only these names, so a request can never reach another file.
+ */
+export const DASHBOARD_FONTS = [
+    'oswald-latin-variable.woff2', 'poppins-latin-400.woff2', 'poppins-latin-500.woff2', 'poppins-latin-600.woff2',
+] as const;
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -77,16 +93,94 @@ function escapeHtml(value: unknown): string {
 // Brand name, credit, logo and footer come from the environment (src/branding.ts)
 // so a licensee can white-label the dashboard without forking.
 function page(title: string, body: string, logoutPath: string | undefined, navLinks: readonly PluginNavLink[], branding: Branding, footer: string): string {
-    const logout = logoutPath ? `<a href="${escapeHtml(logoutPath)}" style="float:right;margin-right:0">Log out</a>` : '';
+    const logout = logoutPath ? `<a class="logout" href="${escapeHtml(logoutPath)}">Log out</a>` : '';
     const extra = navLinks.map((link) => `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join('');
-    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    // A minimal copy of the dashboard tokens (static/dashboard/styles.css :root),
+    // system fonts only, so un-themed pages and errors match the dark dashboard.
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)} · ${escapeHtml(branding.title)}</title><style>
-body{font:15px system-ui,sans-serif;margin:0;background:#f6f7f9;color:#17202a}nav{padding:16px 24px;background:#111827;color:white}nav a{color:white;margin-right:18px}main{max-width:1100px;margin:24px auto;padding:0 20px}.card{background:white;border:1px solid #dde2e8;border-radius:10px;padding:18px;margin:14px 0}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #e5e7eb}code{font-size:12px}.muted{color:#64748b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}button,.button{background:#2563eb;color:white;border:0;border-radius:6px;padding:8px 12px;text-decoration:none;cursor:pointer}input,select,textarea{padding:8px;border:1px solid #cbd5e1;border-radius:6px}</style></head>
-<body><nav><a href="/"><strong>${escapeHtml(branding.name)}</strong></a><a href="/">Devices</a><a href="/tasks">Tasks</a><a href="/docs">API</a>${extra}${logout}</nav><main>${body}</main><footer style="max-width:1100px;margin:24px auto;padding:16px 20px;color:#94a3b8;font-size:12px">${footer}</footer></body></html>`;
+:root{color-scheme:dark;--bg:#0a0a0c;--bg-2:#101014;--panel:#141419;--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--ink:#f6f6f8;--muted:#a9a9b4;--pink-2:#ff5fae;--pink-deep:#d6166f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Helvetica Neue",sans-serif}
+nav{display:flex;flex-wrap:wrap;align-items:center;gap:6px 20px;padding:14px 24px;border-bottom:1px solid var(--line);background:var(--bg-2)}
+nav a{color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;text-decoration:none}nav a:hover{color:var(--ink)}nav .home{margin-right:auto;color:var(--ink);letter-spacing:.18em}
+main{max-width:1100px;margin:24px auto;padding:0 20px}h1{font-size:28px;letter-spacing:.01em;text-transform:uppercase;margin:0 0 12px}h2{font-size:15px;letter-spacing:.06em;text-transform:uppercase}
+.card{margin:14px 0;padding:18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+button,.button{display:inline-flex;align-items:center;min-height:36px;padding:0 16px;border:0;border-radius:999px;background:var(--pink-deep);color:#fff;font:600 12px system-ui,sans-serif;letter-spacing:.1em;text-transform:uppercase;text-decoration:none;cursor:pointer}
+.button.secondary{border:1px solid var(--line-strong);background:transparent;color:var(--ink)}a{color:var(--pink-2)}
+input,select,textarea{min-height:36px;padding:8px 10px;border:1px solid var(--line-strong);border-radius:10px;background:var(--bg-2);color:var(--ink);font:inherit}
+:focus-visible{outline:2px solid var(--pink-2);outline-offset:2px}footer{max-width:1100px;margin:24px auto;padding:16px 20px;color:var(--muted);font-size:12px}footer a{color:var(--muted)}</style></head>
+<body><nav><a class="home" href="/">${escapeHtml(branding.name)}</a><a href="/">Devices</a><a href="/tasks">Tasks</a><a href="/docs">API</a>${extra}${logout}</nav><main>${body}</main><footer>${footer}</footer></body></html>`;
 }
 
-async function registeredWithStatus() {
-    const [registered, connected] = await Promise.all([loadRegisteredDevices(), discoverConnectedDevices()]);
+/**
+ * How often the device grid re-polls itself. Each poll pulls a still from every
+ * connected phone, so at two phones 5s is free and at twenty it is twenty WDA
+ * round trips over one shared USB tree. The cadence opens up as the rack grows;
+ * `PHONE_FARM_GRID_POLL_SECONDS` overrides it either way.
+ */
+export function gridPollSeconds(activeDeviceCount: number): number {
+    const configured = Number(process.env.PHONE_FARM_GRID_POLL_SECONDS);
+    if (Number.isFinite(configured) && configured >= 1) return Math.round(configured);
+    return activeDeviceCount > 10 ? 10 : 5;
+}
+
+export const DEFAULT_GRID_SCREENSHOT_TIMEOUT_MS = 3_000;
+
+/**
+ * The WDA deadline for a grid still. A phone that cannot answer in a few seconds
+ * is shown as unavailable rather than holding a browser connection for the full
+ * 10s client default. `PHONE_FARM_GRID_SCREENSHOT_TIMEOUT_MS` overrides it.
+ */
+export function gridScreenshotTimeoutMs(): number {
+    const configured = Number(process.env.PHONE_FARM_GRID_SCREENSHOT_TIMEOUT_MS);
+    return Number.isFinite(configured) && configured >= 100 ? Math.round(configured) : DEFAULT_GRID_SCREENSHOT_TIMEOUT_MS;
+}
+
+/** The supervisor's per-device WDA state, read once per grid poll. */
+async function supervisorStatuses(): Promise<DeviceConnectionStatus[]> {
+    const response = await requestWdaService('/devices', { timeoutMs: 1_500 });
+    if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`WDA service returned ${response.statusCode}`);
+    const devices = (JSON.parse(response.body) as { devices?: unknown }).devices;
+    if (!Array.isArray(devices)) throw new Error('WDA service returned no device list');
+    return devices as DeviceConnectionStatus[];
+}
+
+/**
+ * The grid card's phone-frame proportions from the device's coordinate profile,
+ * as an inline custom property. Numbers only; an unknown profile falls back to
+ * the stylesheet default rather than breaking the whole grid.
+ */
+function screenRatioStyle(profile: string | undefined): string {
+    try {
+        const { width, height } = coordinatesForProfile(profile).screenSize;
+        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+            return ` style="--screen-ar: ${Math.round(width)} / ${Math.round(height)}"`;
+        }
+    } catch { /* unknown profile */ }
+    return '';
+}
+
+/** A stable, id-safe token for a device, so htmx can match its elements across swaps. */
+function deviceKey(udid: string): string {
+    return crypto.createHash('sha1').update(udid).digest('hex').slice(0, 12);
+}
+
+/** htmx preserves the preview <img> by this id across the grid poll. */
+function previewId(udid: string): string {
+    return `preview-${deviceKey(udid)}`;
+}
+
+function ageText(at: number | undefined): string {
+    if (!at) return '';
+    const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+    if (seconds < 60) return `updated ${seconds}s ago`;
+    const minutes = Math.round(seconds / 60);
+    return minutes < 60 ? `updated ${minutes}m ago` : `updated ${Math.round(minutes / 60)}h ago`;
+}
+
+async function registeredWithStatus(discover: () => Promise<Device[]> = connectedDevices) {
+    const [registered, connected] = await Promise.all([loadRegisteredDevices(), discover()]);
     const online = new Map(connected.map((device) => [device.udid, device]));
     return registered.map((device) => ({
         ...redactDevice(device),
@@ -146,7 +240,16 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         });
     }
 
-    const remote = new RegistryWdaRemoteControl();
+    const remote: RemoteControl = options.remote ?? new RegistryWdaRemoteControl();
+    const discover = options.discoverDevices ?? connectedDevices;
+    const wdaStatuses = options.wdaStatuses ?? supervisorStatuses;
+    const screenshots = createScreenshotCache(remote);
+    const thumbnails = createThumbnailCache();
+    const forgetDevice = (udid: string) => {
+        remote.forget?.(udid);
+        screenshots.forget(udid);
+        thumbnails.forget(udid);
+    };
     const logoutPath = options.authProvider?.logoutPath;
     const authNavHtml = logoutPath
         ? `<a class="button secondary app-logout" href="${escapeHtml(logoutPath)}">Log out</a>` : '';
@@ -154,7 +257,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         .flatMap((plugin) => plugin.navLinks ?? [])
         .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
     const pluginNavHtml = navLinks
-        .map((link) => `<a class="button secondary" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`)
+        .map((link) => `<a class="nav-link" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`)
         .join('');
     const assetHash = (body: string | Buffer) => crypto.createHash('sha1').update(body).digest('base64url').slice(0, 10);
 
@@ -181,7 +284,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     if (options.dashboardTheme) {
         const root = options.dashboardTheme.rootDirectory;
         const require = createRequire(import.meta.url);
-        const [indexHtml, deviceHtml, tasksHtml, registerDeviceHtml, styles, deviceScript, tasksScript, registerDeviceScript, htmx] = await Promise.all([
+        const [indexHtml, deviceHtml, tasksHtml, registerDeviceHtml, rawStyles, deviceScript, tasksScript, registerDeviceScript, gridScript, htmx] = await Promise.all([
             readFile(path.join(root, 'templates/index.html'), 'utf8'),
             readFile(path.join(root, 'templates/device.html'), 'utf8'),
             readFile(path.join(root, 'templates/tasks.html'), 'utf8'),
@@ -190,14 +293,30 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             readFile(path.join(root, 'assets/device.js'), 'utf8'),
             readFile(path.join(root, 'assets/tasks.js'), 'utf8'),
             readFile(path.join(root, 'assets/register-device.js'), 'utf8'),
+            readFile(path.join(root, 'assets/grid.js'), 'utf8'),
             readFile(require.resolve('htmx.org/dist/htmx.min.js'), 'utf8'),
         ]);
+        const fonts = new Map<string, Buffer>();
+        for (const name of DASHBOARD_FONTS) {
+            try {
+                fonts.set(name, await readFile(path.join(root, 'fonts', name)));
+            } catch (error) {
+                // A theme without the font files still renders with the metric-matched fallbacks.
+                console.warn(`dashboard font ${name} not found (${errorMessage(error)}); using fallback fonts`);
+            }
+        }
+        const fontVersions = Object.fromEntries([...fonts].map(([name, body]) => [`fonts/${name}`, assetHash(body)]));
+        // Version the stylesheet's own font URLs too, so they are the same
+        // immutable URLs the templates preload (one download, cached forever).
+        let styles = rawStyles;
+        for (const [name, v] of Object.entries(fontVersions)) styles = styles.replaceAll(`/assets/${name})`, `/assets/${name}?v=${v})`);
         // Content-hash every asset URL in the templates so a changed file gets a
         // fresh URL that no browser or CDN can serve stale.
         const versions: Record<string, string> = {
             'styles.css': assetHash(styles), 'device.js': assetHash(deviceScript),
             'tasks.js': assetHash(tasksScript), 'register-device.js': assetHash(registerDeviceScript),
-            'htmx.min.js': assetHash(htmx),
+            'grid.js': assetHash(gridScript), 'htmx.min.js': assetHash(htmx),
+            ...fontVersions,
         };
         const finalize = (html: string) => {
             let out = html.replaceAll('__AUTH_NAV__', authNavHtml).replaceAll('__PLUGIN_NAV__', pluginNavHtml)
@@ -209,14 +328,16 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         themed = {
             indexHtml: finalize(indexHtml), deviceHtml: finalize(deviceHtml),
             tasksHtml: finalize(tasksHtml), registerDeviceHtml: finalize(registerDeviceHtml),
-            styles, deviceScript, tasksScript, registerDeviceScript, htmx,
+            styles, deviceScript, tasksScript, registerDeviceScript, gridScript, htmx, fonts,
         };
     }
 
     const renderActivity = async (deviceUdid: string, message?: string): Promise<string> => {
         const executions = await options.scheduler.listExecutions(25, deviceUdid);
         const execution = executions.find(({ status }) => status === 'running') ?? executions[0];
-        if (!execution) return `<section id="device-activity" class="run-panel"><div class="run-heading"><span class="status idle"><span class="dot"></span>idle</span><span class="run-meta">No automation has run on this device yet.</span></div>${message ? `<p class="run-error">${escapeHtml(message)}</p>` : ''}<pre>Waiting for output…</pre></section>`;
+        const errorBanner = message
+            ? `<div class="banner err run-error" role="alert"><strong>Could not start the automation</strong><p>${escapeHtml(message)}</p></div>` : '';
+        if (!execution) return `<section id="device-activity" class="run-panel"><div class="run-heading"><span class="status idle"><span class="dot"></span>idle</span><span class="run-meta">No automation has run on this device yet.</span></div>${errorBanner}<pre role="log" aria-live="polite">Waiting for output…</pre></section>`;
         const detail = await options.scheduler.execution(execution.id);
         // A plugin (or task version) can be uninstalled while old executions
         // still reference it — degrade instead of throwing out of the fragment.
@@ -233,7 +354,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const canStop = execution.status === 'queued' || (execution.status === 'running' && (definition?.supportsStop(execution.payload) ?? true));
         const stop = canStop
             ? `<form hx-post="/api/executions/${execution.id}/stop" hx-target="#device-activity" hx-swap="outerHTML"><button class="button secondary" type="submit">Stop</button></form>` : '';
-        return `<section id="device-activity" class="run-panel" hx-get="/api/devices/${encodeURIComponent(deviceUdid)}/fragments/activity" hx-trigger="every 1s" hx-swap="outerHTML"><div class="run-heading"><span class="status ${escapeHtml(execution.status)}"><span class="dot"></span>${escapeHtml(execution.status)}</span><span class="run-meta">${escapeHtml(summary)} · ${escapeHtml(execution.scheduledFor.toISOString())}</span></div>${message ? `<p class="run-error">${escapeHtml(message)}</p>` : ''}${stop}<pre>${detail?.logs.length ? detail.logs.map(escapeHtml).join('\n') : escapeHtml(execution.error ?? 'Waiting for worker output…')}</pre></section>`;
+        return `<section id="device-activity" class="run-panel" hx-get="/api/devices/${encodeURIComponent(deviceUdid)}/fragments/activity" hx-trigger="every 1s" hx-swap="outerHTML"><div class="run-heading"><span class="status ${escapeHtml(execution.status)}"><span class="dot"></span>${escapeHtml(execution.status)}</span><span class="run-meta">${escapeHtml(summary)} · <time datetime="${escapeHtml(execution.scheduledFor.toISOString())}" data-local-time>${escapeHtml(execution.scheduledFor.toISOString().slice(0, 16).replace('T', ' '))} UTC</time></span></div>${errorBanner}${stop}<pre role="log" aria-live="polite">${detail?.logs.length ? detail.logs.map(escapeHtml).join('\n') : escapeHtml(execution.error ?? 'Waiting for worker output…')}</pre></section>`;
     };
 
     app.get('/health', async () => {
@@ -252,8 +373,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         id: plugin.id, version: plugin.version, displayName: plugin.displayName,
         tasks: plugin.tasks.map(({ type, version, displayName }) => ({ type, version, displayName })),
     })));
-    app.get('/api/devices', async () => registeredWithStatus());
-    app.get('/api/devices/discovered', async () => discoverConnectedDevices());
+    app.get('/api/devices', async () => registeredWithStatus(discover));
+    app.get('/api/devices/discovered', async () => connectedDevices());
     app.get('/api/device-registrations/candidates', async (_request, reply) => {
         if (!options.registrations) return reply.code(503).send({ error: 'Device registration is not configured' });
         return { devices: await options.registrations.candidates() };
@@ -288,9 +409,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         await options.registrations.cancel(request.params.id);
         return reply.code(204).send();
     });
-    app.post<{ Body: { name?: string; udid?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinateProfile?: string; pluginData?: Record<string, JsonObject> } }>(
+    app.post<{ Body: { name?: string; udid?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinateProfile?: string; rackSlot?: string; pluginData?: Record<string, JsonObject> } }>(
         '/api/devices', async (request, reply) => {
-            const { name, udid, wdaLocalPort, mjpegLocalPort, passcode, coordinateProfile, pluginData } = request.body;
+            const { name, udid, wdaLocalPort, mjpegLocalPort, passcode, coordinateProfile, rackSlot, pluginData } = request.body;
             if (!udid) return reply.code(400).send({ error: 'A device UDID is required' });
             if (passcode !== undefined && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
@@ -303,6 +424,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     ...(wdaLocalPort !== undefined ? { wdaLocalPort } : {}),
                     ...(mjpegLocalPort !== undefined ? { mjpegLocalPort } : {}),
                     ...(coordinateProfile !== undefined ? { coordinateProfile: coordinateProfile as RegisteredDevice['coordinateProfile'] } : {}),
+                    ...(rackSlot !== undefined ? { rackSlot } : {}),
                     ...(passcode !== undefined ? { passcode } : {}),
                 };
                 devices.push(device);
@@ -311,9 +433,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             return reply.code(201).send(redactDevice(created));
         },
     );
-    app.patch<{ Params: { udid: string }; Body: { name?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinates?: unknown; disabled?: boolean; coordinateProfile?: string; pluginData?: Record<string, JsonObject> } }>(
+    app.patch<{ Params: { udid: string }; Body: { name?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinates?: unknown; disabled?: boolean; coordinateProfile?: string; rackSlot?: string; pluginData?: Record<string, JsonObject> } }>(
         '/api/devices/:udid', async (request, reply) => {
-            const { passcode, coordinates, name, wdaLocalPort, mjpegLocalPort, disabled, coordinateProfile, pluginData } = request.body;
+            const { passcode, coordinates, name, wdaLocalPort, mjpegLocalPort, disabled, coordinateProfile, rackSlot, pluginData } = request.body;
             if (passcode !== undefined && passcode !== '' && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
             }
@@ -327,6 +449,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 if (wdaLocalPort !== undefined) device.wdaLocalPort = wdaLocalPort;
                 if (mjpegLocalPort !== undefined) device.mjpegLocalPort = mjpegLocalPort;
                 if (coordinateProfile !== undefined) device.coordinateProfile = coordinateProfile as RegisteredDevice['coordinateProfile'];
+                // rackSlot: a value sets it, '' clears it (saveRegisteredDevices trims and drops empties)
+                if (rackSlot !== undefined) device.rackSlot = rackSlot;
                 if (pluginData !== undefined) device.pluginData = pluginData;
                 if (disabled === true) device.disabled = true;
                 else if (disabled === false) delete device.disabled;
@@ -341,7 +465,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 }
                 return device;
             });
-            remote.forget(request.params.udid);
+            forgetDevice(request.params.udid);
             return redactDevice(updated);
         },
     );
@@ -375,13 +499,13 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             const index = devices.findIndex(({ udid }) => udid === request.params.udid);
             if (index >= 0) devices.splice(index, 1);
         });
-        remote.forget(request.params.udid);
+        forgetDevice(request.params.udid);
         return reply.code(204).send();
     });
     app.post<{ Params: { udid: string } }>('/api/devices/:udid/checks', async (request, reply) => {
         const device = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
         if (!device) return reply.code(404).send({ error: 'Device not found' });
-        const identity = (await discoverConnectedDevices()).find(({ udid }) => udid === device.udid) ?? device;
+        const identity = (await connectedDevices()).find(({ udid }) => udid === device.udid) ?? device;
         const results = [];
         for (const plugin of options.plugins.list()) {
             for (const check of plugin.registrationChecks ?? []) {
@@ -396,16 +520,43 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     // per-device client. The old unprefixed /screenshot and /actions twins
     // that bypassed both were removed.
     app.get<{ Params: { udid: string } }>('/api/devices/:udid/remote/info', async (request, reply) => {
-        const device = (await discoverConnectedDevices()).find(({ udid }) => udid === request.params.udid);
+        const device = (await connectedDevices()).find(({ udid }) => udid === request.params.udid);
         if (!device) return reply.code(404).send({ error: 'Device is not connected' });
         return { device, screen: await remote.getScreenInfo(device.udid) };
     });
-    app.get<{ Params: { udid: string } }>('/api/devices/:udid/remote/screenshot', async (request, reply) => {
+    app.get<{ Params: { udid: string }; Querystring: { fresh?: string } }>('/api/devices/:udid/remote/screenshot', async (request, reply) => {
         try {
-            return reply.header('cache-control', 'no-store').type('image/png').send(await remote.getScreenshot(request.params.udid));
+            // Served from the shared per-device cache so N dashboard tabs cost one
+            // WDA round trip; `?fresh=1` bypasses it for a client that needs now.
+            const frame = await screenshots.get(request.params.udid, request.query.fresh ? 0 : undefined);
+            return reply.header('cache-control', 'no-store').type('image/png').send(frame);
         } catch {
             // A flapping device shouldn't spew 500s into the log every 5s from the grid poll.
             return reply.code(503).header('cache-control', 'no-store').send();
+        }
+    });
+    // The grid's still: a small JPEG of the same cached frame, with an ETag so an
+    // unchanged screen costs a 304 and no body. The full-size PNG above stays for
+    // the device page and calibration.
+    app.get<{ Params: { udid: string }; Querystring: { w?: string } }>('/api/devices/:udid/remote/thumbnail', async (request, reply) => {
+        const width = thumbnailWidth(request.query.w);
+        let frame: Buffer;
+        try {
+            frame = await screenshots.get(request.params.udid, { timeoutMs: gridScreenshotTimeoutMs() });
+        } catch (error) {
+            // WDA unreachable or refusing is "not ready"; anything else is a fault.
+            return reply.code(503).header('cache-control', 'no-store')
+                .header('x-device-state', error instanceof RemoteDeviceError ? 'not-ready' : 'error').send();
+        }
+        const etag = thumbnails.etag(request.params.udid, frame, width);
+        reply.header('etag', etag).header('cache-control', 'private, max-age=2');
+        if (request.headers['if-none-match'] === etag) return reply.code(304).send();
+        try {
+            const body = await thumbnails.thumbnail(request.params.udid, frame, width);
+            return reply.type('image/jpeg').send(body);
+        } catch {
+            reply.removeHeader('etag');
+            return reply.code(503).header('cache-control', 'no-store').header('x-device-state', 'error').send();
         }
     });
     app.get<{ Params: { udid: string } }>('/api/devices/:udid/remote/stream', async (request, reply) => {
@@ -439,7 +590,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 if (status) return status;
             }
         } catch { /* supervisor socket unavailable — fall back to a probe */ }
-        const connected = (await discoverConnectedDevices()).some(({ udid }) => udid === registered.udid);
+        const connected = (await connectedDevices()).some(({ udid }) => udid === registered.udid);
         let wda = false;
         try {
             wda = (await fetch(`http://127.0.0.1:${registered.wdaLocalPort ?? 8100}/status`, { signal: AbortSignal.timeout(2_000) })).ok;
@@ -456,7 +607,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         if (await options.scheduler.activeExecution(request.params.udid)) {
             return reply.code(409).send({ error: 'Cannot reconnect while automation is running' });
         }
-        remote.forget(request.params.udid);
+        forgetDevice(request.params.udid);
         return reply.code(202).send({ ok: true, message: 'The shared WDA supervisor will reconnect automatically' });
     });
 
@@ -571,11 +722,11 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const theme = themed;
         // Templates request these with a ?v=<contenthash>. A versioned request is
         // safe to cache forever; a bare one (bookmark) must revalidate via ETag.
-        const asset = (contentType: string, body: string | Buffer) => {
+        const asset = (contentType: string, body: string | Buffer, unversionedCache = 'no-cache') => {
             const etag = `"${crypto.createHash('sha1').update(body).digest('base64url')}"`;
             return async (request: FastifyRequest, reply: FastifyReply) => {
                 const versioned = Boolean((request.query as { v?: string }).v);
-                reply.header('cache-control', versioned ? 'public, max-age=31536000, immutable' : 'no-cache')
+                reply.header('cache-control', versioned ? 'public, max-age=31536000, immutable' : unversionedCache)
                     .header('etag', etag);
                 if (request.headers['if-none-match'] === etag) return reply.code(304).send();
                 return reply.type(contentType).send(body);
@@ -585,38 +736,84 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         app.get('/assets/device.js', asset('text/javascript', theme.deviceScript));
         app.get('/assets/tasks.js', asset('text/javascript', theme.tasksScript));
         app.get('/assets/register-device.js', asset('text/javascript', theme.registerDeviceScript));
+        app.get('/assets/grid.js', asset('text/javascript', theme.gridScript));
         app.get('/assets/htmx.min.js', asset('text/javascript', theme.htmx));
         if (logo) app.get('/assets/brand-logo', asset(logo.contentType, logo.body));
+        // Whitelisted by name: the parameter is only ever a map key, never a path.
+        const fontRoutes = new Map([...theme.fonts].map(([name, body]) => [name, asset('font/woff2', body, 'public, max-age=86400')]));
+        app.get<{ Params: { file: string } }>('/assets/fonts/:file', async (request, reply) => {
+            const serve = fontRoutes.get(request.params.file);
+            if (!serve) return reply.code(404).send({ error: 'Font not found' });
+            return serve(request, reply);
+        });
         app.get('/api/fragments/devices', async (_request, reply) => {
-            const devices = await registeredWithStatus();
+            const [devices, supervisor] = await Promise.all([
+                registeredWithStatus(discover),
+                // One supervisor read per poll. If the socket is down we cannot tell
+                // ready from not-ready, so connected phones render a preview as before.
+                wdaStatuses().catch(() => null),
+            ]);
+            const wdaState = new Map((supervisor ?? []).map((status) => [status.udid, status]));
             const active = devices.filter((device) => !device.disabled);
             const disabled = devices.filter((device) => device.disabled);
+            const refreshMs = gridPollSeconds(active.length) * 1000;
             const toggleButton = (udid: string, label: string, next: boolean) =>
-                `<button type="button" class="button secondary device-toggle" data-toggle-device="${encodeURIComponent(udid)}" data-disabled="${next}">${label}</button>`;
+                `<button type="button" id="toggle-${deviceKey(udid)}" class="button secondary device-toggle" data-toggle-device="${encodeURIComponent(udid)}" data-disabled="${next}">${label}</button>`;
+            let online = 0;
+            let attention = 0;
             const cards = active.map((device) => {
                 const accounts = Object.values(device.pluginData).flatMap((value) => {
                     const candidate = value.accounts;
                     return Array.isArray(candidate) ? candidate.filter((entry) => typeof entry === 'string') : [];
                 });
-                // A still screenshot that refreshes with the 5s fragment poll —
-                // not a live MJPEG stream. Streaming every device's screen through
-                // the tunnel at once is what made the grid crawl.
-                const preview = device.connected
-                    ? `<div class="device-preview-frame"><img class="device-preview" src="/api/devices/${encodeURIComponent(device.udid)}/remote/screenshot?t=${Date.now()}" alt="Screen of ${escapeHtml(device.name)}" draggable="false" onerror="this.style.visibility='hidden'"></div>`
-                    : '<div class="device-preview-frame unavailable" aria-hidden="true"><div class="device-icon"></div></div>';
-                return `<article class="device-card">${preview}<div class="device-copy"><h2>${escapeHtml(device.name)}</h2><p>${device.connected ? `iOS ${escapeHtml(device.connected.osVersion)}` : escapeHtml(device.udid)}</p><span class="connected${device.connected ? '' : ' offline'}"><span></span>${device.connected ? 'Online' : 'Offline'}</span>${accounts.length ? `<p class="accounts">${accounts.map(escapeHtml).join(', ')}</p>` : ''}</div><div class="device-card-actions"><a class="button secondary" href="/devices/${encodeURIComponent(device.udid)}">Open device <span aria-hidden="true">→</span></a>${toggleButton(device.udid, 'Disconnect', true)}</div></article>`;
+                const status = device.connected ? wdaState.get(device.udid) : undefined;
+                const state = !device.connected ? 'offline' : !status || status.wda === 'ready' ? 'ready' : 'not-ready';
+                if (state === 'ready') online += 1;
+                else if (state === 'not-ready') attention += 1;
+                // A still, not a live stream. The server markup never carries a src:
+                // grid.js fetches a small JPEG thumbnail per card on its own staggered
+                // timer and htmx preserves the <img> (by its stable id) across the poll
+                // swap, so a refresh never blanks or re-downloads a picture.
+                // The rack slot is what turns "iPhone 14 is offline" into a phone
+                // somebody can walk up to, so it shows online and offline alike,
+                // as a badge on the phone frame.
+                const slot = device.rackSlot ? `<p class="rack-slot" title="Slot ${escapeHtml(device.rackSlot)}">Slot ${escapeHtml(device.rackSlot)}</p>` : '';
+                const preview = state === 'ready'
+                    ? `<div class="device-preview-frame">${slot}<img id="${previewId(device.udid)}" class="device-preview" hx-preserve="true" data-thumb-src="/api/devices/${encodeURIComponent(device.udid)}/remote/thumbnail" data-refresh-ms="${refreshMs}" alt="Screen of ${escapeHtml(device.name)}" draggable="false" decoding="async"></div>`
+                    : `<div class="device-preview-frame unavailable">${slot}<div class="device-icon" aria-hidden="true"></div></div>`;
+                // The frame takes the phone's real proportions (numbers only).
+                const ratio = screenRatioStyle(device.coordinateProfile);
+                const pill = state === 'ready'
+                    ? '<span class="connected"><span></span>Online</span>'
+                    : state === 'not-ready'
+                        ? `<span class="connected not-ready" title="${escapeHtml(status?.message ?? '')}"><span></span>WDA not ready</span>`
+                        : '<span class="connected offline"><span></span>Offline</span>';
+                const age = state === 'ready' ? `<p class="preview-age">${escapeHtml(ageText(screenshots.peek(device.udid).at))}</p>` : '';
+                const accountList = accounts.map(escapeHtml).join(', ');
+                return `<article class="device-card" data-state="${state}"${ratio}>${preview}<div class="device-copy"><h2 title="${escapeHtml(device.name)}">${escapeHtml(device.name)}</h2>${pill}<p class="device-meta" title="${escapeHtml(device.udid)}">${device.connected ? `iOS ${escapeHtml(device.connected.osVersion)}` : escapeHtml(device.udid)}</p>${accounts.length ? `<p class="accounts" title="${accountList}">${accountList}</p>` : ''}${age}</div><div class="device-card-actions"><a id="open-${deviceKey(device.udid)}" class="button secondary" href="/devices/${encodeURIComponent(device.udid)}" aria-label="Open ${escapeHtml(device.name)}">Open</a>${toggleButton(device.udid, 'Disconnect', true)}</div></article>`;
             }).join('');
+            const summary = active.length
+                ? `<p class="grid-summary">${online} online · ${attention} need attention · ${active.length} total</p>` : '';
             const disabledPanel = disabled.length
-                ? `<details class="disabled-devices"${disabled.length ? '' : ' hidden'}><summary>Disconnected devices (${disabled.length})</summary><ul>${disabled.map((device) => `<li><span>${escapeHtml(device.name)}</span>${toggleButton(device.udid, 'Reconnect', false)}</li>`).join('')}</ul></details>`
+                ? `<details class="disabled-devices"><summary>Disconnected devices (${disabled.length})</summary><ul>${disabled.map((device) => `<li><span>${escapeHtml(device.name)}</span>${toggleButton(device.udid, 'Reconnect', false)}</li>`).join('')}</ul></details>`
                 : '';
-            const toggleScript = `<script>if(!window.__deviceToggle){window.__deviceToggle=1;document.addEventListener('click',async function(e){var b=e.target.closest('[data-toggle-device]');if(!b)return;e.preventDefault();b.disabled=true;var r=await fetch('/api/devices/'+b.dataset.toggleDevice,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({disabled:b.dataset.disabled==='true'})});if(r.ok){if(window.htmx)htmx.ajax('GET','/api/fragments/devices',{target:'#device-list',swap:'outerHTML'})}else{b.disabled=false;alert(((await r.json().catch(function(){return{}}))||{}).error||'Request failed')}})}</script>`;
-            return reply.type('text/html').send(`<section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="every 5s" hx-swap="outerHTML" aria-live="polite">${cards || '<div class="empty-state"><h2>No active devices</h2></div>'}${disabledPanel}${toggleScript}</section>`);
+            return reply.type('text/html').send(`<section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="every ${gridPollSeconds(active.length)}s" hx-swap="outerHTML" data-refresh-ms="${refreshMs}">${summary}${cards || `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones yet</h2><p>${disabled.length ? 'Every registered phone is disconnected. Reconnect one below, or register another.' : 'Plug an iPhone in over USB, trust this Mac, then register it.'}</p><a class="button primary" href="/devices/register">Register a phone</a></div>`}${disabledPanel}</section>`);
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/summary', async (request, reply) => {
-            const device = (await discoverConnectedDevices()).find(({ udid }) => udid === request.params.udid);
-            if (!device) return reply.type('text/html').send('<section id="device-summary" class="device-summary error"><div><h2>Device disconnected</h2></div></section>');
+            const [connectedList, registeredList] = await Promise.all([connectedDevices(), loadRegisteredDevices()]);
+            const device = connectedList.find(({ udid }) => udid === request.params.udid);
+            if (!device) {
+                // Registered but not on USB: keep the page header (name, UDID) so the
+                // operator still knows which phone this is. Unknown UDIDs are a 404.
+                const known = registeredList.find(({ udid }) => udid === request.params.udid);
+                if (!known) return reply.code(404).type('text/html').send('<section id="device-summary" class="device-summary error"><div class="banner err" role="alert"><strong>Device not found</strong><p>No registered phone has this UDID.</p></div></section>');
+                const knownSlot = known.rackSlot ? `<p>Slot ${escapeHtml(known.rackSlot)}</p>` : '';
+                return reply.type('text/html').send(`<section id="device-summary" class="device-summary error"><div class="device-summary-head"><div><span class="eyebrow">Registered device</span><h1>${escapeHtml(known.name)}</h1><span class="connected offline"><span></span>Offline</span>${knownSlot}</div><code title="UDID">${escapeHtml(known.udid)}</code></div><div class="banner err" role="alert"><strong>Device disconnected</strong><p>This phone is not visible over USB. Check the cable and hub port, unlock the phone and accept Trust, then reload this page.</p></div></section>`);
+            }
             const screen = await remote.getScreenInfo(device.udid);
-            return reply.type('text/html').send(`<section id="device-summary" class="device-summary" data-screen-width="${screen.screenSize.width}" data-screen-height="${screen.screenSize.height}"><div><span class="eyebrow">Connected device</span><h1>${escapeHtml(device.name)}</h1><p>iOS ${escapeHtml(device.osVersion)} · ${screen.screenSize.width} × ${screen.screenSize.height} points · ${screen.scale}×</p></div><code>${escapeHtml(device.udid)}</code></section>`);
+            const rackSlot = registeredList.find(({ udid }) => udid === device.udid)?.rackSlot;
+            const slot = rackSlot ? ` · slot ${escapeHtml(rackSlot)}` : '';
+            return reply.type('text/html').send(`<section id="device-summary" class="device-summary" data-screen-width="${screen.screenSize.width}" data-screen-height="${screen.screenSize.height}"><div><span class="eyebrow">Connected device</span><h1>${escapeHtml(device.name)}</h1><p>iOS ${escapeHtml(device.osVersion)} · ${screen.screenSize.width} × ${screen.screenSize.height} points · ${screen.scale}×${slot}</p></div><code title="UDID">${escapeHtml(device.udid)}</code></section>`);
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/activity', async (request, reply) => {
             return reply.type('text/html').send(await renderActivity(request.params.udid));
@@ -625,9 +822,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
 
     app.get('/', async (_request, reply) => {
         if (themed) return reply.type('text/html').send(themed.indexHtml);
-        const devices = await registeredWithStatus();
+        const devices = await registeredWithStatus(discover);
         const cards = devices.map((device) => `<div class="card"><h2>${escapeHtml(device.name)}</h2><p class="muted"><code>${escapeHtml(device.udid)}</code></p><p>${device.disabled ? 'Disconnected' : device.connected ? `Online · iOS ${escapeHtml(device.connected.osVersion)}` : 'Offline'}</p><a class="button" href="/devices/${encodeURIComponent(device.udid)}">Open device</a></div>`).join('');
-        const connected = await discoverConnectedDevices();
+        const connected = await connectedDevices();
         const registeredIds = new Set(devices.map(({ udid }) => udid));
         const candidates = connected.filter(({ udid }) => !registeredIds.has(udid)).map((device) => `<option value="${escapeHtml(device.udid)}" data-name="${escapeHtml(device.name)}">${escapeHtml(device.name)} · ${escapeHtml(device.osVersion)}</option>`).join('');
         const registration = candidates ? `<section class="card"><h2>Register connected device</h2><form id="register-device"><select name="udid">${candidates}</select> <button>Register</button></form><p id="register-result" class="muted"></p><script>document.getElementById('register-device').addEventListener('submit',async function(e){e.preventDefault();var s=e.currentTarget.udid;var o=s.options[s.selectedIndex];var r=await fetch('/api/devices',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({udid:o.value,name:o.dataset.name,pluginData:{}})});document.getElementById('register-result').textContent=r.ok?'Registered. Reloading…':(await r.json()).error;if(r.ok)setTimeout(function(){location.reload()},500)});</script></section>` : '';
@@ -639,7 +836,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     });
     app.get<{ Params: { udid: string } }>('/devices/:udid', async (request, reply) => {
         const device = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
-        if (!device) return reply.code(404).type('text/html').send(renderPage('Not found', '<h1>Device not found</h1>'));
+        if (!device) return reply.code(404).type('text/html').send(renderPage('Not found', '<section class="card"><h1>Device not found</h1><p class="muted">No registered phone has this UDID. It may have been removed, or the link is from another farm.</p><p><a class="button" href="/">Back to devices</a></p></section>'));
         if (themed) {
             const rendered = options.dashboardTheme?.renderDevice
                 ? options.dashboardTheme.renderDevice(themed.deviceHtml, device) : themed.deviceHtml;

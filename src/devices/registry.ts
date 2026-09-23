@@ -14,6 +14,12 @@ export interface RegisteredDevice {
     passcode?: string;
     /** Per-device single-tap coordinate overrides (dashboard calibration). */
     coordinates?: DeviceCoordinateOverrides;
+    /**
+     * Where the phone physically sits — free text the operator chooses, e.g. `A3`
+     * or `hub 2 · port 7`. Purely a label: nothing resolves it, it exists so that
+     * "iPhone 14 is offline" maps to a slot in the rack without unplugging cables.
+     */
+    rackSlot?: string;
     /** When true the farm keeps the entry but stops supervising it — no WDA, no worker, no discovery polling. */
     disabled?: boolean;
     pluginData: Record<string, JsonObject>;
@@ -25,6 +31,9 @@ export function activeDevices(devices: readonly RegisteredDevice[]): RegisteredD
 }
 
 export const PASSCODE_PATTERN = /^\d{4,}$/;
+
+/** Long enough for "hub 2 · port 7", short enough to stay on one line in the grid. */
+export const RACK_SLOT_MAX_LENGTH = 40;
 
 /** A device with its passcode removed and a boolean marker in its place — safe to serialize. */
 export function redactDevice<T extends { passcode?: string }>(device: T): Omit<T, 'passcode'> & { hasPasscode: boolean } {
@@ -65,6 +74,11 @@ export async function saveRegisteredDevices(devices: RegisteredDevice[], registr
         if (device.coordinates !== undefined) {
             device.coordinates = validateCoordinateOverrides(device.coordinates, device.coordinateProfile);
             if (Object.keys(device.coordinates).length === 0) delete device.coordinates;
+        }
+        if (device.rackSlot !== undefined) {
+            const slot = device.rackSlot.trim().slice(0, RACK_SLOT_MAX_LENGTH);
+            if (slot) device.rackSlot = slot;
+            else delete device.rackSlot;
         }
         if (device.disabled !== true) delete device.disabled;
         if (unique.has(device.udid)) throw new Error(`Device ${device.udid} is already registered`);

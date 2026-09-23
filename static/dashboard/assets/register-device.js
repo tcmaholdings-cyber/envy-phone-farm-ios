@@ -7,6 +7,7 @@ const errorBox = document.querySelector('#registration-error');
 const form = document.querySelector('#registration-details');
 const nameInput = document.querySelector('#registration-name');
 const profileInput = document.querySelector('#registration-profile');
+const rackSlotInput = document.querySelector('#registration-rackslot');
 const accountsInput = document.querySelector('#registration-accounts');
 const passcodeInput = document.querySelector('#registration-passcode');
 const ports = document.querySelector('#registration-ports');
@@ -14,6 +15,30 @@ const checks = document.querySelector('#registration-checks');
 const logs = document.querySelector('#registration-logs');
 const authorize = document.querySelector('#authorize-registration');
 const finalizeButton = document.querySelector('#action-finalize');
+const toastElement = document.querySelector('#toast');
+let toastTimer;
+function toast(message) {
+    if (!toastElement)
+        return;
+    toastElement.textContent = message;
+    toastElement.classList.add('visible');
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => toastElement.classList.remove('visible'), 4_000);
+}
+function skeletonCards() {
+    const hidden = document.createElement('span');
+    hidden.className = 'visually-hidden';
+    hidden.textContent = 'Looking for phones…';
+    return [hidden, ...Array.from({ length: 3 }, () => {
+            const card = document.createElement('article');
+            card.className = 'candidate-card skeleton';
+            card.setAttribute('aria-hidden', 'true');
+            const bar = document.createElement('div');
+            bar.className = 'skeleton-row';
+            card.append(bar);
+            return card;
+        })];
+}
 let currentId;
 let poll;
 async function request(url, options) {
@@ -27,15 +52,39 @@ async function request(url, options) {
 }
 function showError(error) {
     errorBox.hidden = !error;
-    errorBox.textContent = error ? (error instanceof Error ? error.message : String(error)) : '';
+    if (!error) {
+        errorBox.replaceChildren();
+        return;
+    }
+    const title = document.createElement('strong');
+    title.textContent = 'Setup step failed.';
+    const cause = document.createElement('p');
+    cause.textContent = error instanceof Error ? error.message : String(error);
+    errorBox.replaceChildren(title, cause);
 }
 async function candidates() {
     showError();
-    candidateList.textContent = 'Checking connected devices…';
+    candidateList.setAttribute('aria-busy', 'true');
+    candidateList.replaceChildren(...skeletonCards());
     try {
         const data = await request('/api/device-registrations/candidates');
         if (!data.devices.length) {
-            candidateList.innerHTML = '<div class="empty-state"><h3>No unregistered device is readable</h3><p>Connect by USB, unlock the device, accept Trust, and click Recheck.</p></div>';
+            const empty = document.createElement('div');
+            empty.className = 'empty-state';
+            const icon = document.createElement('div');
+            icon.className = 'empty-icon';
+            icon.setAttribute('aria-hidden', 'true');
+            const heading = document.createElement('h3');
+            heading.textContent = 'No unregistered phones';
+            const text = document.createElement('p');
+            text.textContent = 'Plug one in over USB, unlock it and trust this Mac, then recheck.';
+            const recheck = document.createElement('button');
+            recheck.type = 'button';
+            recheck.className = 'button secondary';
+            recheck.textContent = 'Recheck';
+            recheck.addEventListener('click', () => void candidates());
+            empty.append(icon, heading, text, recheck);
+            candidateList.replaceChildren(empty);
             return;
         }
         candidateList.replaceChildren(...data.devices.map((device) => {
@@ -50,15 +99,29 @@ async function candidates() {
             const button = document.createElement('button');
             button.className = 'button primary';
             button.type = 'button';
-            button.textContent = 'Set up this device';
-            button.addEventListener('click', () => void create(device.udid));
+            button.textContent = 'Set up';
+            button.setAttribute('aria-label', `Set up ${device.name}`);
+            button.addEventListener('click', () => {
+                for (const other of candidateList.querySelectorAll('.candidate-card'))
+                    other.classList.remove('selected');
+                card.classList.add('selected');
+                button.disabled = true;
+                button.setAttribute('aria-busy', 'true');
+                void create(device.udid).catch((error) => {
+                    showError(error);
+                    card.classList.remove('selected');
+                }).finally(() => { button.disabled = false; button.removeAttribute('aria-busy'); });
+            });
             card.append(copy, button);
             return card;
         }));
     }
     catch (error) {
-        candidateList.textContent = '';
+        candidateList.replaceChildren();
         showError(error);
+    }
+    finally {
+        candidateList.removeAttribute('aria-busy');
     }
 }
 async function create(udid) {
@@ -85,6 +148,8 @@ function render(snapshot) {
         }
         profileInput.value = snapshot.coordinateProfile ?? (snapshot.availableProfiles.some(({ name }) => name === previous) ? previous : '');
     }
+    if (document.activeElement !== rackSlotInput)
+        rackSlotInput.value = snapshot.rackSlot ?? '';
     if (document.activeElement !== accountsInput)
         accountsInput.value = snapshot.tiktokAccounts.join(', ');
     passcodeInput.placeholder = snapshot.hasPasscode ? 'Passcode saved in this setup session' : 'Optional numeric passcode';
@@ -94,7 +159,9 @@ function render(snapshot) {
         row.className = `registration-check ${value.state}`;
         const state = document.createElement('span');
         state.className = `check-mark ${value.state}`;
-        state.textContent = value.state === 'passed' ? '✓' : value.state === 'checking' ? '…' : '!';
+        state.textContent = value.state === 'passed' ? '✓' : value.state === 'checking' ? '…' : value.state === 'pending' ? '·' : '!';
+        state.setAttribute('role', 'img');
+        state.setAttribute('aria-label', value.state);
         const copy = document.createElement('div');
         const heading = document.createElement('h3');
         heading.textContent = key.replace(/^./, (letter) => letter.toUpperCase());
@@ -169,12 +236,13 @@ form.addEventListener('submit', async (event) => {
     try {
         const snapshot = await request(`/api/device-registrations/${encodeURIComponent(currentId)}`, {
             method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-                name: nameInput.value, coordinateProfile: profileInput.value,
+                name: nameInput.value, coordinateProfile: profileInput.value, rackSlot: rackSlotInput.value,
                 tiktokAccounts: accountsInput.value.split(','), passcode: passcodeInput.value || undefined,
             }),
         });
         passcodeInput.value = '';
         render(snapshot);
+        toast('Details saved.');
     }
     catch (error) {
         showError(error);

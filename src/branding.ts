@@ -8,7 +8,8 @@
  *
  * | Variable                  | Default                       | Shown as |
  * | ------------------------- | ----------------------------- | -------- |
- * | PHONE_FARM_BRAND_NAME     | `iOS Farm`                    | product name in the top bar (links to `/`) |
+ * | PHONE_FARM_BRAND_NAME     | `iOS Farm`                    | product name: logo alt text, fallback-page nav, logs |
+ * | PHONE_FARM_BRAND_LABEL    | the name                      | visible text next to the logo in the top bar (links to `/`) |
  * | PHONE_FARM_BRAND_TITLE    | `Handler`                     | suffix of every page `<title>` |
  * | PHONE_FARM_BRAND_BY       | `by Handler`                  | small credit under the name; empty string hides it |
  * | PHONE_FARM_BRAND_BY_URL   | `https://gethandler.ai`       | where the credit links; empty string = plain text |
@@ -20,6 +21,8 @@ import path from 'node:path';
 
 export interface Branding {
     name: string;
+    /** Text shown beside the logo. Defaults to `name`; a wordmark logo usually wants just the product, e.g. "Phone Farm". */
+    label: string;
     title: string;
     by: string;
     byUrl: string;
@@ -30,6 +33,7 @@ export interface Branding {
 
 export const DEFAULT_BRANDING: Branding = {
     name: 'iOS Farm',
+    label: 'iOS Farm',
     title: 'Handler',
     by: 'by Handler',
     byUrl: 'https://gethandler.ai',
@@ -56,8 +60,10 @@ function pick(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
 export function brandingFromEnv(env: NodeJS.ProcessEnv = process.env): Branding {
     const logo = env.PHONE_FARM_BRAND_LOGO?.trim();
     const footer = env.PHONE_FARM_FOOTER_TEXT?.trim();
+    const name = pick(env, 'PHONE_FARM_BRAND_NAME', DEFAULT_BRANDING.name) || DEFAULT_BRANDING.name;
     return {
-        name: pick(env, 'PHONE_FARM_BRAND_NAME', DEFAULT_BRANDING.name) || DEFAULT_BRANDING.name,
+        name,
+        label: pick(env, 'PHONE_FARM_BRAND_LABEL', name) || name,
         title: pick(env, 'PHONE_FARM_BRAND_TITLE', DEFAULT_BRANDING.title) || DEFAULT_BRANDING.title,
         by: pick(env, 'PHONE_FARM_BRAND_BY', DEFAULT_BRANDING.by),
         byUrl: pick(env, 'PHONE_FARM_BRAND_BY_URL', DEFAULT_BRANDING.byUrl),
@@ -82,7 +88,7 @@ export function brandHtml(branding: Branding, logoSrc: string | null = null): st
             ? `<a class="brand-by" href="${escapeHtml(branding.byUrl)}" target="_blank" rel="noopener">${escapeHtml(branding.by)}</a>`
             : `<span class="brand-by">${escapeHtml(branding.by)}</span>`)
         : '';
-    return `<div class="brand">${logo}<div class="brand-text"><a class="brand-name" href="/">${escapeHtml(branding.name)}</a>${by}</div></div>`;
+    return `<div class="brand">${logo}<div class="brand-text"><a class="brand-name" href="/">${escapeHtml(branding.label)}</a>${by}</div></div>`;
 }
 
 /** Footer text. Stock: the Agniverse credit. With PHONE_FARM_FOOTER_TEXT: that text, linked to PHONE_FARM_BRAND_URL when set. */

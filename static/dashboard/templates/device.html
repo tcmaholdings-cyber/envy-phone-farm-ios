@@ -4,23 +4,16 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>iPhone · __BRAND_TITLE__</title>
+    <link rel="preload" href="/assets/fonts/oswald-latin-variable.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/assets/fonts/poppins-latin-400.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="/assets/styles.css">
     <script src="/assets/htmx.min.js" defer></script>
 </head>
-<body>
+<body class="page-device">
     <header class="topbar">
         <div class="topbar-inner">
             __BRAND__
-            <nav class="topbar-nav">
-                <a class="crumb" href="/">Devices</a>
-                <a class="crumb" href="/tasks">Tasks</a>
-                <button id="open-tasks" class="button secondary" type="button">Tasks &amp; schedules</button>
-                <button id="open-accounts" class="button secondary" type="button">Accounts</button>
-                <button id="open-passcode" class="button secondary" type="button">Passcode</button>
-                <button id="open-calibrate" class="button secondary" type="button">Touch points</button>
-                <button id="open-remove" class="button danger" type="button">Remove device</button>
-                __PLUGIN_NAV____AUTH_NAV__
-            </nav>
+            <nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/">Devices</a><a class="nav-link" href="/tasks">Tasks</a><a class="nav-link" href="/devices/register">Register</a>__PLUGIN_NAV____AUTH_NAV__</nav>
         </div>
     </header>
     <main class="shell device-shell" data-device-udid="__DEVICE_UDID__">
@@ -28,18 +21,28 @@
             hx-get="/api/devices/__DEVICE_UDID__/fragments/summary" hx-trigger="load" hx-swap="outerHTML">
             <span class="spinner" aria-hidden="true"></span>Loading device details…
         </section>
+        <div id="connection-banner" class="banner warn" role="alert" hidden><strong>Lost contact with the server. Retrying…</strong><p>Remote input is paused until the dashboard answers again.</p></div>
+        <div class="device-toolbar" role="toolbar" aria-label="Device settings">
+            <button id="open-tasks" class="button secondary" type="button">Tasks &amp; schedules</button>
+            <button id="open-accounts" class="button secondary" type="button">Accounts</button>
+            <button id="open-passcode" class="button secondary" type="button">Passcode</button>
+            <button id="open-rackslot" class="button secondary" type="button">Rack slot</button>
+            <button id="open-calibrate" class="button secondary" type="button">Touch points</button>
+            <span class="spacer"></span>
+            <button id="open-remove" class="button danger" type="button">Remove device</button>
+        </div>
         <div class="workspace-grid">
             <section class="panel remote-panel">
                 <div class="section-heading">
                     <div><span class="eyebrow">Live control</span><h2>Device screen</h2></div>
                     <div class="inline-actions">
-                        <button id="refresh" class="icon-button" type="button">Reconnect</button>
-                        <button id="toggle" class="icon-button" type="button">Pause</button>
+                        <button id="refresh" class="icon-button" type="button" aria-label="Reconnect the video stream">Reconnect</button>
+                        <button id="toggle" class="icon-button" type="button">Pause stream</button>
                     </div>
                 </div>
                 <div class="stream-workspace">
-                    <div class="phone"><img id="screen" alt="Live screen from the connected iPhone" draggable="false"></div>
-                    <div class="remote-controls" aria-label="Device navigation controls">
+                    <div class="phone"><img id="screen" alt="Live screen from the connected iPhone" draggable="false"><div id="stream-overlay" class="stream-overlay" hidden><span class="status connecting"><span class="dot"></span>Stream paused. Reconnecting…</span><button id="stream-retry" class="button secondary" type="button">Retry</button></div></div>
+                    <div class="remote-controls" role="group" aria-label="Device navigation controls">
                         <div class="swipe-pad">
                             <button class="remote-button up" type="button" data-remote-action="up" aria-label="Swipe up">↑</button>
                             <button class="remote-button left" type="button" data-remote-action="left" aria-label="Swipe left">←</button>
@@ -49,15 +52,16 @@
                         </div>
                         <div class="system-controls">
                             <button class="remote-button labeled" type="button" data-remote-action="home"><span aria-hidden="true">⌂</span> Home</button>
-                            <button class="remote-button labeled" type="button" data-remote-action="lock"><span aria-hidden="true">◼</span> Power off</button>
-                            <button class="remote-button labeled" type="button" data-remote-action="wake"><span aria-hidden="true">◻</span> Power on</button>
-                            <button class="remote-button labeled" type="button" data-remote-action="unlock"><span aria-hidden="true">🔓</span> Unlock</button>
+                            <button class="remote-button labeled" type="button" data-remote-action="lock"><svg class="control-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg> Power off</button>
+                            <button class="remote-button labeled" type="button" data-remote-action="wake"><svg class="control-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg> Power on</button>
+                            <button class="remote-button labeled" type="button" data-remote-action="unlock"><svg class="control-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.8-1.2"/></svg> Unlock</button>
                             <button class="remote-button labeled" type="button" data-remote-action="volumeUp"><span aria-hidden="true">＋</span> Volume up</button>
                             <button class="remote-button labeled" type="button" data-remote-action="volumeDown"><span aria-hidden="true">−</span> Volume down</button>
                         </div>
                     </div>
                 </div>
-                <div id="status" class="stream-status"><span class="dot"></span><span>Waiting for device details…</span></div>
+                <div id="status" class="stream-status status connecting" role="status"><span class="dot"></span><span>Connecting…</span></div>
+                <div id="remote-locked" class="banner warn" role="alert" hidden><strong>Automation running. Remote input is locked.</strong><p id="remote-locked-detail"></p></div>
                 <p class="hint">Click to tap and drag to swipe. Remote input pauses while a doomscroll session is running.</p>
             </section>
             <div class="action-stack">
@@ -124,16 +128,31 @@
             </div>
         </form>
     </dialog>
+    <dialog id="rackslot-dialog">
+        <form id="rackslot-form" class="modal" autocomplete="off">
+            <div class="modal-head">
+                <div><span class="eyebrow">This device</span><h2>Rack slot</h2></div>
+                <button id="close-rackslot" class="icon-button" type="button">Close</button>
+            </div>
+            <p>Where this phone physically sits, so an offline device can be found without tracing cables. Free text — whatever is written on the rack, for example <code>A3</code> or <code>hub 2 · port 7</code>.</p>
+            <label for="device-rackslot">Slot</label>
+            <input id="device-rackslot" type="text" maxlength="40" value="__DEVICE_RACKSLOT__" placeholder="A3">
+            <div class="form-actions">
+                <span id="rackslot-result" class="run-meta" aria-live="polite"></span><span class="spacer"></span>
+                <button class="button primary" type="submit">Save slot</button>
+            </div>
+        </form>
+    </dialog>
     <dialog id="remove-dialog">
         <form class="modal" method="dialog">
             <div class="modal-head">
                 <div><span class="eyebrow">This device</span><h2>Remove device</h2></div>
                 <button id="close-remove" class="icon-button" type="button">Close</button>
             </div>
-            <p>This cancels every schedule for the device and forgets its configuration (passcode, accounts, touch points). WebDriverAgent stays installed on the phone.</p>
+            <p>Remove <strong id="remove-name">this device</strong>? This cancels every schedule for it and forgets its configuration (passcode, accounts, touch points). WebDriverAgent stays installed on the phone.</p>
             <div class="form-actions">
                 <span id="remove-result" class="run-meta" aria-live="polite"></span><span class="spacer"></span>
-                <button id="remove-device" class="button danger" type="button">Remove device</button>
+                <button id="remove-device" class="button danger solid" type="button">Remove device</button>
             </div>
         </form>
     </dialog>
@@ -146,7 +165,7 @@
             <p>Pick a target, then click where it belongs on the live screen. Untouched targets use the <strong id="cal-profile">…</strong> profile.</p>
             <div class="cal-toolbar">
                 <label class="cal-switch"><input id="cal-control" type="checkbox"><span class="cal-switch-track" aria-hidden="true"></span><span>Control device</span></label>
-                <button id="cal-unlock" class="button secondary" type="button"><span aria-hidden="true">🔓</span> Unlock</button>
+                <button id="cal-unlock" class="button secondary" type="button"><svg class="control-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.8-1.2"/></svg> Unlock</button>
             </div>
             <div class="calibrate-body">
                 <div class="calibrate-screen"><img id="cal-screen" alt="Live screen"><div id="cal-markers" class="cal-markers" aria-hidden="true"></div></div>
@@ -261,6 +280,7 @@
             <div class="form-actions"><button id="cancel-post" class="button secondary" type="button">Cancel</button><button id="submit-post" class="button primary" type="submit">Save to Drafts</button></div>
         </form>
     </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/assets/device.js"></script>
     <footer class="app-footer">__FOOTER__</footer>
 </body>

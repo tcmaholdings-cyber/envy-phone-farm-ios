@@ -124,7 +124,7 @@ npm run worker         # scheduler worker — runs due tasks
 npm run web            # dashboard + API on :3000
 ```
 
-Open <http://127.0.0.1:3000>, go to **Register device**, pick the connected
+Open <http://127.0.0.1:3000>, go to **Register a phone**, pick the connected
 device, and step through the checks. Unlock the phone when WDA first launches.
 
 ## 7. Schedule something

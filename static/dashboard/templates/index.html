@@ -3,27 +3,45 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>iOS Automation · __BRAND_TITLE__</title>
+    <title>Devices · __BRAND_TITLE__</title>
+    <link rel="preload" href="/assets/fonts/oswald-latin-variable.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/assets/fonts/poppins-latin-400.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="/assets/styles.css">
     <script src="/assets/htmx.min.js" defer></script>
+    <script src="/assets/grid.js" defer></script>
 </head>
-<body>
+<body class="page-grid">
     <header class="topbar">
         <div class="topbar-inner">
             __BRAND__
-            <nav class="topbar-nav"><a class="button primary" href="/devices/register">Register device</a><a class="button secondary" href="/tasks">Tasks</a><button class="button secondary" type="button" hx-get="/api/fragments/devices" hx-target="#device-list" hx-swap="outerHTML">Refresh</button>__PLUGIN_NAV____AUTH_NAV__</nav>
+            <nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/" aria-current="page">Devices</a><a class="nav-link" href="/tasks">Tasks</a><a class="nav-link" href="/devices/register">Register</a>__PLUGIN_NAV____AUTH_NAV__</nav>
         </div>
     </header>
     <main class="shell">
         <header class="page-header">
             <div>
-                <span class="eyebrow">Automation workspace</span>
+                <span class="eyebrow">Rack</span>
                 <h1>Devices</h1>
-                <p>Choose a connected iPhone to control it or run automation.</p>
+                <p>Every registered iPhone at a glance. Open one to drive it or run automation.</p>
+            </div>
+            <div class="page-actions">
+                <button class="button secondary" type="button" hx-get="/api/fragments/devices" hx-target="#device-list" hx-swap="outerHTML">Refresh</button>
+                <a class="button primary" href="/devices/register">Register a phone</a>
             </div>
         </header>
-        <section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="load" hx-swap="outerHTML" aria-live="polite">
-            <div class="loading-card"><span class="spinner" aria-hidden="true"></span>Looking for connected devices…</div>
+        <div id="connection-banner" class="banner warn" role="alert" hidden><strong>Lost contact with the server. Retrying…</strong><p>The grid keeps the last pictures, dimmed, until the dashboard answers again.</p></div>
+        <div id="grid-error" class="banner err" role="alert" hidden></div>
+        <p id="grid-announcer" class="visually-hidden" role="status"></p>
+        <section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="load" hx-swap="outerHTML">
+            <p class="visually-hidden">Looking for connected devices…</p>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
+            <article class="device-card skeleton" aria-hidden="true"><div class="device-preview-frame"></div><div class="device-copy"><h2>&nbsp;</h2><p>&nbsp;</p></div></article>
         </section>
     </main>
     <footer class="app-footer">__FOOTER__</footer>

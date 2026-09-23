@@ -13,7 +13,7 @@ import { inject } from './support.js';
 
 const BRAND_KEYS = [
     'PHONE_FARM_BRAND_NAME', 'PHONE_FARM_BRAND_TITLE', 'PHONE_FARM_BRAND_BY', 'PHONE_FARM_BRAND_BY_URL',
-    'PHONE_FARM_BRAND_LOGO', 'PHONE_FARM_FOOTER_TEXT', 'PHONE_FARM_BRAND_URL',
+    'PHONE_FARM_BRAND_LOGO', 'PHONE_FARM_FOOTER_TEXT', 'PHONE_FARM_BRAND_URL', 'PHONE_FARM_BRAND_LABEL',
 ] as const;
 
 function withEnv(values: Partial<Record<(typeof BRAND_KEYS)[number], string>>): () => void {
@@ -102,4 +102,34 @@ test('an empty PHONE_FARM_BRAND_BY hides the credit; a missing logo file is skip
     const res = await inject(server, { method: 'GET', url: '/' });
     assert.doesNotMatch(res.body, /brand-by|brand-logo/);
     assert.ok(warnings.some((line) => line.includes('PHONE_FARM_BRAND_LOGO')));
+});
+
+test('PHONE_FARM_BRAND_LABEL sets the text beside the logo; the name still drives alt text and the fallback nav', async (context) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'phone-farm-label-'));
+    const logoPath = path.join(dir, 'logo.png');
+    await writeFile(logoPath, Buffer.from('89504e470d0a1a0a', 'hex'));
+    context.after(withEnv({
+        PHONE_FARM_BRAND_NAME: 'Envy Phone Farm', PHONE_FARM_BRAND_LABEL: 'Phone <Farm>',
+        PHONE_FARM_BRAND_TITLE: 'Envy', PHONE_FARM_BRAND_LOGO: logoPath,
+    }));
+    const branding = brandingFromEnv();
+    assert.equal(branding.label, 'Phone <Farm>');
+    const html = brandHtml(branding, '/assets/brand-logo');
+    assert.match(html, /<img class="brand-logo" src="\/assets\/brand-logo" alt="Envy Phone Farm logo">/);
+    assert.match(html, /class="brand-name" href="\/">Phone &lt;Farm&gt;</);
+
+    const server = await app();
+    context.after(() => server.close());
+    const index = await inject(server, { method: 'GET', url: '/' });
+    assert.match(index.body, /<title>Devices · Envy<\/title>/);
+    assert.match(index.body, /class="brand-name" href="\/">Phone &lt;Farm&gt;</);
+    const docs = await inject(server, { method: 'GET', url: '/docs' });
+    assert.match(docs.body, /<a class="home" href="\/">Envy Phone Farm<\/a>/, 'fallback pages name the product in full');
+});
+
+test('an unset PHONE_FARM_BRAND_LABEL falls back to the name, so stock deployments are unchanged', (context) => {
+    context.after(withEnv({ PHONE_FARM_BRAND_NAME: 'Acme Rack' }));
+    assert.equal(brandingFromEnv().label, 'Acme Rack');
+    context.after(withEnv({}));
+    assert.equal(brandingFromEnv().label, 'iOS Farm');
 });

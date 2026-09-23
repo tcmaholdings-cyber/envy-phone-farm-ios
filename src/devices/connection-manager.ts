@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { discoverConnectedDeviceUdids } from './discovery.js';
+import { connectedDeviceUdids } from './discovery.js';
 import { activeDevices, loadRegisteredDevices, type RegisteredDevice } from './registry.js';
 
 export type DeviceConnectionPhase = 'disconnected' | 'connecting' | 'unlock-required' | 'ready' | 'error';
@@ -101,7 +101,7 @@ export class DeviceConnectionManager implements DeviceConnections {
 
     constructor(options: ManagerOptions = {}) {
         this.loadDevices = options.loadDevices ?? loadRegisteredDevices;
-        this.connectedUdids = options.connectedUdids ?? discoverConnectedDeviceUdids;
+        this.connectedUdids = options.connectedUdids ?? connectedDeviceUdids;
         this.spawnSupervisor = options.spawnSupervisor ?? defaultSpawnSupervisor;
         this.endpointReady = options.endpointReady ?? defaultEndpointReady;
         this.pollIntervalMs = options.pollIntervalMs ?? 2_000;

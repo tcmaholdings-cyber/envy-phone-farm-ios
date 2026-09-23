@@ -20,6 +20,20 @@ Loaded by every `npm run …` script (`--env-file-if-exists=.env`, then
 | `WDA_LOCAL_PORT` / `MJPEG_LOCAL_PORT` | `8100` / `9100` | Base ports for the per-phone USB forwards; each registered device carries its own `wdaLocalPort` / `mjpegLocalPort` (8100, 8101, … / 9100, 9101, …). |
 | `PHONE_FARM_TRUSTED_ORIGINS` | — | Comma-separated origins allowed to make state-changing browser requests besides the page's own origin (CSRF guard). API clients use `Authorization: Bearer` instead. |
 
+### Fleet-scale polling
+
+Defaults are tuned for a rack of twenty phones behind one hub. Every value here
+trades dashboard freshness against USB and lockdown traffic; raise them on a
+big rack that feels sluggish, lower them on a two-phone bench.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `PHONE_FARM_DISCOVERY_TTL_MS` | `2000` | How long a usbmux device sweep is reused. One sweep costs three lockdown round trips *per attached phone*; the grid, the WDA supervisor and every `/api/devices` caller share it. `0` disables the cache. The registration wizard's **Recheck** always forces a fresh sweep regardless. |
+| `PHONE_FARM_SCREENSHOT_TTL_MS` | `4000` | How long a device's grid still is reused. Concurrent requests for the same phone are always coalesced onto one WebDriverAgent round trip, so extra dashboard tabs are free either way. `GET …/remote/screenshot?fresh=1` bypasses it. |
+| `PHONE_FARM_SCREENSHOT_FAILURE_COOLDOWN_MS` | `20000` | After a phone's screenshot fails (WebDriverAgent down or wedged), how long further requests for it fail at once instead of waiting on the phone again. `…/remote/screenshot?fresh=1`, a registry change and **Reconnect** clear it. `0` disables it. |
+| `PHONE_FARM_GRID_SCREENSHOT_TIMEOUT_MS` | `3000` | WebDriverAgent deadline for a grid thumbnail. A phone slower than this shows its last still, marked stale, instead of holding a browser connection for the 10 s default. Other WDA calls keep the 10 s default: a full-size `/remote/screenshot` never joins an in-flight grid fetch, and a grid timeout does not put it into the failure cooldown. |
+| `PHONE_FARM_GRID_POLL_SECONDS` | `5`, or `10` above ten active phones | How often the device grid refreshes its cards (status, slot, accounts), and how often each visible card's thumbnail is revalidated. Thumbnails are fetched by the browser on staggered per-card timers, at most four at a time, and are skipped while the tab is hidden or the card is scrolled off screen. |
+
 ### Database
 
 | Key | Meaning |
@@ -74,6 +88,7 @@ Loaded by every `npm run …` script (`--env-file-if-exists=.env`, then
 | `WDA_SERVICE_SOCKET` | `.wda/wda-service.sock` | Path of the supervisor's control socket. |
 | `WDA_PROJECT_PATH`, `XCUITEST_DRIVER_PATH`, `WDA_BOOTSTRAP_PATH` | derived from `.appium2` | Override where the WebDriverAgent project / XCUITest driver are found. |
 | `WDA_URL`, `WDA_REMOTE_PORT`, `MJPEG_REMOTE_PORT` | — / `8100` / `9100` | Used by the standalone TikTok entrypoints when run by hand outside the worker. |
+| `WDA_XCTESTRUN` | — | Path to a copied `.xctestrun` from `wda:prepare -- --generic` on another Mac. When set, WDA runs that pre-signed build and this host needs no Team, signing identity or Apple ID — only Xcode. See *Signing on another Mac* in `operations.md`. |
 | `ALLOW_PROVISIONING_DEVICE_REGISTRATION` | `false` | `true` lets `xcodebuild` register a newly connected UDID with the Team automatically during `wda:prepare`. |
 | `SHOW_XCODE_LOG` | `false` | Verbose Xcode output from Appium sessions (debugging only). |
 | `DOOMSCROLL_PERSONALITY`, `TIKTOK_SWITCH_ACCOUNT` | set per task | Internal: passed from the task payload to the subprocess by the plugin. Not operator configuration. |
@@ -92,6 +107,7 @@ while the processes are stopped. Mode `0600`.
     "coordinates": { "like": { "x": 350, "y": 320 } },   // optional per-device overrides of the 15 calibratable TikTok points
     "wdaLocalPort": 8101,                        // unique per device
     "mjpegLocalPort": 9101,                      // unique per device
+    "rackSlot": "hub 2 · port 7",                // optional: where the phone physically sits
     "passcode": "123456",                        // unlock code; never returned by the API
     "disabled": false,                           // true = keep the entry, supervise nothing
     "pluginData": {
@@ -106,6 +122,10 @@ Rules:
 - `udid`, `wdaLocalPort`, `mjpegLocalPort` must be unique across entries.
 - `coordinateProfile` must exist in `src/devices/coordinates.ts` (only
   `iphone8` ships); an unknown key fails at load with a clear message.
+- `rackSlot` is free text (trimmed, 40 characters), purely an operator label:
+  nothing resolves it. It exists so "Rack A · 03 is offline" maps to a phone
+  someone can walk up to. Set it in the registration wizard, on the device page
+  (*Rack slot*), or with `PATCH /api/devices/:udid`; `""` clears it.
 - `pluginData` is per plugin id and never holds secrets.
 - The worker re-reads the file every 30 s; `wda-service` and `web` watch it
   too. Prefer `PATCH /api/devices/:udid` over editing while running.

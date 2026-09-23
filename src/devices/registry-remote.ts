@@ -28,7 +28,7 @@ export class RegistryWdaRemoteControl implements RemoteControl {
     }
 
     async getScreenInfo(udid: string): Promise<ScreenInfo> { return (await this.control(udid)).getScreenInfo(udid); }
-    async getScreenshot(udid: string): Promise<Buffer> { return (await this.control(udid)).getScreenshot(udid); }
+    async getScreenshot(udid: string, options?: { timeoutMs?: number }): Promise<Buffer> { return (await this.control(udid)).getScreenshot(udid, options); }
     async getMjpegStream(udid: string, signal?: AbortSignal): Promise<Response> { return (await this.control(udid)).getMjpegStream(udid, signal); }
     async performAction(udid: string, action: RemoteAction): Promise<void> { return (await this.control(udid)).performAction(udid, action); }
     async isLocked(udid: string): Promise<boolean> { return (await this.control(udid)).isLocked(udid); }

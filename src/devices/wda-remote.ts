@@ -72,7 +72,8 @@ interface W3cPointerSource {
 
 export interface RemoteControl {
     getScreenInfo(udid: string): Promise<ScreenInfo>;
-    getScreenshot(udid: string): Promise<Buffer>;
+    /** `timeoutMs` overrides the client's default WDA deadline for this one call. */
+    getScreenshot(udid: string, options?: { timeoutMs?: number }): Promise<Buffer>;
     /** `signal` should be tied to the client request so the upstream device stream closes when the viewer leaves. */
     getMjpegStream(udid: string, signal?: AbortSignal): Promise<Response>;
     performAction(udid: string, action: RemoteAction): Promise<void>;
@@ -125,12 +126,12 @@ export class WdaRemoteControl {
         }
     }
 
-    async request(pathname: string, options: RequestInit = {}): Promise<Response> {
+    async request(pathname: string, { timeoutMs, ...options }: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
         let response: Response;
         try {
             response = await this.fetch(`${this.wdaUrl}${pathname}`, {
                 ...options,
-                signal: AbortSignal.timeout(this.timeoutMs),
+                signal: AbortSignal.timeout(timeoutMs ?? this.timeoutMs),
             });
         } catch (error) {
             throw new RemoteDeviceError(`WebDriverAgent is unavailable: ${errorMessage(error)}`);
@@ -150,9 +151,11 @@ export class WdaRemoteControl {
         return payload.value;
     }
 
-    async getScreenshot(udid: string): Promise<Buffer> {
+    async getScreenshot(udid: string, options: { timeoutMs?: number } = {}): Promise<Buffer> {
         this.assertTarget(udid);
-        const response = await this.request('/screenshot');
+        // The grid passes a short deadline so a wedged phone fails fast instead
+        // of holding a browser connection for the full default timeout.
+        const response = await this.request('/screenshot', options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs });
         const payload = await response.json() as WdaPayload<unknown>;
         if (typeof payload.value !== 'string') {
             throw new RemoteDeviceError('WebDriverAgent returned an invalid screenshot');

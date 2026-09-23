@@ -4,34 +4,38 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Register device · __BRAND_TITLE__</title>
+    <link rel="preload" href="/assets/fonts/oswald-latin-variable.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/assets/fonts/poppins-latin-400.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="/assets/styles.css">
     <script type="module" src="/assets/register-device.js"></script>
 </head>
-<body>
+<body class="page-register">
     <header class="topbar">
         <div class="topbar-inner">
             __BRAND__
-            <nav class="topbar-nav"><a class="button secondary" href="/">Back to devices</a>__PLUGIN_NAV____AUTH_NAV__</nav>
+            <nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/">Devices</a><a class="nav-link" href="/tasks">Tasks</a><a class="nav-link" href="/devices/register" aria-current="page">Register</a>__PLUGIN_NAV____AUTH_NAV__</nav>
         </div>
     </header>
     <main class="shell registration-shell">
         <header class="page-header">
             <div><span class="eyebrow">Guided setup</span><h1>Register a device</h1><p>Keep the phone connected and unlocked. Every requirement is rechecked before it is saved.</p></div>
+            <div class="page-actions"><a class="button secondary" href="/">Back to devices</a></div>
         </header>
 
         <section class="registration-panel" id="candidate-panel">
             <div class="section-heading"><div><span class="eyebrow">Step 1</span><h2>Connect an unregistered device</h2></div><button class="button secondary" id="refresh-candidates" type="button">Recheck</button></div>
             <p>Connect by USB, unlock it, and accept <strong>Trust This Computer</strong>. If Developer Mode has never been enabled, pairing with Xcode makes the setting appear.</p>
-            <div id="candidate-list" class="candidate-list" aria-live="polite">Checking connected devices…</div>
+            <div id="candidate-list" class="candidate-list" aria-live="polite" aria-busy="true"><span class="visually-hidden">Looking for phones…</span><article class="candidate-card skeleton" aria-hidden="true"><div class="skeleton-row"></div></article><article class="candidate-card skeleton" aria-hidden="true"><div class="skeleton-row"></div></article><article class="candidate-card skeleton" aria-hidden="true"><div class="skeleton-row"></div></article></div>
         </section>
 
         <section class="registration-panel" id="registration-panel" hidden>
-            <div class="section-heading"><div><span class="eyebrow">Setup checklist</span><h2 id="registration-title">Device</h2></div><span id="registration-busy" class="status checking" hidden>checking</span></div>
-            <div id="registration-error" class="run-error" hidden></div>
+            <div class="section-heading"><div><span class="eyebrow">Setup checklist</span><h2 id="registration-title">Device</h2></div><span id="registration-busy" class="status checking" hidden><span class="spinner" aria-hidden="true"></span>Checking…</span></div>
+            <div id="registration-error" class="banner err" role="alert" hidden></div>
 
             <form id="registration-details" class="registration-form">
                 <label>Device name<input id="registration-name" name="name" required maxlength="100"></label>
                 <label>Coordinate profile <span class="field-help">The detected model is recommended automatically; you may override it.</span><select id="registration-profile" name="coordinateProfile" required><option value="">Detecting model</option></select></label>
+                <label>Rack slot <span class="field-help">Optional. Where the phone sits — e.g. <code>A3</code> or <code>hub 2 · port 7</code> — so an offline device can be found without tracing cables.</span><input id="registration-rackslot" name="rackSlot" maxlength="40" placeholder="A3"></label>
                 <label class="wide">TikTok accounts <span class="field-help">Optional. Add comma-separated signed-in handles now, or manage them later from the device page.</span><input id="registration-accounts" name="accounts" placeholder="@account_one, @account_two"></label>
                 <label class="wide">Unlock passcode <span class="field-help">Optional; stored only in the git-ignored owner-readable devices.json file, never returned by the API.</span><input id="registration-passcode" name="passcode" type="password" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,}"></label>
                 <div class="wide inline-actions"><button class="button secondary" type="submit">Save details</button><span id="registration-ports" class="run-meta"></span></div>
@@ -52,14 +56,15 @@
             <label class="authorization"><input id="authorize-registration" type="checkbox"> I am authorized to let Xcode register this UDID with the configured Apple Developer team.</label>
             <div class="inline-actions registration-actions">
                 <button class="button secondary" id="action-refresh" type="button">Recheck state</button>
-                <button class="button primary" id="action-prepare" type="button">Register and prepare WDA</button>
-                <button class="button primary" id="action-verify" type="button">Verify Appium, video, touch, and accounts</button>
+                <button class="button secondary" id="action-prepare" type="button">Register and prepare WDA</button>
+                <button class="button secondary" id="action-verify" type="button">Verify Appium, video, touch, and accounts</button>
                 <button class="button primary" id="action-finalize" type="button" disabled>Finish registration</button>
-                <button class="button danger" id="action-cancel" type="button">Cancel</button>
+                <button class="button danger" id="action-cancel" type="button">Cancel setup</button>
             </div>
-            <details class="registration-log"><summary>Sanitized setup log</summary><pre id="registration-logs">No setup output yet.</pre></details>
+            <details class="registration-log"><summary>Sanitized setup log</summary><pre id="registration-logs" role="log">No setup output yet.</pre></details>
         </section>
     </main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <footer class="app-footer">__FOOTER__</footer>
 </body>
 </html>

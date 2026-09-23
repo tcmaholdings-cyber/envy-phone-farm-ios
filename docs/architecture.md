@@ -33,10 +33,26 @@ Fastify app on `WEB_PORT` (default 3000).
 - JSON API under `/api/*` (devices, registrations, schedules, executions,
   assets, remote control).
 - Live device screen: `GET /api/devices/:udid/remote/stream` proxies the
-  phone's MJPEG feed (used on the device page; the device **grid** uses
-  periodic `…/remote/screenshot` stills instead). The proxy aborts the
+  phone's MJPEG feed (used on the device page). The device **grid** uses
+  stills instead: `GET …/remote/thumbnail` is a 240 px JPEG of the cached
+  screenshot with an ETag (an unchanged screen costs a 304), refreshed per card
+  by `static/dashboard/assets/grid.js`, and only for phones whose WDA the
+  supervisor reports ready; the rest show **WDA not ready**. The full-size PNG
+  `…/remote/screenshot` stays for the device page and calibration. The proxy aborts the
   upstream feed when the browser disconnects. `POST …/remote/action` forwards
   tap/swipe to WDA.
+- Static assets are content-hashed: templates reference `/assets/<file>?v=<hash>`
+  (immutable caching), and a bare URL revalidates by ETag. The theme's fonts
+  (Oswald and Poppins, SIL OFL, `static/dashboard/fonts/`) are served by
+  `GET /assets/fonts/:file` from a fixed whitelist (`DASHBOARD_FONTS` in
+  `app.ts`); the stylesheet's `url()` references are rewritten to the same
+  hashed URLs the templates preload. Nothing is loaded from an external host.
+- **Shared polling.** Everything that repeats per phone is pooled, because the
+  whole rack sits on one USB tree: one usbmux sweep is shared by the grid, the
+  API and the WDA supervisor (`connectedDevices()` in `src/devices/discovery.ts`),
+  and concurrent screenshot requests for a device collapse onto one WDA round
+  trip (`src/devices/screenshot-cache.ts`). The grid's own cadence widens past
+  ten phones. See *Fleet-scale polling* in [configuration.md](configuration.md).
 - Loads plugins (`PHONE_FARM_PLUGINS`) and the auth provider
   (`PHONE_FARM_AUTH_PLUGIN`); mounts each plugin's **panels** on the device
   page and its **routes** under `/plugins/<pluginId>`.
@@ -170,6 +186,6 @@ in `src/scheduler/recurrence.ts`; the next occurrence is written to
 | `src/registry.ts` | `PluginRegistry` — task resolution and validation |
 | `src/loader.ts` | Dynamic import of `PHONE_FARM_PLUGINS` / `PHONE_FARM_AUTH_PLUGIN` |
 | `src/example-plugin.ts` | Minimal reference plugin |
-| `static/dashboard/` | HTML templates, browser TS (`tsconfig.web.json` → `static/dashboard/assets/*.js`) |
+| `static/dashboard/` | HTML templates, `styles.css` (the Envy theme: all colours are `:root` tokens), `fonts/`, browser TS (`tsconfig.web.json` → `static/dashboard/assets/*.js`, including the grid thumbnail loader `grid.js`) |
 | `Patches/` | WDA source patches applied by `wda:prepare` |
 | `drizzle/` | SQL migrations + journal |

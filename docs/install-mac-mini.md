@@ -12,10 +12,50 @@ processes do) and [configuration.md](configuration.md) (every setting).
 | Item | Notes |
 | --- | --- |
 | Mac mini (Apple silicon), macOS 14+ | One farm host per rack. Keep it on mains power, never sleeping (System Settings → Energy → *Prevent automatic sleeping*), and logged in to a **graphical session** — the WebDriverAgent launcher needs one. |
-| Powered USB hub(s) | One USB-C/A port per phone. Data-capable cables; cheap charge-only cables are the #1 cause of "device offline". |
+| Powered USB hub(s) | One USB-C/A port per phone. See [USB hubs and racks](#usb-hubs-and-racks) below before buying — the hub is the single most common source of "device offline". |
 | iPhones (this fleet: iPhone 12 mini) | Each with its own Apple ID signed in, TikTok installed and logged in, Developer Mode on. See §5. |
 | Apple Developer account | A **paid** Team (US$99/yr) for more than one device and for profiles that do not expire weekly. Note the 10-character Team ID. |
 | Admin user on the Mac | Everything below runs as one normal user account, e.g. `farm`. Give it *Automatic login* so agents come back after a power cut. |
+
+### USB hubs and racks
+
+The farm never talks to USB directly — phones arrive through `usbmuxd`, so any
+hub that enumerates works and no configuration names it. What the hub decides is
+whether phones stay online, charged and findable.
+
+- **Data, not charging.** Charge-only cables are the single biggest cause of
+  "device offline". Use the cable that came with the iPhone, or an MFi data
+  cable of the right connector: Lightning for iPhone 14 and earlier, USB-C for
+  iPhone 15 and later. Racks sold for Android farms ship USB-C or Micro cables
+  that will not fit a Lightning fleet.
+- **The Mac must be the USB host.** Avoid "OTG" hubs and switches: OTG exists to
+  make the *phone* the host so it can drive an ethernet adapter, which is an
+  Android-farm feature. An iPhone has to be a peripheral or nothing in this
+  stack — pairing, `xcodebuild`, the port forwards — can see it.
+- **Powered, with per-port current limiting.** A rack that injects one big 5 V
+  rail (the 40–60 A supplies sold with DIY farm stands) has no per-port
+  protection, and its charge path often presents no Apple current-negotiation
+  divider, so a phone running WebDriverAgent with the screen on draws more than
+  it is offered and slowly discharges while plugged in. Before committing a Mac
+  mini to one, confirm per-port limiting and that the 5 V rail is isolated from
+  the upstream port, and bench-test two phones for a few hours: they should
+  *gain* charge during a `doomscroll`.
+- **Per-port power switching is worth paying for.** The fix for a wedged phone
+  is a power cycle; without switching that means physically unplugging it inside
+  a full rack.
+- **Do not chain hubs.** USB allows five tiers and a 20-port unit is already
+  several cascaded chips internally. One hub, straight into the Mac.
+- **One model per rack.** Only the `iphone8` coordinate profile ships; a mixed
+  fleet means a new typed profile plus per-device calibration. See
+  [coordinates.md](coordinates.md).
+- **Label the slots**, and record each phone's label in its `rackSlot` (the
+  registration wizard asks, and the device page has a *Rack slot* button). The
+  dashboard prints it on every card, which is what turns "Rack A · 03 is
+  offline" into a phone someone can walk to.
+
+Above roughly ten phones, also read the polling defaults in
+[configuration.md](configuration.md#fleet-scale-polling): each phone adds
+lockdown and screenshot traffic to a USB tree they all share.
 
 ## 1. macOS baseline
 
@@ -153,7 +193,7 @@ See [operations.md](operations.md) for restart, logs and upgrades.
 
 ## 8. Register the phones
 
-Open <http://127.0.0.1:3000> → **Register device**. Pick the phone, give it
+Open <http://127.0.0.1:3000> → **Register a phone**. Pick the phone, give it
 its label, choose the coordinate profile (see the note below), enter the
 passcode and its TikTok account handle(s), and step through the checks
 (host → connection → signing → developer → WDA → Appium → video → touch →

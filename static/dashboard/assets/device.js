@@ -81,6 +81,12 @@ const elements = {
     passcodeClear: element('#passcode-clear'),
     passcodeState: element('#passcode-state'),
     passcodeResult: element('#passcode-result'),
+    rackslotDialog: element('#rackslot-dialog'),
+    openRackslot: element('#open-rackslot'),
+    closeRackslot: element('#close-rackslot'),
+    rackslotForm: element('#rackslot-form'),
+    deviceRackslot: element('#device-rackslot'),
+    rackslotResult: element('#rackslot-result'),
     openCalibrate: element('#open-calibrate'),
     calibrateDialog: element('#calibrate-dialog'),
     closeCalibrate: element('#close-calibrate'),
@@ -96,7 +102,62 @@ const elements = {
     calSave: element('#cal-save'),
     removeDevice: element('#remove-device'),
     removeResult: element('#remove-result'),
+    removeName: element('#remove-name'),
+    phone: element('.phone'),
+    streamOverlay: element('#stream-overlay'),
+    streamRetry: element('#stream-retry'),
+    remoteControls: element('.remote-controls'),
+    remoteLocked: element('#remote-locked'),
+    remoteLockedDetail: element('#remote-locked-detail'),
+    connectionBanner: element('#connection-banner'),
+    toast: element('#toast'),
 };
+// The page title is "<device> · <brand title>"; keep whatever brand suffix the
+// server rendered instead of hard-coding one.
+const initialTitle = document.title;
+const titleSuffix = initialTitle.includes(' · ') ? initialTitle.slice(initialTitle.lastIndexOf(' · ') + 3) : initialTitle;
+/** An HTTP failure that keeps its status, so a 409 lock can be told apart from a fault. */
+class RequestError extends Error {
+    status;
+    constructor(message, status) {
+        super(message);
+        this.status = status;
+    }
+}
+let toastTimer;
+function toast(message, tone = 'ok') {
+    elements.toast.textContent = message;
+    elements.toast.classList.toggle('err', tone === 'err');
+    elements.toast.classList.add('visible');
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => elements.toast.classList.remove('visible'), 4_000);
+}
+function setConnectionLost(lost) {
+    elements.connectionBanner.hidden = !lost;
+}
+function statusPill(state, text) {
+    const pill = document.createElement('span');
+    pill.className = `status ${state}`;
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const label = document.createElement('span');
+    label.textContent = text;
+    pill.append(dot, label);
+    return pill;
+}
+function setLive(live) {
+    elements.phone.classList.toggle('is-live', live);
+    if (live)
+        elements.streamOverlay.hidden = true;
+}
+function setRemoteLocked(message) {
+    elements.remoteLocked.hidden = message === null;
+    elements.remoteLockedDetail.textContent = message ?? '';
+    if (message === null)
+        elements.remoteControls.removeAttribute('aria-disabled');
+    else
+        elements.remoteControls.setAttribute('aria-disabled', 'true');
+}
 let screenSize;
 let paused = false;
 let connecting = false;
@@ -156,21 +217,30 @@ elements.doomscrollDurationButtons.forEach((button) => {
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
 }
-function setStatus(message, state = '') {
-    elements.status.className = `status ${state}`;
+function setStatus(message, state = 'idle') {
+    elements.status.className = `stream-status status ${state}`;
     elements.statusText.textContent = message;
 }
 async function jsonRequest(url, options) {
-    const response = await fetch(url, options);
-    const data = await response.json();
+    let response;
+    try {
+        response = await fetch(url, options);
+    }
+    catch (error) {
+        // fetch only rejects when the server itself cannot be reached.
+        setConnectionLost(true);
+        throw error;
+    }
+    setConnectionLost(false);
+    const data = await response.json().catch(() => ({}));
     if (!response.ok)
-        throw new Error(data.error ?? `Request failed (${response.status})`);
+        throw new RequestError(data.error ?? `Request failed (${response.status})`, response.status);
     return data;
 }
 function startStream() {
     if (paused || !screenSize)
         return;
-    setStatus('Connecting video stream…');
+    setStatus('Connecting video stream…', 'connecting');
     elements.screen.src = `/api/devices/${encodeURIComponent(udid)}/remote/stream?t=${Date.now()}`;
 }
 async function connectRemote() {
@@ -200,7 +270,7 @@ async function pollConnection(reloadWhenReady = false) {
             return;
         }
         const appium = connection.appium === 'ready' ? '' : ' Appium is unavailable.';
-        setStatus(`${connection.message}.${appium}`.replace('..', '.'), connection.wda === 'error' ? 'error' : '');
+        setStatus(`${connection.message}.${appium}`.replace('..', '.'), connection.wda === 'error' ? 'error' : connection.wda);
         connectionPoll = window.setTimeout(() => void pollConnection(reloadWhenReady), 2_000);
     }
     catch (error) {
@@ -218,17 +288,71 @@ function useDeviceSummary(summary) {
         return;
     screenSize = { width, height };
     const name = summary.querySelector('h1')?.textContent;
-    if (name)
-        document.title = `${name} · iOS Automation`;
+    if (name) {
+        document.title = `${name} · ${titleSuffix}`;
+        elements.removeName.textContent = name;
+    }
     void connectRemote();
 }
-document.addEventListener('htmx:afterSwap', () => {
+/**
+ * The summary fragment for a registered phone that is not on USB. Nothing can
+ * stream or take input, so say so plainly and switch every screen control off
+ * instead of leaving an amber "Connecting…" that never resolves.
+ */
+function useDisconnectedSummary(summary) {
+    screenSize = undefined;
+    window.clearTimeout(connectionPoll);
+    const name = summary.querySelector('h1')?.textContent;
+    if (name) {
+        document.title = `${name} · ${titleSuffix}`;
+        elements.removeName.textContent = name;
+    }
+    setStatus('Phone disconnected', 'offline');
+    setLive(false);
+    elements.screen.removeAttribute('src');
+    const controls = [...elements.remoteButtons, elements.refresh, elements.toggle];
+    controls.forEach((control) => {
+        control.disabled = true;
+        control.setAttribute('aria-disabled', 'true');
+    });
+    elements.remoteControls.setAttribute('aria-disabled', 'true');
+    const label = elements.streamOverlay.querySelector('.status');
+    if (label) {
+        label.className = 'status offline';
+        const text = label.lastChild;
+        if (text)
+            text.textContent = 'Not connected';
+    }
+    elements.streamRetry.hidden = true;
+    elements.streamOverlay.hidden = false;
+}
+/** Show run times in the operator's locale, the way the Tasks page does. */
+function localizeTimes(root = document) {
+    root.querySelectorAll('time[data-local-time]').forEach((node) => {
+        const when = new Date(node.dateTime);
+        if (!Number.isNaN(when.getTime()))
+            node.textContent = when.toLocaleString();
+    });
+}
+function applySummary() {
     const summary = document.querySelector('#device-summary[data-screen-width]');
-    if (summary)
+    if (summary) {
         useDeviceSummary(summary);
+        return;
+    }
+    const disconnected = document.querySelector('#device-summary.error');
+    if (disconnected)
+        useDisconnectedSummary(disconnected);
+}
+document.addEventListener('htmx:afterSwap', () => {
+    applySummary();
+    localizeTimes();
 });
+document.addEventListener('htmx:sendError', () => setConnectionLost(true));
 document.addEventListener('htmx:afterRequest', (event) => {
     const detail = event.detail;
+    if (detail?.successful)
+        setConnectionLost(false);
     if (detail?.elt === elements.doomscrollForm && detail.successful) {
         elements.doomscrollDialog.close();
     }
@@ -243,18 +367,27 @@ function pointFromEvent(event) {
     };
 }
 async function sendAction(action) {
-    setStatus('Sending input…');
+    setStatus('Sending input…', 'busy');
     elements.remoteButtons.forEach((button) => { button.disabled = true; });
+    const liveState = () => (elements.phone.classList.contains('is-live') ? 'live' : 'ready');
     try {
         await jsonRequest(`/api/devices/${encodeURIComponent(udid)}/remote/action`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify(action),
         });
-        setStatus(action.type === 'tap' ? `Tapped (${action.x}, ${action.y})` : 'Remote connected', 'ready');
+        setRemoteLocked(null);
+        setStatus(action.type === 'tap' ? `Tapped (${action.x}, ${action.y})` : 'Input sent', liveState());
     }
     catch (error) {
-        setStatus(errorMessage(error), 'error');
+        if (error instanceof RequestError && error.status === 409) {
+            // The server refuses remote input while automation drives the phone.
+            setRemoteLocked(errorMessage(error));
+            setStatus('Remote input is locked', 'running');
+        }
+        else {
+            setStatus(errorMessage(error), 'error');
+        }
     }
     finally {
         elements.remoteButtons.forEach((button) => { button.disabled = false; });
@@ -324,35 +457,47 @@ elements.screen.addEventListener('pointerup', (event) => {
     }
 });
 elements.screen.addEventListener('pointercancel', () => { pointerStart = undefined; });
-elements.screen.addEventListener('load', () => setStatus('Live video connected', 'ready'));
+elements.screen.addEventListener('load', () => {
+    setLive(true);
+    setStatus('Live video', 'live');
+});
 elements.screen.addEventListener('error', () => {
     if (paused)
         return;
     elements.screen.removeAttribute('src');
+    setLive(false);
+    elements.streamOverlay.hidden = false;
     setStatus('Video stream disconnected; checking the phone connection…', 'error');
     void pollConnection();
 });
+elements.streamRetry.addEventListener('click', () => elements.refresh.click());
 elements.refresh.addEventListener('click', async () => {
     elements.refresh.disabled = true;
     window.clearTimeout(connectionPoll);
     elements.screen.removeAttribute('src');
-    setStatus('Restarting the phone connection…');
+    setLive(false);
+    elements.refresh.setAttribute('aria-busy', 'true');
+    setStatus('Restarting the phone connection…', 'connecting');
     try {
         await jsonRequest(`/api/devices/${encodeURIComponent(udid)}/reconnect`, { method: 'POST' });
-        elements.refresh.disabled = false;
         void pollConnection(true);
     }
     catch (error) {
         setStatus(errorMessage(error), 'error');
+    }
+    finally {
         elements.refresh.disabled = false;
+        elements.refresh.removeAttribute('aria-busy');
     }
 });
 elements.toggle.addEventListener('click', () => {
     paused = !paused;
     elements.toggle.textContent = paused ? 'Resume stream' : 'Pause stream';
+    elements.toggle.setAttribute('aria-pressed', String(paused));
     if (paused) {
         elements.screen.removeAttribute('src');
-        setStatus('Video stream paused');
+        setLive(false);
+        setStatus('Video stream paused', 'paused');
     }
     else {
         void connectRemote();
@@ -368,14 +513,17 @@ function renderMedia() {
         up.textContent = '↑';
         up.title = 'Move earlier';
         up.disabled = index === 0;
+        up.setAttribute('aria-label', `Move ${file.name} earlier`);
         const down = document.createElement('button');
         down.type = 'button';
         down.textContent = '↓';
         down.title = 'Move later';
         down.disabled = index === orderedMedia.length - 1;
+        down.setAttribute('aria-label', `Move ${file.name} later`);
         const remove = document.createElement('button');
         remove.type = 'button';
         remove.textContent = 'Remove';
+        remove.setAttribute('aria-label', `Remove ${file.name}`);
         up.addEventListener('click', () => { [orderedMedia[index - 1], orderedMedia[index]] = [orderedMedia[index], orderedMedia[index - 1]]; renderMedia(); });
         down.addEventListener('click', () => { [orderedMedia[index], orderedMedia[index + 1]] = [orderedMedia[index + 1], orderedMedia[index]]; renderMedia(); });
         remove.addEventListener('click', () => { orderedMedia.splice(index, 1); renderMedia(); });
@@ -436,19 +584,27 @@ async function pollPost() {
 function formatDate(value) {
     return value ? new Date(value).toLocaleString() : '—';
 }
-function taskActionButton(label, action) {
+function taskActionButton(label, subject, action, done) {
     const buttonElement = document.createElement('button');
     buttonElement.className = 'icon-button';
     buttonElement.type = 'button';
     buttonElement.textContent = label;
+    buttonElement.setAttribute('aria-label', `${label} ${subject}`);
     buttonElement.addEventListener('click', () => {
         void (async () => {
+            buttonElement.disabled = true;
+            buttonElement.setAttribute('aria-busy', 'true');
             try {
                 await action();
+                toast(done);
                 await loadDeviceTasks();
             }
             catch (error) {
-                window.alert(errorMessage(error));
+                toast(errorMessage(error), 'err');
+            }
+            finally {
+                buttonElement.disabled = false;
+                buttonElement.removeAttribute('aria-busy');
             }
         })();
     });
@@ -490,25 +646,24 @@ function renderDeviceSchedules(schedules) {
         const meta = document.createElement('p');
         meta.textContent = `${timingDescription(schedule.timing)} · next ${formatDate(schedule.nextRunAt)}`;
         copy.append(title, meta);
-        const state = document.createElement('span');
-        state.className = `status ${schedule.status}`;
-        state.textContent = schedule.status;
+        const state = statusPill(schedule.status, schedule.status);
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
+        const subject = title.textContent;
         if (schedule.status === 'active')
-            actions.append(taskActionButton('Pause', async () => {
+            actions.append(taskActionButton('Pause', subject, async () => {
                 await jsonRequest(`/api/schedules/${schedule.id}/pause`, { method: 'POST' });
-            }));
+            }, 'Schedule paused.'));
         if (schedule.status === 'paused')
-            actions.append(taskActionButton('Resume', async () => {
+            actions.append(taskActionButton('Resume', subject, async () => {
                 await jsonRequest(`/api/schedules/${schedule.id}/resume`, { method: 'POST' });
-            }));
+            }, 'Schedule resumed.'));
         if (schedule.status !== 'cancelled' && schedule.status !== 'completed') {
-            actions.append(taskActionButton('Cancel', async () => {
+            actions.append(taskActionButton('Cancel', subject, async () => {
                 await jsonRequest(`/api/schedules/${schedule.id}/cancel`, { method: 'POST' });
-            }));
+            }, 'Schedule cancelled.'));
         }
-        row.append(copy, state, actions);
+        row.append(state, copy, actions);
         return row;
     }));
 }
@@ -528,25 +683,25 @@ function renderDeviceExecutions(executions) {
         const meta = document.createElement('p');
         meta.textContent = `${formatDate(execution.scheduledFor)}${execution.error ? ` · ${execution.error}` : ''}`;
         copy.append(title, meta);
-        const state = document.createElement('span');
-        state.className = `status ${execution.status}`;
-        state.textContent = execution.status;
+        const state = statusPill(execution.status, execution.status);
         const actions = document.createElement('div');
         actions.className = 'inline-actions';
+        const subject = `${title.textContent} run`;
         if (execution.status === 'queued' || (execution.status === 'running' && execution.taskType === 'doomscroll')) {
-            actions.append(taskActionButton(execution.status === 'queued' ? 'Cancel' : 'Stop', async () => {
+            const label = execution.status === 'queued' ? 'Cancel' : 'Stop';
+            actions.append(taskActionButton(label, subject, async () => {
                 await jsonRequest(`/api/executions/${execution.id}/stop`, { method: 'POST' });
-            }));
+            }, label === 'Cancel' ? 'Run cancelled.' : 'Stop requested.'));
         }
         if (execution.status === 'failed' || execution.status === 'stopped') {
-            actions.append(taskActionButton('Retry', async () => {
+            actions.append(taskActionButton('Retry', subject, async () => {
                 if (execution.taskType === 'post'
                     && !window.confirm('The post may already have reached TikTok. Retry only after checking the device.'))
                     return;
                 await jsonRequest(`/api/executions/${execution.id}/retry`, { method: 'POST' });
-            }));
+            }, 'Run queued again.'));
         }
-        row.append(copy, state, actions);
+        row.append(state, copy, actions);
         return row;
     }));
 }
@@ -657,6 +812,7 @@ elements.accountsForm.addEventListener('submit', async (event) => {
             doomscrollAccount.value = previousDoomscroll;
         elements.deviceAccounts.value = result.accounts.join(', ');
         elements.accountsResult.textContent = result.accounts.length ? 'Accounts saved.' : 'Account switching is optional.';
+        toast(result.accounts.length ? 'Accounts saved.' : 'Accounts cleared.');
     }
     catch (error) {
         elements.accountsResult.textContent = errorMessage(error);
@@ -681,6 +837,7 @@ function renderCalPoints() {
         const pick = document.createElement('button');
         pick.type = 'button';
         pick.className = 'cal-pick';
+        pick.setAttribute('aria-pressed', String(cal.armed === point.name));
         pick.textContent = cal.armed === point.name ? `${point.label} — click the screen` : point.label;
         pick.addEventListener('click', () => { cal.armed = cal.armed === point.name ? undefined : point.name; renderCal(); });
         const xy = document.createElement('span');
@@ -691,6 +848,7 @@ function renderCalPoints() {
         reset.className = 'cal-reset';
         reset.title = 'Reset to profile';
         reset.textContent = '↺';
+        reset.setAttribute('aria-label', `Reset ${point.label} to the profile default`);
         reset.addEventListener('click', () => { delete cal.overrides[point.name]; renderCal(); });
         li.append(pick, xy, reset);
         return li;
@@ -827,6 +985,7 @@ elements.calScreen.addEventListener('pointerup', (event) => {
 elements.calScreen.addEventListener('pointercancel', () => { calPointerStart = undefined; });
 elements.calSave.addEventListener('click', async () => {
     elements.calSave.disabled = true;
+    elements.calSave.setAttribute('aria-busy', 'true');
     elements.calStatus.textContent = 'Saving…';
     try {
         await jsonRequest(`/api/devices/${encodeURIComponent(udid)}`, {
@@ -836,6 +995,7 @@ elements.calSave.addEventListener('click', async () => {
         });
         const count = Object.keys(cal.overrides).length;
         elements.calStatus.textContent = count ? `Saved ${count} override${count === 1 ? '' : 's'}.` : 'Cleared all overrides.';
+        toast(elements.calStatus.textContent);
         for (const point of cal.points)
             point.overridden = point.name in cal.overrides;
         renderCal();
@@ -845,6 +1005,7 @@ elements.calSave.addEventListener('click', async () => {
     }
     finally {
         elements.calSave.disabled = false;
+        elements.calSave.removeAttribute('aria-busy');
     }
 });
 async function patchPasscode(passcode, pending, done) {
@@ -863,6 +1024,7 @@ async function patchPasscode(passcode, pending, done) {
         elements.passcodeState.textContent = data.hasPasscode ? '· set' : '· not set';
         elements.devicePasscode.value = '';
         elements.passcodeResult.textContent = done;
+        toast(done);
     }
     catch (error) {
         elements.passcodeResult.textContent = errorMessage(error);
@@ -882,8 +1044,38 @@ elements.passcodeClear.addEventListener('click', () => {
         return;
     void patchPasscode('', 'Clearing…', 'Passcode cleared.');
 });
+elements.openRackslot.addEventListener('click', () => {
+    elements.rackslotResult.textContent = '';
+    elements.rackslotDialog.showModal();
+});
+elements.closeRackslot.addEventListener('click', () => elements.rackslotDialog.close());
+elements.rackslotForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    // An empty field clears the slot — the API treats '' the same way it does for the passcode.
+    const rackSlot = elements.deviceRackslot.value.trim();
+    elements.rackslotResult.textContent = 'Saving…';
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(udid)}`, {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ rackSlot }),
+        });
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error ?? `Request failed (${response.status})`);
+        }
+        const data = await response.json();
+        elements.deviceRackslot.value = data.rackSlot ?? '';
+        elements.rackslotResult.textContent = data.rackSlot ? 'Slot saved.' : 'Slot cleared.';
+        toast(elements.rackslotResult.textContent);
+    }
+    catch (error) {
+        elements.rackslotResult.textContent = errorMessage(error);
+    }
+});
 elements.removeDevice.addEventListener('click', async () => {
     elements.removeDevice.disabled = true;
+    elements.removeDevice.setAttribute('aria-busy', 'true');
     elements.removeResult.textContent = 'Removing…';
     try {
         const response = await fetch(`/api/devices/${encodeURIComponent(udid)}`, { method: 'DELETE' });
@@ -895,6 +1087,7 @@ elements.removeDevice.addEventListener('click', async () => {
     }
     catch (error) {
         elements.removeDevice.disabled = false;
+        elements.removeDevice.removeAttribute('aria-busy');
         elements.removeResult.textContent = errorMessage(error);
     }
 });
@@ -903,7 +1096,6 @@ updateDoomscrollSchedule();
 updatePostSchedule();
 setInterval(() => { if (elements.tasksDialog.open)
     void loadDeviceTasks(); }, 5_000);
-const loadedSummary = document.querySelector('#device-summary[data-screen-width]');
-if (loadedSummary)
-    useDeviceSummary(loadedSummary);
+applySummary();
+localizeTimes();
 export {};
