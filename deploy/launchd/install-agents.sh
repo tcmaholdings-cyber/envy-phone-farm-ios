@@ -67,6 +67,8 @@ declare -a NAMES=(db appium wda-service worker web)
 for name in "${NAMES[@]}"; do
   case $name in
     db)      args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/db-up.sh</string>' "$REPO"); keep=false ;;
+    # launchd labels cannot hold ':', so the label is wda-service but the npm script is wda:service.
+    wda-service) args=$(npm_args "wda:service"); keep=true ;;
     *)       args=$(npm_args "$name"); keep=true ;;
   esac
   content=$(plist "$name" "$keep" "$args")
@@ -77,7 +79,12 @@ for name in "${NAMES[@]}"; do
   # bootout first so a changed plist is re-read; ignore "not loaded"
   launchctl bootout "gui/$(id -u)/$PREFIX.$name" 2>/dev/null || true
   echo "$content" > "$target"
-  launchctl bootstrap "gui/$(id -u)" "$target"
+  # bootout returns before the old job is gone; bootstrap then fails with EIO, so retry briefly.
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl bootstrap "gui/$(id -u)" "$target" 2>/dev/null && break
+    [ "$attempt" = 10 ] && { echo "could not load $PREFIX.$name"; exit 1; }
+    sleep 1
+  done
   echo "installed $PREFIX.$name"
 done
 [ "$DRY" = "--dry-run" ] && exit 0
