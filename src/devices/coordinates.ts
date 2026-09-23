@@ -53,10 +53,15 @@ export const DEFAULT_COORDINATE_PROFILE = 'iphone8';
 
 // Add another named layout here, then set that key as coordinateProfile on
 // the matching devices.json entry. Devices without a key use iphone8.
+// One profile per screen geometry: phones that share a point size share a
+// profile. iphone8 was measured on a device; iphoneX and iphone13 were derived
+// from it (bottom-anchored targets move down with the taller screen above the
+// home indicator, top-anchored ones by the taller status bar, x scales with
+// width) and must be checked on a real phone before they are trusted.
 export const DEVICE_COORDINATES = {
     iphone8: {
-        displayName: 'iPhone 8',
-        productTypes: ['iPhone10,1', 'iPhone10,4'],
+        displayName: 'iPhone 8 / SE',
+        productTypes: ['iPhone10,1', 'iPhone10,4', 'iPhone12,8', 'iPhone14,6'],
         screenSize: { width: 375, height: 667 },
         passcodeKeypad: {
             columnX: [103, 191, 275],
@@ -91,7 +96,94 @@ export const DEVICE_COORDINATES = {
             swipe: { x: 187, startY: 550, endY: 150, durationMs: 450 },
         },
     },
+    iphoneX: {
+        displayName: 'iPhone X / XS / 12 mini / 13 mini',
+        productTypes: ['iPhone10,3', 'iPhone10,6', 'iPhone11,2', 'iPhone13,1', 'iPhone14,4'],
+        screenSize: { width: 375, height: 812 },
+        passcodeKeypad: {
+            columnX: [103, 191, 275],
+            rowY: [292, 419, 497, 578],
+        },
+        tiktok: {
+            profileTab: { x: 338, y: 767 },
+            homeTab: { x: 38, y: 764 },
+            accountSwitcher: { x: 185, y: 182 },
+            create: { x: 187, y: 751 },
+            upload: { x: 30, y: 746 },
+            selectMultiple: { x: 24, y: 729 },
+            useLayout: { x: 24, y: 600 },
+            picker: {
+                circleX: 106,
+                columnStep: 126,
+                firstY: 593,
+                trayY: 471,
+                rowStep: 125,
+                cellX: 62,
+                cellStep: 125,
+                cellY: 637,
+            },
+            pickerNext: { x: 277, y: 728 },
+            editorNext: { x: 277, y: 748 },
+            caption: { x: 120, y: 260 },
+            keyboardBack: { x: 22, y: 66 },
+            draft: { x: 98, y: 741 },
+            finish: { x: 277, y: 741 },
+            like: { x: 345, y: 424 },
+            save: { x: 345, y: 555 },
+            swipe: { x: 187, startY: 670, endY: 180, durationMs: 450 },
+        },
+    },
+    iphone13: {
+        displayName: 'iPhone 12 / 13',
+        productTypes: ['iPhone13,2', 'iPhone14,5'],
+        screenSize: { width: 390, height: 844 },
+        passcodeKeypad: {
+            columnX: [111, 199, 283],
+            rowY: [308, 435, 513, 594],
+        },
+        tiktok: {
+            profileTab: { x: 353, y: 799 },
+            homeTab: { x: 38, y: 796 },
+            accountSwitcher: { x: 192, y: 185 },
+            create: { x: 195, y: 783 },
+            upload: { x: 31, y: 778 },
+            selectMultiple: { x: 25, y: 761 },
+            useLayout: { x: 25, y: 632 },
+            picker: {
+                circleX: 110,
+                columnStep: 131,
+                firstY: 625,
+                trayY: 503,
+                rowStep: 130,
+                cellX: 64,
+                cellStep: 130,
+                cellY: 669,
+            },
+            pickerNext: { x: 288, y: 760 },
+            editorNext: { x: 288, y: 780 },
+            caption: { x: 125, y: 263 },
+            keyboardBack: { x: 22, y: 69 },
+            draft: { x: 102, y: 773 },
+            finish: { x: 288, y: 773 },
+            like: { x: 360, y: 456 },
+            save: { x: 360, y: 587 },
+            swipe: { x: 195, startY: 696, endY: 190, durationMs: 450 },
+        },
+    },
 } satisfies Record<string, DeviceCoordinates>;
+
+// Marketing names for the product types above, so a phone on a shared
+// profile is still listed as its own model.
+const MODEL_NAMES: Readonly<Record<string, string>> = {
+    'iPhone10,1': 'iPhone 8', 'iPhone10,4': 'iPhone 8',
+    'iPhone12,8': 'iPhone SE (2nd generation)', 'iPhone14,6': 'iPhone SE (3rd generation)',
+    'iPhone10,3': 'iPhone X', 'iPhone10,6': 'iPhone X',
+    'iPhone11,2': 'iPhone XS',
+    'iPhone13,1': 'iPhone 12 mini',
+    'iPhone13,2': 'iPhone 12',
+    'iPhone14,4': 'iPhone 13 mini',
+    'iPhone14,5': 'iPhone 13',
+};
 
 export type CoordinateProfile = keyof typeof DEVICE_COORDINATES;
 export type DeviceProfileName = CoordinateProfile;
@@ -120,7 +212,7 @@ export function profileForProductType(productType: string | undefined): Coordina
 
 export function modelNameForProductType(productType: string | undefined): string | undefined {
     if (!productType) return;
-    return coordinateProfiles().find(({ productTypes }) => productTypes.includes(productType))?.displayName;
+    return MODEL_NAMES[productType];
 }
 
 export function coordinatesForProfile(profile: string = DEFAULT_COORDINATE_PROFILE): DeviceCoordinates {

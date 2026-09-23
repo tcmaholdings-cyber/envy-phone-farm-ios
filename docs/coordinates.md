@@ -3,7 +3,25 @@
 **Short answer to "can people add coordinate configs?":** not at runtime. A
 coordinate profile is a compiled constant in the source. `devices.json` only
 *selects* one that already exists. Adding a new layout means editing two files
-and redeploying. Only the `iphone8` profile ships today.
+and redeploying. Three profiles ship today:
+
+| Profile | Screen (points) | Phones (product types) | Status |
+| --- | --- | --- | --- |
+| `iphone8` | 375 × 667 | iPhone 8 (`iPhone10,1`, `iPhone10,4`), SE 2nd gen (`iPhone12,8`), SE 3rd gen (`iPhone14,6`); also fits the 7 | measured on a device |
+| `iphoneX` | 375 × 812 | iPhone X (`iPhone10,3`, `iPhone10,6`), XS (`iPhone11,2`), 12 mini (`iPhone13,1`), 13 mini (`iPhone14,4`) | derived from `iphone8`, verify on a phone |
+| `iphone13` | 390 × 844 | iPhone 12 (`iPhone13,2`), iPhone 13 (`iPhone14,5`) | derived from `iphone8`, verify on a phone |
+
+The registration wizard suggests the right profile from the phone's product
+type. XS Max / XR (414 × 896) and the 12 Pro / 13 Pro / 14 are not listed:
+the 390 × 844 models could reuse `iphone13` by adding their product types.
+
+The two derived profiles move bottom‑anchored targets (tab bar, Create, picker,
+Next/Post, the like/save rail) down by the extra height above the home
+indicator, top‑anchored ones (caption, back, account switcher) by the taller
+status bar, and scale x with width. Before relying on them, open the device
+page, unlock with the padlock (checks the keypad rows), and walk the
+**Touch points** list; fix any single‑tap target there. If the keypad, picker
+grid or swipe is off, correct the profile itself (see *Measuring coordinates*).
 
 ## What a profile is
 
