@@ -1,6 +1,7 @@
 export * from './types.js';
 export * from './scheduler/runtime.js';
 export * from './scheduler/worker.js';
+export * from './scheduler/effects.js';
 export * from './api/app.js';
 export * from './api/server.js';
 export * from './plugin.js';

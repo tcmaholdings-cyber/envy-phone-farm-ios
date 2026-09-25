@@ -1,0 +1,1 @@
+ALTER TABLE "scheduler"."executions" ADD COLUMN "effect_committed_at" timestamp with time zone;

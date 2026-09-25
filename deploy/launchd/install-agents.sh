@@ -32,6 +32,11 @@ NPM="$NODE_BIN/npm"
 [ -x "$NPM" ] || { echo "npm not found next to node ($NODE_BIN)"; exit 1; }
 [ -f "$REPO/.env" ] || { echo "$REPO/.env is missing — copy .env.example first"; exit 1; }
 mkdir -p "$AGENTS" "$LOGS"
+# launchd SIGKILLs a job this many seconds after SIGTERM (its default is 20).
+# The worker drains running tasks for WORKER_DRAIN_SECONDS (default 120), then
+# gives task subprocesses WORKER_KILL_GRACE_SECONDS (default 15) between SIGTERM
+# and SIGKILL, so its ExitTimeOut must stay above drain + grace + ~20 s.
+WORKER_EXIT_TIMEOUT=${PHONE_FARM_WORKER_EXIT_TIMEOUT:-180}
 
 plist () {  # name, keepalive(true|false), program args (xml <string> lines), [extra xml]
   local name=$1 keep=$2 args=$3 extra=${4:-}
@@ -89,6 +94,9 @@ for name in "${NAMES[@]}"; do
     db)      args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/db-up.sh</string>' "$REPO"); keep=false ;;
     # launchd labels cannot hold ':', so the label is wda-service but the npm script is wda:service.
     wda-service) args=$(npm_args "wda:service"); keep=true ;;
+    # Long ExitTimeOut so a restart drains running tasks instead of killing them mid-post.
+    worker)  args=$(npm_args worker); keep=true
+             extra=$'\n  <key>ExitTimeOut</key><integer>'"$WORKER_EXIT_TIMEOUT"'</integer>' ;;
     # One-shot every 60 s (StartInterval), not a daemon; curl --max-time bounds each run.
     heartbeat) args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/heartbeat.sh</string>' "$REPO"); keep=false
                extra=$'\n  <key>StartInterval</key><integer>60</integer>' ;;

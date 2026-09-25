@@ -80,7 +80,8 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 
 ## Things that look like bugs but are not
 
-- A schedule failing with "task version not installed" after an upgrade — by design (invariant 1).
+- A schedule recording **skipped** runs ("Task …@N is unavailable") after an upgrade — by design (invariant 1); it moves on to its next occurrence instead of blocking other schedules.
+- A failed post the Retry button refuses ("Execution is not retryable") — its side effect was committed (`effect_committed_at`); re-running it could post twice.
 - `wda:prepare` failing over SSH with `errSecInternalComponent` — keychain needs a GUI session.
 - `403 Cross-origin write blocked` from a script — send `Authorization: Bearer …` or set `PHONE_FARM_TRUSTED_ORIGINS`.
 - The device grid showing stills, not video — intentional; live MJPEG is only on the device page.

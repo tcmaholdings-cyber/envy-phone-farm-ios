@@ -40,6 +40,10 @@ export const executions = schedulerSchema.table('executions', {
     startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }),
     finishedAt: timestamp('finished_at', { withTimezone: true, mode: 'date' }), exitCode: integer('exit_code'),
     error: text('error'), stopRequestedAt: timestamp('stop_requested_at', { withTimezone: true, mode: 'date' }),
+    // Set once the task reports its irreversible side effect (e.g. the TikTok
+    // Post tap). An execution with this set is never re-run: not by a pg-boss
+    // retry, not by the dashboard Retry button, not after a worker restart.
+    effectCommittedAt: timestamp('effect_committed_at', { withTimezone: true, mode: 'date' }),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
 }, (table) => [

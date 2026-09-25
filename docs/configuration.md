@@ -113,6 +113,11 @@ can do everything, unless it returns `access` (`UserAccess` in
 `PHONE_FARM_LAUNCHD_PREFIX` (default `com.phone-farm`) — label prefix used by
 `deploy/launchd/install-agents.sh`; not read by the application itself.
 
+`PHONE_FARM_WORKER_EXIT_TIMEOUT` (default `180`) — seconds launchd waits after
+SIGTERM before it SIGKILLs the worker (the plist's `ExitTimeOut`). Keep it above
+`WORKER_DRAIN_SECONDS` + `WORKER_KILL_GRACE_SECONDS` + about 20 s, and re-run the
+installer after changing either.
+
 ### Monitoring
 
 See *Monitoring and alerts* in [operations.md](operations.md#monitoring-and-alerts).
@@ -136,6 +141,8 @@ See *Monitoring and alerts* in [operations.md](operations.md#monitoring-and-aler
 | `SCHEDULER_MIN_TASK_GAP_MINUTES` | see `DEFAULT_MIN_SCHEDULE_GAP_MINUTES` in `src/scheduler/repository.ts` | Minimum spacing enforced between tasks on one device. |
 | `SCHEDULER_HISTORY_DAYS` | `30` | Execution history kept by the cleanup pass. |
 | `SCHEDULER_ORPHAN_ASSET_HOURS` | — | Age after which uploaded media with no remaining schedule is deleted. |
+| `WORKER_DRAIN_SECONDS` | `120` | On SIGTERM the worker stops taking jobs and waits this long for running tasks. Stoppable tasks (doomscroll) are asked to stop at once; tasks that cannot be stopped safely (a post) are left to finish, then stopped when the time is up. |
+| `WORKER_KILL_GRACE_SECONDS` | `15` | After a task subprocess is sent SIGTERM (a Stop, or the drain deadline), how long before it is SIGKILLed. |
 | `PUBLIC_ORIGIN` | — | The browser-facing origin (`https://farm.example`) when the dashboard sits behind a reverse proxy; counted as trusted by the CSRF guard. |
 | `PHONE_FARM_RELEASE_FILE` | `RELEASED` | JSON file (deploy stamp) whose `sha` `/health` reports as `release`. |
 | `WDA_SERVICE_SOCKET` | `.wda/wda-service.sock` | Path of the supervisor's control socket. |

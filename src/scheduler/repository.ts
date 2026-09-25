@@ -8,8 +8,10 @@ import {
     assets, executionAttempts, executionLogs, executions, schedules,
     type ExecutionRow, type ScheduleRow,
 } from '../database/schema.js';
+import type { TaskDefinition } from '../plugin.js';
 import type { PluginRegistry } from '../registry.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming, StoredAsset, TaskEnvelope } from '../types.js';
+import { EFFECT_COMMITTED_REFUSAL } from './effects.js';
 import { ensureDeviceQueue, queueNameForDevice } from './queue.js';
 import { initialRunAt, latestDueOccurrence } from './recurrence.js';
 import { DEFAULT_MIN_SCHEDULE_GAP_MINUTES, estimatedTaskWindow, validateTaskInput, windowsTooClose } from './validation.js';
@@ -34,6 +36,64 @@ export function scheduleTransitionAllowed(from: string, to: 'active' | 'paused' 
     };
     return (allowed[from] ?? []).includes(to);
 }
+
+/** pg-boss refuses an expiry above 24 h. */
+export const MAX_JOB_EXPIRY_SECONDS = 24 * 60 * 60;
+const JOB_EXPIRY_MARGIN_SECONDS = 600;
+const MIN_JOB_EXPIRY_SECONDS = 900;
+
+/**
+ * How long pg-boss lets one job run before it expires it (and, if retries are
+ * left, hands it to another worker while the first is still going). The
+ * executor may spend the whole run window waiting for the phone before the
+ * task even starts, so the expiry covers window + task duration + a margin.
+ */
+export function jobExpirySeconds(runWindowMinutes: number, estimatedDurationMs: number): number {
+    const window = Math.max(0, runWindowMinutes) * 60;
+    const duration = Math.ceil(Math.max(0, estimatedDurationMs) / 1000);
+    return Math.min(MAX_JOB_EXPIRY_SECONDS, Math.max(MIN_JOB_EXPIRY_SECONDS, window + duration + JOB_EXPIRY_MARGIN_SECONDS));
+}
+
+type DueOccurrence = NonNullable<ReturnType<typeof latestDueOccurrence>>;
+
+/** A schedules row as materializeDue reads it (raw SQL, snake_case). */
+export interface DueScheduleRow {
+    id: string; device_udid: string; plugin_id: string; task_type: string; task_version: number;
+    payload: JsonObject; timing: ScheduleTiming; run_window_minutes: number; next_run_at: Date;
+}
+
+export type MaterializationPlan =
+    | { kind: 'enqueue'; occurrence: DueOccurrence; definition: TaskDefinition; expireInSeconds: number }
+    | { kind: 'skip'; occurrence: DueOccurrence; error: string };
+
+/**
+ * What to do with one due schedule. A task the registry cannot resolve (its
+ * version was uninstalled, its plugin removed) is recorded as a skipped
+ * execution and the schedule moves on — it must not throw, which used to roll
+ * back the whole batch and block every other schedule every 5 s.
+ */
+export function planMaterialization(plugins: PluginRegistry, row: DueScheduleRow, now: Date): MaterializationPlan | null {
+    const occurrence = latestDueOccurrence(row.timing, new Date(row.next_run_at), now);
+    if (!occurrence) return null;
+    const task: TaskEnvelope = { pluginId: row.plugin_id, taskType: row.task_type, taskVersion: row.task_version, payload: row.payload };
+    try {
+        const definition = plugins.task(task);
+        return {
+            kind: 'enqueue', occurrence, definition,
+            expireInSeconds: jobExpirySeconds(row.run_window_minutes, definition.estimateDurationMs(task.payload)),
+        };
+    } catch (error) {
+        return { kind: 'skip', occurrence, error: `Skipped: ${error instanceof Error ? error.message : String(error)}` };
+    }
+}
+
+/** Why startAttempt did or did not start an attempt. */
+export type StartAttemptResult =
+    | { status: 'started'; execution: ExecutionRow; attempt: number }
+    | { status: 'effect-committed'; execution: ExecutionRow }
+    | { status: 'not-runnable' };
+
+type Transaction = Parameters<Parameters<DatabaseConnection['db']['transaction']>[0]>[0];
 
 function taskEnvelope(row: Pick<ScheduleRow, 'pluginId' | 'taskType' | 'taskVersion' | 'payload'>): TaskEnvelope {
     return { pluginId: row.pluginId, taskType: row.taskType, taskVersion: row.taskVersion, payload: row.payload };
@@ -211,51 +271,84 @@ export class SchedulerRepository {
             const conditions = onlyScheduleId
                 ? sql`status = 'active' and next_run_at <= ${now} and id = ${onlyScheduleId}::uuid`
                 : sql`status = 'active' and next_run_at <= ${now}`;
-            interface DueRow {
-                id: string; device_udid: string; plugin_id: string; task_type: string; task_version: number;
-                payload: JsonObject; timing: ScheduleTiming; run_window_minutes: number; next_run_at: Date;
-            }
             const result = await tx.execute(sql`select id, device_udid, plugin_id, task_type, task_version, payload,
                 timing, run_window_minutes, next_run_at from scheduler.schedules where ${conditions}
                 order by next_run_at for update skip locked limit 100`);
-            for (const row of result.rows as unknown as DueRow[]) {
-                const occurrence = latestDueOccurrence(row.timing, new Date(row.next_run_at), now);
-                if (!occurrence) continue;
-                const task: TaskEnvelope = {
-                    pluginId: row.plugin_id, taskType: row.task_type, taskVersion: row.task_version, payload: row.payload,
-                };
-                const definition = this.plugins.task(task);
-                const policy = definition.retryPolicy(task.payload);
-                const [execution] = await tx.insert(executions).values({
-                    scheduleId: row.id, deviceUdid: row.device_udid,
-                    pluginId: row.plugin_id, taskType: row.task_type, taskVersion: row.task_version, payload: row.payload,
-                    scheduledFor: occurrence.scheduledFor,
-                    deadlineAt: new Date(occurrence.scheduledFor.getTime() + row.run_window_minutes * 60_000),
-                }).onConflictDoNothing().returning();
-                await tx.update(schedules).set({
-                    nextRunAt: occurrence.nextRunAt, status: occurrence.nextRunAt ? 'active' : 'completed', updatedAt: now,
-                }).where(eq(schedules.id, row.id));
-                if (!execution) continue;
-                const queueJobId = await this.boss.send(queueNameForDevice(row.device_udid), { executionId: execution.id }, {
-                    db: fromDrizzle(tx, sql), retryLimit: policy.retryLimit,
-                    retryDelay: policy.retryDelaySeconds, retryBackoff: policy.retryBackoff,
-                    expireInSeconds: Math.max(900, Math.ceil(definition.estimateDurationMs(task.payload) / 1000) + 600),
-                });
-                if (!queueJobId) throw new Error('Queue rejected an execution job');
-                await tx.update(executions).set({ queueJobId }).where(eq(executions.id, execution.id));
-                count++;
+            for (const row of result.rows as unknown as DueScheduleRow[]) {
+                // One savepoint per schedule: a row that fails (a queue error, a
+                // bad payload) rolls back alone and the rest of the batch still
+                // gets queued. It stays due, so it is retried on the next tick.
+                try {
+                    if (await tx.transaction((savepoint) => this.materializeRow(savepoint, row, now))) count++;
+                } catch (error) {
+                    console.error(`Could not queue schedule ${row.id}:`, error);
+                }
             }
         });
         return count;
     }
 
-    async startAttempt(id: string, attempt: number, now = new Date()): Promise<ExecutionRow | null> {
+    /** Queue (or record as skipped) one due schedule inside `tx`. True when a job was queued. */
+    protected async materializeRow(tx: Transaction, row: DueScheduleRow, now: Date): Promise<boolean> {
+        const plan = planMaterialization(this.plugins, row, now);
+        if (!plan) return false;
+        const { occurrence } = plan;
+        const occurrenceColumns = {
+            scheduleId: row.id, deviceUdid: row.device_udid,
+            pluginId: row.plugin_id, taskType: row.task_type, taskVersion: row.task_version, payload: row.payload,
+            scheduledFor: occurrence.scheduledFor,
+            deadlineAt: new Date(occurrence.scheduledFor.getTime() + row.run_window_minutes * 60_000),
+        };
+        const [execution] = await tx.insert(executions).values(plan.kind === 'skip'
+            ? { ...occurrenceColumns, status: 'skipped' as const, error: plan.error, finishedAt: now }
+            : occurrenceColumns).onConflictDoNothing().returning();
+        // Advance even when skipping, so an uninstalled task version is not
+        // re-evaluated every 5 s; a recurring schedule records one skip per occurrence.
+        await tx.update(schedules).set({
+            nextRunAt: occurrence.nextRunAt, status: occurrence.nextRunAt ? 'active' : 'completed', updatedAt: now,
+        }).where(eq(schedules.id, row.id));
+        if (!execution || plan.kind === 'skip') return false;
+        const policy = plan.definition.retryPolicy(row.payload);
+        const queueJobId = await this.boss.send(queueNameForDevice(row.device_udid), { executionId: execution.id }, {
+            db: fromDrizzle(tx, sql), retryLimit: policy.retryLimit,
+            retryDelay: policy.retryDelaySeconds, retryBackoff: policy.retryBackoff,
+            expireInSeconds: plan.expireInSeconds,
+        });
+        if (!queueJobId) throw new Error('Queue rejected an execution job');
+        await tx.update(executions).set({ queueJobId }).where(eq(executions.id, execution.id));
+        return true;
+    }
+
+    /**
+     * Claim an execution for a new attempt. Refuses an execution that already
+     * committed its side effect (whatever re-delivered it: a pg-boss retry, an
+     * expired job, a restart). The attempt number continues from the recorded
+     * attempts, so a re-queued execution does not overwrite attempt 1.
+     */
+    async startAttempt(id: string, now = new Date()): Promise<StartAttemptResult> {
         const [row] = await this.connection.db.update(executions).set({
             status: 'running', startedAt: now, updatedAt: now, error: null,
-        }).where(and(eq(executions.id, id), inArray(executions.status, ['queued', 'running']))).returning();
-        if (!row) return null;
+        }).where(and(
+            eq(executions.id, id), inArray(executions.status, ['queued', 'running']), isNull(executions.effectCommittedAt),
+        )).returning();
+        if (!row) {
+            const [current] = await this.connection.db.select().from(executions).where(eq(executions.id, id)).limit(1);
+            if (current?.effectCommittedAt && ['queued', 'running'].includes(current.status)) {
+                return { status: 'effect-committed', execution: current };
+            }
+            return { status: 'not-runnable' };
+        }
+        const [previous] = await this.connection.db.select({ latest: sql<number>`coalesce(max(${executionAttempts.attempt}), 0)::int` })
+            .from(executionAttempts).where(eq(executionAttempts.executionId, id));
+        const attempt = Number(previous?.latest ?? 0) + 1;
         await this.connection.db.insert(executionAttempts).values({ executionId: id, attempt }).onConflictDoNothing();
-        return row;
+        return { status: 'started', execution: row, attempt };
+    }
+
+    /** Record that the execution's irreversible side effect happened (first call wins). */
+    async markEffectCommitted(id: string, now = new Date()): Promise<void> {
+        await this.connection.db.update(executions).set({ effectCommittedAt: now, updatedAt: now })
+            .where(and(eq(executions.id, id), isNull(executions.effectCommittedAt)));
     }
 
     async appendLogs(id: string, attempt: number, lines: string[]): Promise<void> {
@@ -277,8 +370,47 @@ export class SchedulerRepository {
         if (status === 'succeeded' || status === 'cancelled') await this.purgeTerminalAssets(id);
     }
 
-    async resetForRetry(id: string, error: string): Promise<void> {
-        await this.connection.db.update(executions).set({ status: 'queued', error, updatedAt: new Date() }).where(eq(executions.id, id));
+    /** Back to queued for a pg-boss retry. False (and nothing changes) once the side effect is committed. */
+    async resetForRetry(id: string, error: string): Promise<boolean> {
+        const rows = await this.connection.db.update(executions).set({ status: 'queued', error, updatedAt: new Date() })
+            .where(and(eq(executions.id, id), isNull(executions.effectCommittedAt))).returning({ id: executions.id });
+        return rows.length > 0;
+    }
+
+    /**
+     * A worker shutdown interrupted this execution before its task started, so
+     * nothing happened on the phone: queue it again (a fresh job, same
+     * execution) for the next worker. The old job completes normally. False when
+     * it cannot be re-queued (no longer running, effect committed, window over,
+     * plugin gone) — the caller then records it as stopped.
+     */
+    async requeueAfterShutdown(id: string, message: string, now = new Date()): Promise<boolean> {
+        const [current] = await this.connection.db.select().from(executions).where(eq(executions.id, id)).limit(1);
+        if (!current || current.status !== 'running' || current.effectCommittedAt || current.deadlineAt <= now) return false;
+        let definition: TaskDefinition;
+        try {
+            definition = this.plugins.task(taskEnvelope(current));
+        } catch {
+            return false;
+        }
+        const policy = definition.retryPolicy(current.payload);
+        const remainingMinutes = Math.ceil((current.deadlineAt.getTime() - now.getTime()) / 60_000);
+        let requeued = false;
+        await this.connection.db.transaction(async (tx) => {
+            const [row] = await tx.update(executions).set({ status: 'queued', error: message, updatedAt: now }).where(and(
+                eq(executions.id, id), eq(executions.status, 'running'), isNull(executions.effectCommittedAt),
+            )).returning();
+            if (!row) return;
+            const jobId = await this.boss.send(queueNameForDevice(row.deviceUdid), { executionId: row.id }, {
+                db: fromDrizzle(tx, sql), retryLimit: policy.retryLimit,
+                retryDelay: policy.retryDelaySeconds, retryBackoff: policy.retryBackoff,
+                expireInSeconds: jobExpirySeconds(remainingMinutes, definition.estimateDurationMs(row.payload)),
+            });
+            if (!jobId) throw new Error('Queue rejected the re-queued execution');
+            await tx.update(executions).set({ queueJobId: jobId }).where(eq(executions.id, row.id));
+            requeued = true;
+        });
+        return requeued;
     }
 
     async stopRequested(id: string): Promise<boolean> {
@@ -311,23 +443,26 @@ export class SchedulerRepository {
     async retryExecution(id: string, now = new Date()): Promise<ExecutionRow | null> {
         const [source] = await this.connection.db.select().from(executions).where(eq(executions.id, id)).limit(1);
         if (!source || !['failed', 'stopped'].includes(source.status)) return null;
+        // Retrying a post that was already submitted would publish it twice.
+        if (source.effectCommittedAt) return null;
         await ensureDeviceQueue(this.boss, source.deviceUdid);
         const definition = this.plugins.task(taskEnvelope(source));
         const policy = definition.retryPolicy(source.payload);
+        const runWindowMinutes = Number(process.env.SCHEDULER_RUN_WINDOW_MINUTES ?? 30);
         let created: ExecutionRow | undefined;
         await this.connection.db.transaction(async (tx) => {
             [created] = await tx.insert(executions).values({
                 scheduleId: source.scheduleId, deviceUdid: source.deviceUdid,
                 pluginId: source.pluginId, taskType: source.taskType, taskVersion: source.taskVersion, payload: source.payload,
-                scheduledFor: now, deadlineAt: new Date(now.getTime() + Number(process.env.SCHEDULER_RUN_WINDOW_MINUTES ?? 30) * 60_000),
+                scheduledFor: now, deadlineAt: new Date(now.getTime() + runWindowMinutes * 60_000),
             }).returning();
             if (!created) throw new Error('Unable to create retry execution');
             const jobId = await this.boss.send(queueNameForDevice(source.deviceUdid), { executionId: created.id }, {
                 db: fromDrizzle(tx, sql), retryLimit: policy.retryLimit,
                 retryDelay: policy.retryDelaySeconds, retryBackoff: policy.retryBackoff,
-                // Match materializeDue — a retried multi-hour task must not be
-                // expired by pg-boss's ~15-minute default while it's still running.
-                expireInSeconds: Math.max(900, Math.ceil(definition.estimateDurationMs(source.payload) / 1000) + 600),
+                // Match materializeDue: the job may wait out the whole run window
+                // for the phone before the task runs, so both count toward expiry.
+                expireInSeconds: jobExpirySeconds(runWindowMinutes, definition.estimateDurationMs(source.payload)),
             });
             if (!jobId) throw new Error('Unable to enqueue retry execution');
             await tx.update(executions).set({ queueJobId: jobId }).where(eq(executions.id, created.id));
@@ -341,8 +476,14 @@ export class SchedulerRepository {
         let changed = 0;
         for (const execution of pending) {
             if (!execution.queueJobId) continue;
-            const [job] = await this.boss.findJobs(queueNameForDevice(execution.deviceUdid), { id: execution.queueJobId });
-            if (job?.state === 'retry' && execution.status === 'running') {
+            const queue = queueNameForDevice(execution.deviceUdid);
+            const [job] = await this.boss.findJobs(queue, { id: execution.queueJobId });
+            if (execution.effectCommittedAt && (job?.state === 'retry' || job?.state === 'created')) {
+                // Something would deliver it again (an expired job, an
+                // interrupted attempt): cancel that instead of posting twice.
+                await this.boss.cancel(queue, execution.queueJobId);
+                await this.finishExecution(execution.id, 'failed', null, EFFECT_COMMITTED_REFUSAL); changed++;
+            } else if (job?.state === 'retry' && execution.status === 'running') {
                 await this.resetForRetry(execution.id, 'Worker attempt interrupted; waiting for retry'); changed++;
             } else if (job && (job.state === 'failed' || job.state === 'cancelled')) {
                 await this.finishExecution(execution.id, job.state === 'cancelled' ? 'cancelled' : 'failed', null, `Queue job ${job.state}`); changed++;
