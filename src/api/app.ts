@@ -38,6 +38,10 @@ import type { CreateTaskInput, JsonObject, ScheduleTiming } from '../types.js';
 import { ScheduleTransitionError, type SchedulerRepository } from '../scheduler/repository.js';
 import { PROMETHEUS_CONTENT_TYPE, renderMetrics } from '../observability/metrics.js';
 import { checkReadiness, createDefaultProbes, type ObservabilityProbes } from '../observability/probes.js';
+import { AgentClient, AgentRequestError, FleetRemoteControl } from '../agent/client.js';
+import { agentToken, bearerToken, tokenMatches } from '../agent/token.js';
+import { isLocalDevice, localDevices, localHostId } from '../devices/host-identity.js';
+import { postgresHostDirectory, type HostDirectory } from '../hosts/directory.js';
 
 export interface CreateAppOptions {
     plugins: PluginRegistry;
@@ -54,6 +58,18 @@ export interface CreateAppOptions {
     observability?: ObservabilityProbes;
     /** A phone's recent supervisor output; defaults to the wda-service socket. Undefined means unknown phone. */
     wdaLogs?: (udid: string, limit: number) => Promise<string[] | undefined>;
+    /** Multi-host: this Mac's id (default PHONE_FARM_HOST_ID / hostname). Phones with another hostId are reached through their host's agent. */
+    hostId?: string;
+    /** Multi-host: where other hosts' agents are (default fleet.hosts in Postgres, opened on first use). */
+    hosts?: HostDirectory;
+    /** Multi-host test seam: the fetch used to call other hosts' agents. */
+    agentFetch?: typeof fetch;
+}
+
+/** What GET /agent/status answers: this host's phones with their USB and WDA state. */
+export interface AgentStatusResponse {
+    hostId: string;
+    devices: Array<{ udid: string; connected: Device | null; status: DeviceConnectionStatus | null }>;
 }
 
 export interface DashboardTheme {
@@ -159,13 +175,6 @@ async function supervisorLogs(udid: string, limit: number): Promise<string[] | u
     return lines.map(String);
 }
 
-/** Compare a presented bearer token with the configured one without leaking its length or prefix through timing. */
-function tokenMatches(presented: string | undefined, expected: string): boolean {
-    if (!presented) return false;
-    const digest = (value: string) => crypto.createHash('sha256').update(value).digest();
-    return crypto.timingSafeEqual(digest(presented), digest(expected));
-}
-
 async function supervisorStatuses(): Promise<DeviceConnectionStatus[]> {
     const response = await requestWdaService('/devices', { timeoutMs: 1_500 });
     if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`WDA service returned ${response.statusCode}`);
@@ -205,26 +214,6 @@ function ageText(at: number | undefined): string {
     if (seconds < 60) return `updated ${seconds}s ago`;
     const minutes = Math.round(seconds / 60);
     return minutes < 60 ? `updated ${minutes}m ago` : `updated ${Math.round(minutes / 60)}h ago`;
-}
-
-async function registeredWithStatus(discover: () => Promise<Device[]> = connectedDevices) {
-    const [registered, connected] = await Promise.all([loadRegisteredDevices(), discover()]);
-    // A phone seen on USB without a stored model gets the one discovery reports,
-    // once; model grants depend on it. Steady state: no write.
-    const missing = missingModels(registered, connected);
-    if (missing.size) {
-        try {
-            await backfillDeviceModels(connected);
-            for (const device of registered) device.model ??= missing.get(device.udid);
-        } catch (error) {
-            console.warn(`could not record device models (${errorMessage(error)})`);
-        }
-    }
-    const online = new Map(connected.map((device) => [device.udid, device]));
-    return registered.map((device) => ({
-        ...redactDevice(device),
-        connected: device.disabled ? null : online.get(device.udid) ?? null,
-    }));
 }
 
 export interface RegisteredRoute {
@@ -413,9 +402,102 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         });
     }
 
-    const remote: RemoteControl = options.remote ?? new RegistryWdaRemoteControl();
     const discover = options.discoverDevices ?? connectedDevices;
     const wdaStatuses = options.wdaStatuses ?? supervisorStatuses;
+
+    // Multi-host (docs/multi-host.md). A phone whose hostId is another Mac is
+    // reached through that Mac's /agent/* routes; everything else is local.
+    const hostId = options.hostId ?? localHostId();
+    const hostDirectory = options.hosts ?? postgresHostDirectory();
+    if (!options.hosts) app.addHook('onClose', async () => hostDirectory.close?.());
+    const agent = new AgentClient({ hosts: hostDirectory, ...(options.agentFetch ? { fetch: options.agentFetch } : {}) });
+    /** The host that owns a registered phone when that is not this Mac; undefined for a local or unknown phone. */
+    const ownerOf = async (udid: string): Promise<string | undefined> => {
+        const device = (await loadRegisteredDevices()).find((entry) => entry.udid === udid);
+        return device && !isLocalDevice(device, hostId) ? device.hostId : undefined;
+    };
+    const localRemote: RemoteControl = options.remote ?? new RegistryWdaRemoteControl();
+    const remote: RemoteControl = new FleetRemoteControl(localRemote, agent, ownerOf);
+    /** Relay an agent response: status, the caching/state headers, and the body (streamed). */
+    const relay = (reply: FastifyReply, upstream: Response) => {
+        reply.code(upstream.status);
+        for (const header of ['content-type', 'etag', 'cache-control', 'x-device-state']) {
+            const value = upstream.headers.get(header);
+            if (value) reply.header(header, value);
+        }
+        if (!upstream.body || upstream.status === 304) return reply.send();
+        return reply.send(Readable.from(upstream.body as AsyncIterable<Uint8Array>));
+    };
+    const agentFailure = (reply: FastifyReply, error: unknown) => {
+        if (!(error instanceof AgentRequestError)) throw error;
+        return reply.code(error.statusCode).header('cache-control', 'no-store').send({ error: error.message });
+    };
+    /** Each other host's phones with their USB/WDA state, fetched once per host and reused for 2 s. */
+    const remoteStatusCache = new Map<string, { at: number; value: Promise<AgentStatusResponse | null> }>();
+    const remoteHostStatus = (owner: string): Promise<AgentStatusResponse | null> => {
+        const cached = remoteStatusCache.get(owner);
+        if (cached && Date.now() - cached.at < 2_000) return cached.value;
+        const value = (async () => {
+            try {
+                const response = await agent.request(owner, '/agent/status', { timeoutMs: 1_500 });
+                return response.ok ? await response.json() as AgentStatusResponse : null;
+            } catch {
+                return null;
+            }
+        })();
+        remoteStatusCache.set(owner, { at: Date.now(), value });
+        return value;
+    };
+    const remoteFleet = async (devices: readonly RegisteredDevice[]) => {
+        const owners = [...new Set(devices.filter((device) => !isLocalDevice(device, hostId)).map((device) => device.hostId!))];
+        const state = new Map<string, { connected: Device | null; status: DeviceConnectionStatus | null }>();
+        const unreachable = new Set<string>();
+        await Promise.all(owners.map(async (owner) => {
+            const status = await remoteHostStatus(owner);
+            if (!status) { unreachable.add(owner); return; }
+            for (const entry of status.devices) state.set(entry.udid, { connected: entry.connected, status: entry.status });
+        }));
+        return { state, unreachable };
+    };
+    /** Host id → display name, only fetched when some phone lives on another host. */
+    const hostNames = async (devices: readonly RegisteredDevice[]): Promise<Map<string, string>> => {
+        if (!devices.some((device) => device.hostId)) return new Map();
+        try {
+            return new Map((await hostDirectory.list()).map((host) => [host.id, host.displayName]));
+        } catch {
+            return new Map();
+        }
+    };
+    const registeredWithStatus = async () => {
+        const [registered, connected] = await Promise.all([loadRegisteredDevices(), discover()]);
+        // A phone seen on USB without a stored model gets the one discovery reports,
+        // once; model grants depend on it. Steady state: no write. Only this
+        // host's USB tree is visible here, so only its phones are considered.
+        const missing = missingModels(localDevices(registered, hostId), connected);
+        if (missing.size) {
+            try {
+                await backfillDeviceModels(connected.filter(({ udid }) => missing.has(udid)));
+                for (const device of registered) device.model ??= missing.get(device.udid);
+            } catch (error) {
+                console.warn(`could not record device models (${errorMessage(error)})`);
+            }
+        }
+        const online = new Map(connected.map((device) => [device.udid, device]));
+        const [fleet, names] = await Promise.all([remoteFleet(registered), hostNames(registered)]);
+        return registered.map((device) => {
+            const local = isLocalDevice(device, hostId);
+            const remoteEntry = local ? undefined : fleet.state.get(device.udid);
+            return {
+                ...redactDevice(device),
+                connected: device.disabled ? null : local ? online.get(device.udid) ?? null : remoteEntry?.connected ?? null,
+                ...(device.hostId ? { hostName: names.get(device.hostId) ?? device.hostId } : {}),
+                ...(local ? {} : {
+                    remoteStatus: remoteEntry?.status ?? null,
+                    hostReachable: !fleet.unreachable.has(device.hostId!),
+                }),
+            };
+        });
+    };
     const screenshots = createScreenshotCache(remote);
     const thumbnails = createThumbnailCache();
     const forgetDevice = (udid: string) => {
@@ -648,7 +730,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             settle('heartbeats', () => probes.workerHeartbeats()),
         ]);
         const body = renderMetrics({
-            now: Date.now(), uptimeSeconds: process.uptime(), devices: devices ?? [], usbUdids: usb, wda,
+            // Per-host scrape: only the phones on this Mac's USB tree.
+            now: Date.now(), uptimeSeconds: process.uptime(), devices: localDevices(devices ?? [], hostId), usbUdids: usb, wda,
             queues, executionsLastHour: executions, heartbeats,
         });
         return reply.type(PROMETHEUS_CONTENT_TYPE).header('cache-control', 'no-store').send(body);
@@ -660,7 +743,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     /** Registered phones this request may see, each with the caller's level on it. */
     const visibleDevices = async (request: FastifyRequest) => {
         const access = accessOf(request);
-        return (await registeredWithStatus(discover)).flatMap((device) => {
+        return (await registeredWithStatus()).flatMap((device) => {
             const level = access.levelFor(device);
             return level ? [{ ...device, access: level }] : [];
         });
@@ -745,6 +828,11 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             if (passcode !== undefined && passcode !== '' && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
             }
+            // A passcode lives only on the Mac that owns the phone (never in Postgres).
+            if (passcode !== undefined) {
+                const owner = await ownerOf(request.params.udid);
+                if (owner) return reply.code(409).send({ error: `This phone is on host ${owner}; set its passcode from that host's dashboard` });
+            }
             if (disabled === true && await options.scheduler.activeExecution(request.params.udid)) {
                 return reply.code(409).send({ error: 'Stop the running automation before disconnecting this device' });
             }
@@ -816,6 +904,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     app.post<{ Params: { udid: string } }>('/api/devices/:udid/checks', async (request, reply) => {
         const device = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
         if (!device) return reply.code(404).send({ error: 'Device not found' });
+        if (!isLocalDevice(device, hostId)) {
+            return reply.code(409).send({ error: `This phone is on host ${device.hostId}; run its checks from that host's dashboard` });
+        }
         const identity = (await connectedDevices()).find(({ udid }) => udid === device.udid) ?? device;
         const results = [];
         for (const plugin of options.plugins.list()) {
@@ -826,111 +917,246 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return results;
     });
 
+    // The phone-facing handlers, shared by the dashboard's /api routes (for this
+    // host's phones) and the host agent's /agent routes (for another host's
+    // dashboard). A phone another host owns never reaches these: /api proxies
+    // it to its host and /agent refuses it, so a request cannot loop.
+    const localPhone = {
+        async info(udid: string, reply: FastifyReply) {
+            const device = (await discover()).find((entry) => entry.udid === udid);
+            if (!device) return reply.code(404).send({ error: 'Device is not connected' });
+            return reply.send({ device, screen: await remote.getScreenInfo(device.udid) });
+        },
+        async screenshot(udid: string, fresh: boolean, reply: FastifyReply) {
+            try {
+                // Served from the shared per-device cache so N dashboard tabs cost one
+                // WDA round trip; `?fresh=1` bypasses it for a client that needs now.
+                const frame = await screenshots.get(udid, fresh ? 0 : undefined);
+                return reply.header('cache-control', 'no-store').type('image/png').send(frame);
+            } catch {
+                // A flapping device shouldn't spew 500s into the log every 5s from the grid poll.
+                return reply.code(503).header('cache-control', 'no-store').send();
+            }
+        },
+        async thumbnail(udid: string, requestedWidth: string | undefined, ifNoneMatch: string | undefined, reply: FastifyReply) {
+            const width = thumbnailWidth(requestedWidth);
+            let frame: Buffer;
+            try {
+                frame = await screenshots.get(udid, { timeoutMs: gridScreenshotTimeoutMs() });
+            } catch (error) {
+                // WDA unreachable or refusing is "not ready"; anything else is a fault.
+                return reply.code(503).header('cache-control', 'no-store')
+                    .header('x-device-state', error instanceof RemoteDeviceError ? 'not-ready' : 'error').send();
+            }
+            const etag = thumbnails.etag(udid, frame, width);
+            reply.header('etag', etag).header('cache-control', 'private, max-age=2');
+            if (ifNoneMatch === etag) return reply.code(304).send();
+            try {
+                const body = await thumbnails.thumbnail(udid, frame, width);
+                return reply.type('image/jpeg').send(body);
+            } catch {
+                reply.removeHeader('etag');
+                return reply.code(503).header('cache-control', 'no-store').header('x-device-state', 'error').send();
+            }
+        },
+        async stream(udid: string, request: FastifyRequest, reply: FastifyReply) {
+            // Close the upstream device stream the moment the browser goes away —
+            // otherwise every HTMX fragment swap leaks a live MJPEG connection.
+            const abort = new AbortController();
+            request.raw.once('close', () => abort.abort());
+            const upstream = await remote.getMjpegStream(udid, abort.signal);
+            if (!upstream.body) return reply.code(503).send({ error: 'Device stream is unavailable' });
+            return reply.header('cache-control', 'no-store, no-cache, must-revalidate')
+                .type(upstream.headers.get('content-type') ?? 'multipart/x-mixed-replace; boundary=--BoundaryString')
+                .send(Readable.from(upstream.body as AsyncIterable<Uint8Array>));
+        },
+        async action(udid: string, action: RemoteAction, reply: FastifyReply) {
+            if (await options.scheduler.activeExecution(udid)) {
+                return reply.code(409).send({ error: 'Remote input is disabled while automation is running' });
+            }
+            await remote.performAction(udid, action);
+            return reply.send({ ok: true });
+        },
+        async locked(udid: string, reply: FastifyReply) {
+            return reply.send({ locked: await remote.isLocked(udid) });
+        },
+        async wdaLog(udid: string, requestedLines: string | undefined, request: FastifyRequest, reply: FastifyReply) {
+            const requested = Number(requestedLines ?? 200);
+            const limit = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, 1_000) : 200;
+            let lines: string[] | undefined;
+            try {
+                lines = await wdaLogs(udid, limit);
+            } catch (error) {
+                request.log.warn({ error: errorMessage(error) }, 'wda-service log request failed');
+                return reply.code(503).send({ error: 'WDA service is unavailable' });
+            }
+            return reply.header('cache-control', 'no-store').send({ udid, lines: lines ?? [] });
+        },
+        async connection(registered: RegisteredDevice, reply: FastifyReply) {
+            // Prefer the real per-device state the wda-service supervisor tracks
+            // (physical, wda, appium, retryCount, message).
+            try {
+                const response = await requestWdaService('/devices', { timeoutMs: 2_000 });
+                if (response.statusCode >= 200 && response.statusCode < 300) {
+                    const status = (JSON.parse(response.body).devices as DeviceConnectionStatus[])
+                        .find((entry) => entry.udid === registered.udid);
+                    if (status) return reply.send(status);
+                }
+            } catch { /* supervisor socket unavailable — fall back to a probe */ }
+            const connected = (await connectedDevices()).some(({ udid }) => udid === registered.udid);
+            let wda = false;
+            try {
+                wda = (await fetch(`http://127.0.0.1:${registered.wdaLocalPort ?? 8100}/status`, { signal: AbortSignal.timeout(2_000) })).ok;
+            } catch { /* WDA not up */ }
+            const fallback: DeviceConnectionStatus = {
+                udid: registered.udid, physical: connected ? 'connected' : 'disconnected',
+                wda: wda ? 'ready' : connected ? 'connecting' : 'disconnected', appium: 'unavailable',
+                managed: false, message: wda ? 'WDA is ready' : connected ? 'Waiting for WDA' : 'Reconnect the USB cable',
+                retryCount: 0, updatedAt: new Date().toISOString(),
+            };
+            return reply.send(fallback);
+        },
+    };
+    const wdaLogs = options.wdaLogs ?? supervisorLogs;
+    /** GET a small JSON document for another host's phone from its agent and relay it. */
+    const proxyJson = async (owner: string, udid: string, rest: string, reply: FastifyReply, timeoutMs = 5_000) => {
+        try {
+            return relay(reply, await agent.request(owner, `/agent/devices/${encodeURIComponent(udid)}${rest}`, { timeoutMs }));
+        } catch (error) {
+            return agentFailure(reply, error);
+        }
+    };
+
     // NB: /remote/screenshot and /remote/action below are the canonical
     // endpoints — they carry the activeExecution guard and the cached
     // per-device client. The old unprefixed /screenshot and /actions twins
     // that bypassed both were removed.
     app.get<{ Params: { udid: string } }>('/api/devices/:udid/remote/info', async (request, reply) => {
-        const device = (await connectedDevices()).find(({ udid }) => udid === request.params.udid);
-        if (!device) return reply.code(404).send({ error: 'Device is not connected' });
-        return { device, screen: await remote.getScreenInfo(device.udid) };
+        const owner = await ownerOf(request.params.udid);
+        if (owner) return proxyJson(owner, request.params.udid, '/remote/info', reply);
+        return localPhone.info(request.params.udid, reply);
     });
     app.get<{ Params: { udid: string }; Querystring: { fresh?: string } }>('/api/devices/:udid/remote/screenshot', async (request, reply) => {
-        try {
-            // Served from the shared per-device cache so N dashboard tabs cost one
-            // WDA round trip; `?fresh=1` bypasses it for a client that needs now.
-            const frame = await screenshots.get(request.params.udid, request.query.fresh ? 0 : undefined);
-            return reply.header('cache-control', 'no-store').type('image/png').send(frame);
-        } catch {
-            // A flapping device shouldn't spew 500s into the log every 5s from the grid poll.
-            return reply.code(503).header('cache-control', 'no-store').send();
-        }
+        // Another host's phone: the fleet remote fetches it from that host's agent (its cache).
+        return localPhone.screenshot(request.params.udid, Boolean(request.query.fresh), reply);
     });
     // The grid's still: a small JPEG of the same cached frame, with an ETag so an
     // unchanged screen costs a 304 and no body. The full-size PNG above stays for
-    // the device page and calibration.
+    // the device page and calibration. Another host's phone is thumbnailed on
+    // that host, so only the small JPEG crosses the network.
     app.get<{ Params: { udid: string }; Querystring: { w?: string } }>('/api/devices/:udid/remote/thumbnail', async (request, reply) => {
+        const owner = await ownerOf(request.params.udid);
+        if (!owner) return localPhone.thumbnail(request.params.udid, request.query.w, request.headers['if-none-match'], reply);
         const width = thumbnailWidth(request.query.w);
-        let frame: Buffer;
+        const ifNoneMatch = request.headers['if-none-match'];
         try {
-            frame = await screenshots.get(request.params.udid, { timeoutMs: gridScreenshotTimeoutMs() });
-        } catch (error) {
-            // WDA unreachable or refusing is "not ready"; anything else is a fault.
-            return reply.code(503).header('cache-control', 'no-store')
-                .header('x-device-state', error instanceof RemoteDeviceError ? 'not-ready' : 'error').send();
-        }
-        const etag = thumbnails.etag(request.params.udid, frame, width);
-        reply.header('etag', etag).header('cache-control', 'private, max-age=2');
-        if (request.headers['if-none-match'] === etag) return reply.code(304).send();
-        try {
-            const body = await thumbnails.thumbnail(request.params.udid, frame, width);
-            return reply.type('image/jpeg').send(body);
+            const upstream = await agent.request(owner, `/agent/devices/${encodeURIComponent(request.params.udid)}/remote/thumbnail?w=${width}`, {
+                headers: ifNoneMatch ? { 'if-none-match': ifNoneMatch } : {}, timeoutMs: gridScreenshotTimeoutMs() + 2_000,
+            });
+            return relay(reply, upstream);
         } catch {
-            reply.removeHeader('etag');
-            return reply.code(503).header('cache-control', 'no-store').header('x-device-state', 'error').send();
+            return reply.code(503).header('cache-control', 'no-store').header('x-device-state', 'not-ready').send();
         }
     });
     app.get<{ Params: { udid: string } }>('/api/devices/:udid/remote/stream', async (request, reply) => {
-        // Close the upstream device stream the moment the browser goes away —
-        // otherwise every HTMX fragment swap leaks a live MJPEG connection.
-        const abort = new AbortController();
-        request.raw.once('close', () => abort.abort());
-        const upstream = await remote.getMjpegStream(request.params.udid, abort.signal);
-        if (!upstream.body) return reply.code(503).send({ error: 'Device stream is unavailable' });
-        return reply.header('cache-control', 'no-store, no-cache, must-revalidate')
-            .type(upstream.headers.get('content-type') ?? 'multipart/x-mixed-replace; boundary=--BoundaryString')
-            .send(Readable.from(upstream.body as AsyncIterable<Uint8Array>));
+        try {
+            return await localPhone.stream(request.params.udid, request, reply);
+        } catch (error) {
+            return agentFailure(reply, error);
+        }
     });
     app.post<{ Params: { udid: string }; Body: RemoteAction }>('/api/devices/:udid/remote/action', async (request, reply) => {
-        if (await options.scheduler.activeExecution(request.params.udid)) {
-            return reply.code(409).send({ error: 'Remote input is disabled while automation is running' });
+        try {
+            return await localPhone.action(request.params.udid, request.body, reply);
+        } catch (error) {
+            return agentFailure(reply, error);
         }
-        await remote.performAction(request.params.udid, request.body);
-        return { ok: true };
     });
     // The phone's recent WDA supervisor + xcodebuild output (the full history
     // is in WDA_LOG_DIR/<udid>.log on the host). Admins only: build output names
     // the signing team and host paths.
-    const wdaLogs = options.wdaLogs ?? supervisorLogs;
     app.get<{ Params: { udid: string }; Querystring: { lines?: string } }>('/api/devices/:udid/wda-log', async (request, reply) => {
-        const registered = (await loadRegisteredDevices()).some(({ udid }) => udid === request.params.udid);
+        const registered = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
         if (!registered) return reply.code(404).send({ error: 'Device is not registered' });
-        const requested = Number(request.query.lines ?? 200);
-        const limit = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, 1_000) : 200;
-        let lines: string[] | undefined;
-        try {
-            lines = await wdaLogs(request.params.udid, limit);
-        } catch (error) {
-            request.log.warn({ error: errorMessage(error) }, 'wda-service log request failed');
-            return reply.code(503).send({ error: 'WDA service is unavailable' });
+        if (!isLocalDevice(registered, hostId)) {
+            const lines = Number(request.query.lines ?? 200);
+            return proxyJson(registered.hostId!, registered.udid, `/wda-log?lines=${Number.isSafeInteger(lines) ? lines : 200}`, reply);
         }
-        return reply.header('cache-control', 'no-store').send({ udid: request.params.udid, lines: lines ?? [] });
+        return localPhone.wdaLog(request.params.udid, request.query.lines, request, reply);
     });
     app.get<{ Params: { udid: string } }>('/api/devices/:udid/connection', async (request, reply) => {
         const registered = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
         if (!registered) return reply.code(404).send({ error: 'Device is not registered' });
-        // Prefer the real per-device state the wda-service supervisor tracks
-        // (physical, wda, appium, retryCount, message).
-        try {
-            const response = await requestWdaService('/devices', { timeoutMs: 2_000 });
-            if (response.statusCode >= 200 && response.statusCode < 300) {
-                const status = (JSON.parse(response.body).devices as DeviceConnectionStatus[])
-                    .find((entry) => entry.udid === registered.udid);
-                if (status) return status;
-            }
-        } catch { /* supervisor socket unavailable — fall back to a probe */ }
-        const connected = (await connectedDevices()).some(({ udid }) => udid === registered.udid);
-        let wda = false;
-        try {
-            wda = (await fetch(`http://127.0.0.1:${registered.wdaLocalPort ?? 8100}/status`, { signal: AbortSignal.timeout(2_000) })).ok;
-        } catch { /* WDA not up */ }
-        const fallback: DeviceConnectionStatus = {
-            udid: registered.udid, physical: connected ? 'connected' : 'disconnected',
-            wda: wda ? 'ready' : connected ? 'connecting' : 'disconnected', appium: 'unavailable',
-            managed: false, message: wda ? 'WDA is ready' : connected ? 'Waiting for WDA' : 'Reconnect the USB cable',
-            retryCount: 0, updatedAt: new Date().toISOString(),
+        if (!isLocalDevice(registered, hostId)) return proxyJson(registered.hostId!, registered.udid, '/connection', reply);
+        return localPhone.connection(registered, reply);
+    });
+
+    // ---- the host agent: another host's dashboard reaching this host's phones ----
+    // Bearer PHONE_FARM_AGENT_TOKEN (shared by the farm), off (404) when unset.
+    // Only this host's registered phones answer; anything else is a 404, which
+    // also means a request can never be bounced on to a third host. Reached over
+    // Tailscale through the PHONE_FARM_AGENT_BIND listener (src/agent/listener.ts).
+    const agentGuard = async (request: FastifyRequest, reply: FastifyReply, udid?: string): Promise<RegisteredDevice | true | undefined> => {
+        const expected = agentToken();
+        if (!expected) { await reply.code(404).send({ error: 'Not found' }); return; }
+        if (!tokenMatches(bearerToken(request.headers.authorization), expected)) {
+            await reply.code(401).header('www-authenticate', 'Bearer realm="agent"').send({ error: 'Authentication required' });
+            return;
+        }
+        if (udid === undefined) return true;
+        const device = (await loadRegisteredDevices()).find((entry) => entry.udid === udid);
+        if (!device || !isLocalDevice(device, hostId)) { await reply.code(404).send({ error: 'Device not found on this host' }); return; }
+        return device;
+    };
+    app.get('/agent/status', async (request, reply) => {
+        if (!await agentGuard(request, reply)) return reply;
+        const [registered, connected, supervisor] = await Promise.all([
+            loadRegisteredDevices(), discover(), wdaStatuses().catch(() => null),
+        ]);
+        const online = new Map(connected.map((device) => [device.udid, device]));
+        const states = new Map((supervisor ?? []).map((status) => [status.udid, status]));
+        const body: AgentStatusResponse = {
+            hostId,
+            devices: localDevices(registered, hostId).map((device) => ({
+                udid: device.udid,
+                connected: device.disabled ? null : online.get(device.udid) ?? null,
+                status: states.get(device.udid) ?? null,
+            })),
         };
-        return fallback;
+        return reply.header('cache-control', 'no-store').send(body);
+    });
+    app.get<{ Params: { udid: string } }>('/agent/devices/:udid/remote/info', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.info(request.params.udid, reply);
+    });
+    app.get<{ Params: { udid: string }; Querystring: { fresh?: string } }>('/agent/devices/:udid/remote/screenshot', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.screenshot(request.params.udid, Boolean(request.query.fresh), reply);
+    });
+    app.get<{ Params: { udid: string }; Querystring: { w?: string } }>('/agent/devices/:udid/remote/thumbnail', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.thumbnail(request.params.udid, request.query.w, request.headers['if-none-match'], reply);
+    });
+    app.get<{ Params: { udid: string } }>('/agent/devices/:udid/remote/stream', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.stream(request.params.udid, request, reply);
+    });
+    app.get<{ Params: { udid: string } }>('/agent/devices/:udid/remote/locked', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.locked(request.params.udid, reply);
+    });
+    app.post<{ Params: { udid: string }; Body: RemoteAction }>('/agent/devices/:udid/remote/action', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.action(request.params.udid, request.body, reply);
+    });
+    app.get<{ Params: { udid: string }; Querystring: { lines?: string } }>('/agent/devices/:udid/wda-log', async (request, reply) => {
+        if (!await agentGuard(request, reply, request.params.udid)) return reply;
+        return localPhone.wdaLog(request.params.udid, request.query.lines, request, reply);
+    });
+    app.get<{ Params: { udid: string } }>('/agent/devices/:udid/connection', async (request, reply) => {
+        const device = await agentGuard(request, reply, request.params.udid);
+        if (!device || device === true) return reply;
+        return localPhone.connection(device, reply);
     });
     app.post<{ Params: { udid: string } }>('/api/devices/:udid/reconnect', async (request, reply) => {
         if (await options.scheduler.activeExecution(request.params.udid)) {
@@ -1118,7 +1344,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     const candidate = value.accounts;
                     return Array.isArray(candidate) ? candidate.filter((entry) => typeof entry === 'string') : [];
                 });
-                const status = device.connected ? wdaState.get(device.udid) : undefined;
+                // Another host's phone carries the state its host's agent reported.
+                const status = device.connected ? ('remoteStatus' in device ? device.remoteStatus ?? undefined : wdaState.get(device.udid)) : undefined;
                 const state = !device.connected ? 'offline' : !status || status.wda === 'ready' ? 'ready' : 'not-ready';
                 if (state === 'ready') online += 1;
                 else if (state === 'not-ready') attention += 1;
@@ -1140,10 +1367,12 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     ? '<span class="connected"><span></span>Online</span>'
                     : state === 'not-ready'
                         ? `<span class="connected not-ready" title="${escapeHtml(status?.message ?? '')}"><span></span>WDA not ready</span>`
-                        : '<span class="connected offline"><span></span>Offline</span>';
+                        : `<span class="connected offline"${'hostReachable' in device && !device.hostReachable ? ` title="${escapeHtml(`Host ${device.hostName ?? device.hostId} is not answering`)}"` : ''}><span></span>Offline</span>`;
                 const age = state === 'ready' ? `<p class="preview-age">${escapeHtml(ageText(screenshots.peek(device.udid).at))}</p>` : '';
                 const accountList = accounts.map(escapeHtml).join(', ');
-                return `<article class="device-card" data-state="${state}"${ratio}>${preview}<div class="device-copy"><h2 title="${escapeHtml(device.name)}">${escapeHtml(device.name)}</h2>${pill}<p class="device-meta" title="${escapeHtml(device.model ? `${device.model} · ${device.udid}` : device.udid)}">${device.connected ? `iOS ${escapeHtml(device.connected.osVersion)}` : escapeHtml(device.udid)}</p>${accounts.length ? `<p class="accounts" title="${accountList}">${accountList}</p>` : ''}${age}</div><div class="device-card-actions"><a id="open-${deviceKey(device.udid)}" class="button secondary" href="/devices/${encodeURIComponent(device.udid)}" aria-label="Open ${escapeHtml(device.name)}">Open</a>${toggleButton(device.udid, 'Disconnect', true)}</div></article>`;
+                // Which Mac the phone hangs off (multi-host farms only).
+                const host = device.hostName ? `<p class="device-meta device-host" title="Host">Host · ${escapeHtml(device.hostName)}</p>` : '';
+                return `<article class="device-card" data-state="${state}"${ratio}>${preview}<div class="device-copy"><h2 title="${escapeHtml(device.name)}">${escapeHtml(device.name)}</h2>${pill}${host}<p class="device-meta" title="${escapeHtml(device.model ? `${device.model} · ${device.udid}` : device.udid)}">${device.connected ? `iOS ${escapeHtml(device.connected.osVersion)}` : escapeHtml(device.udid)}</p>${accounts.length ? `<p class="accounts" title="${accountList}">${accountList}</p>` : ''}${age}</div><div class="device-card-actions"><a id="open-${deviceKey(device.udid)}" class="button secondary" href="/devices/${encodeURIComponent(device.udid)}" aria-label="Open ${escapeHtml(device.name)}">Open</a>${toggleButton(device.udid, 'Disconnect', true)}</div></article>`;
             }).join('');
             const summary = active.length
                 ? `<p class="grid-summary">${online} online · ${attention} need attention · ${active.length} total</p>` : '';
@@ -1156,7 +1385,17 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/summary', async (request, reply) => {
             const [connectedList, registeredList] = await Promise.all([connectedDevices(), loadRegisteredDevices()]);
-            const device = connectedList.find(({ udid }) => udid === request.params.udid);
+            const registeredEntry = registeredList.find(({ udid }) => udid === request.params.udid);
+            // Another host's phone: its host's agent says whether it is connected (and its screen).
+            type RemoteInfo = { device: Device; screen: Awaited<ReturnType<RemoteControl['getScreenInfo']>> };
+            let remoteInfo: RemoteInfo | null = null as RemoteInfo | null;
+            if (registeredEntry && !isLocalDevice(registeredEntry, hostId)) {
+                try {
+                    const response = await agent.request(registeredEntry.hostId!, `/agent/devices/${encodeURIComponent(registeredEntry.udid)}/remote/info`, { timeoutMs: 5_000 });
+                    if (response.ok) remoteInfo = await response.json() as RemoteInfo;
+                } catch { /* host unreachable: rendered as disconnected */ }
+            }
+            const device = remoteInfo?.device ?? connectedList.find(({ udid }) => udid === request.params.udid && (!registeredEntry || isLocalDevice(registeredEntry, hostId)));
             if (!device) {
                 // Registered but not on USB: keep the page header (name, UDID) so the
                 // operator still knows which phone this is. Unknown UDIDs are a 404.
@@ -1164,10 +1403,12 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 if (!known) return reply.code(404).type('text/html').send('<section id="device-summary" class="device-summary error"><div class="banner err" role="alert"><strong>Device not found</strong><p>No registered phone has this UDID.</p></div></section>');
                 const knownPlace = [known.model, known.rack ? `Rack ${known.rack}` : '', known.rackSlot ? `Slot ${known.rackSlot}` : ''].filter(Boolean).join(' · ');
                 const knownSlot = knownPlace ? `<p>${escapeHtml(knownPlace)}</p>` : '';
-                return reply.type('text/html').send(`<section id="device-summary" class="device-summary error"><div class="device-summary-head"><div><span class="eyebrow">Registered device</span><h1>${escapeHtml(known.name)}</h1><span class="connected offline"><span></span>Offline</span>${knownSlot}</div><code title="UDID">${escapeHtml(known.udid)}</code></div><div class="banner err" role="alert"><strong>Device disconnected</strong><p>This phone is not visible over USB. Check the cable and hub port, unlock the phone and accept Trust, then reload this page.</p></div></section>`);
+                return reply.type('text/html').send(`<section id="device-summary" class="device-summary error"><div class="device-summary-head"><div><span class="eyebrow">Registered device</span><h1>${escapeHtml(known.name)}</h1><span class="connected offline"><span></span>Offline</span>${knownSlot}</div><code title="UDID">${escapeHtml(known.udid)}</code></div><div class="banner err" role="alert"><strong>Device disconnected</strong><p>${isLocalDevice(known, hostId)
+                    ? 'This phone is not visible over USB. Check the cable and hub port, unlock the phone and accept Trust, then reload this page.'
+                    : escapeHtml(`This phone hangs off host ${known.hostId}, which reports it disconnected or is not answering. Check that host's cable, hub and agent, then reload this page.`)}</p></div></section>`);
             }
-            const screen = await remote.getScreenInfo(device.udid);
-            const known = registeredList.find(({ udid }) => udid === device.udid);
+            const screen = remoteInfo?.screen ?? await remote.getScreenInfo(device.udid);
+            const known = registeredEntry;
             const slot = [known?.rack ? `rack ${known.rack}` : '', known?.rackSlot ? `slot ${known.rackSlot}` : '']
                 .filter(Boolean).map((part) => ` · ${escapeHtml(part)}`).join('');
             return reply.type('text/html').send(`<section id="device-summary" class="device-summary" data-screen-width="${screen.screenSize.width}" data-screen-height="${screen.screenSize.height}"><div><span class="eyebrow">Connected device</span><h1>${escapeHtml(device.name)}</h1><p>iOS ${escapeHtml(device.osVersion)} · ${screen.screenSize.width} × ${screen.screenSize.height} points · ${screen.scale}×${slot}</p></div><code title="UDID">${escapeHtml(device.udid)}</code></section>`);

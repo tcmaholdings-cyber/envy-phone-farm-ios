@@ -18,7 +18,8 @@ import type { AccessLevel } from './policy.js';
  * - `schedule` / `execution` — the level on the phone that schedule/run belongs to.
  * - `any-operate`       — `operate` on at least one phone (asset uploads).
  * - `token`             — no session; the handler checks its own bearer token
- *                         (GET /metrics and PHONE_FARM_METRICS_TOKEN).
+ *                         (GET /metrics and PHONE_FARM_METRICS_TOKEN; the /agent/*
+ *                         host-agent routes and PHONE_FARM_AGENT_TOKEN).
  *
  * An unknown or ungranted phone answers 404, not 403, so ids cannot be probed.
  */
@@ -113,6 +114,18 @@ export const ROUTE_REQUIREMENTS: Readonly<Record<string, RouteRequirement>> = {
     'GET /api/devices/:udid/remote/thumbnail': VIEW,
     'GET /api/devices/:udid/remote/stream': VIEW,
     'POST /api/devices/:udid/remote/action': OPERATE,
+
+    // host agent (multi-host): another host's dashboard reaching this host's
+    // phones. Bearer PHONE_FARM_AGENT_TOKEN, 404 when unset; only this host's phones.
+    'GET /agent/status': TOKEN,
+    'GET /agent/devices/:udid/remote/info': TOKEN,
+    'GET /agent/devices/:udid/remote/screenshot': TOKEN,
+    'GET /agent/devices/:udid/remote/thumbnail': TOKEN,
+    'GET /agent/devices/:udid/remote/stream': TOKEN,
+    'GET /agent/devices/:udid/remote/locked': TOKEN,
+    'POST /agent/devices/:udid/remote/action': TOKEN,
+    'GET /agent/devices/:udid/wda-log': TOKEN,
+    'GET /agent/devices/:udid/connection': TOKEN,
 
     // registration wizard
     'GET /api/device-registrations/candidates': ADMIN,

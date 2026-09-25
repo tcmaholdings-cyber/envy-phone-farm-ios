@@ -198,11 +198,12 @@ test('renderMetrics measures how long a phone has been off USB and WDA not ready
     assert.equal(escapeLabelValue('a"b\\c\nd'), 'a\\"b\\\\c\\nd');
 });
 
-test('GET /metrics is the only token route and bypasses the session check; wda-log is admin-only', async (context) => {
+test('GET /metrics and the /agent/* host-agent routes are the only token routes; wda-log is admin-only', async (context) => {
     const { app, store } = await harness({ wdaLogs: async (udid) => (udid === 'udid-r1-mini' ? ['line 1', 'line 2'] : undefined) });
     context.after(() => app.close());
-    const tokenRoutes = routeAccessReport(app).filter(({ requirement }) => requirement?.kind === 'token').map(({ method, url }) => `${method} ${url}`);
-    assert.deepEqual(tokenRoutes.filter((route) => !route.startsWith('HEAD')), ['GET /metrics']);
+    const tokenRoutes = routeAccessReport(app).filter(({ requirement }) => requirement?.kind === 'token')
+        .map(({ method, url }) => `${method} ${url}`).filter((route) => !route.startsWith('HEAD'));
+    assert.deepEqual(tokenRoutes.filter((route) => !route.split(' ')[1]!.startsWith('/agent/')), ['GET /metrics']);
 
     const admin = await seedUser(store, 'kash', 'admin');
     const va = await seedUser(store, 'va', 'operator');
