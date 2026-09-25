@@ -48,7 +48,7 @@ RELEASE_PATHS=(
     .env.example README.md AGENTS.md PLUGIN_DEVELOPMENT.md SECURITY.md LICENSE LICENSE-GRANT.md NOTICE
 )
 # Host state: must never appear in a release.
-FORBIDDEN_TOP=(.env devices.json .wda .appium2 .scheduler-data logs backups node_modules static/assets)
+FORBIDDEN_TOP=(.env devices.json device-secrets.json .wda .appium2 .scheduler-data logs backups node_modules static/assets)
 
 git diff --quiet HEAD -- && git diff --cached --quiet -- \
     || fail "tracked files have uncommitted changes; commit or stash them first"

@@ -113,7 +113,7 @@ else
     run mkdir -p "$BACKUP"
     run chmod 700 "$BACKUP_ROOT" "$BACKUP"
     items=()
-    for item in .env .env.devices devices.json .wda .scheduler-data backups; do
+    for item in .env .env.devices devices.json device-secrets.json .wda .scheduler-data backups; do
         # The real item may still be at the root or, on a resumed run, already in shared/.
         if [ -e "$ROOT/$item" ] && [ ! -L "$ROOT/$item" ]; then items+=("$ROOT/$item")
         elif [ -e "$SHARED/$item" ]; then items+=("$SHARED/$item"); fi
@@ -184,7 +184,7 @@ fi
 
 # ---- 4. link + activate ---------------------------------------------------
 link_shared "$RELEASE"
-chmod 600 "$SHARED/.env" "$SHARED/.env.devices" "$SHARED/devices.json" 2>/dev/null || true
+chmod 600 "$SHARED/.env" "$SHARED/.env.devices" "$SHARED/devices.json" "$SHARED/device-secrets.json" 2>/dev/null || true
 if [ ! -f "$RELEASE/RELEASE.json" ]; then
     node -e '
         const [file, id, sha, subject] = process.argv.slice(1);

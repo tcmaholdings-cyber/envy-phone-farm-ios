@@ -22,7 +22,7 @@ HEALTH_TIMEOUT=${PHONE_FARM_HEALTH_TIMEOUT:-120}
 GUI_DOMAIN="gui/$(id -u)"
 
 # Files and directories that belong to the host, not to a release.
-SHARED_FILES=(.env .env.devices devices.json)
+SHARED_FILES=(.env .env.devices devices.json device-secrets.json)
 SHARED_DIRS=(.wda .appium2 .scheduler-data logs backups)
 SHARED_ITEMS=("${SHARED_FILES[@]}" "${SHARED_DIRS[@]}")
 

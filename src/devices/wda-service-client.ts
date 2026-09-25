@@ -49,7 +49,9 @@ export function requestWdaService(
         request.setTimeout(options.timeoutMs ?? 2_000, () => {
             request.destroy(new Error('WDA service request timed out'));
         });
-        request.once('error', reject);
+        // .on, not .once: a second socket error (e.g. EINVAL on an over-long path)
+        // would otherwise be unhandled and crash the process.
+        request.on('error', reject);
         request.end();
     });
 }
