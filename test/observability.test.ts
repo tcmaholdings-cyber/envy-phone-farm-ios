@@ -198,14 +198,14 @@ test('renderMetrics measures how long a phone has been off USB and WDA not ready
     assert.equal(escapeLabelValue('a"b\\c\nd'), 'a\\"b\\\\c\\nd');
 });
 
-test('GET /metrics and the /agent/* host-agent routes are the only token routes; wda-log is admin-only', async (context) => {
+test('GET /metrics and the /agent/* host-agent routes are the only token routes; wda-log is platform-only', async (context) => {
     const { app, store } = await harness({ wdaLogs: async (udid) => (udid === 'udid-r1-mini' ? ['line 1', 'line 2'] : undefined) });
     context.after(() => app.close());
     const tokenRoutes = routeAccessReport(app).filter(({ requirement }) => requirement?.kind === 'token')
         .map(({ method, url }) => `${method} ${url}`).filter((route) => !route.startsWith('HEAD'));
     assert.deepEqual(tokenRoutes.filter((route) => !route.split(' ')[1]!.startsWith('/agent/')), ['GET /metrics']);
 
-    const admin = await seedUser(store, 'kash', 'admin');
+    const admin = await seedUser(store, 'kash', 'platform');
     const va = await seedUser(store, 'va', 'operator');
     await store.createGrant({ userId: va.id, groupId: null, scopeType: 'all', scopeValue: null, level: 'operate' });
     const adminCookie = { pf_session: await sessionFor(store, admin.id) };
@@ -222,7 +222,7 @@ test('GET /metrics and the /agent/* host-agent routes are the only token routes;
 test('the wda-log route answers 503 when the wda-service is down', async (context) => {
     const { app, store } = await harness({ wdaLogs: async () => { throw new Error('ENOENT .wda/wda-service.sock'); } });
     context.after(() => app.close());
-    const admin = await seedUser(store, 'kash', 'admin');
+    const admin = await seedUser(store, 'kash', 'platform');
     const response = await app.inject({ method: 'GET', url: '/api/devices/udid-r1-mini/wda-log', cookies: { pf_session: await sessionFor(store, admin.id) } });
     assert.equal(response.statusCode, 503);
     assert.doesNotMatch(response.body, /ENOENT/);

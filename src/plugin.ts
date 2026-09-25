@@ -110,6 +110,12 @@ export interface PluginRouteContext {
      */
     mutateDevices<T>(mutate: (devices: RegisteredDevice[]) => T | Promise<T>): Promise<T>;
     renderActivity(deviceUdid: string, message?: string): Promise<string>;
+    /**
+     * Who is making `request`, for ownership of what a plugin route creates
+     * (uploads): the signed-in user's id and tenant. Null without a signed-in
+     * user (auth off). Optional so older hosts stay compatible.
+     */
+    requestActor?(request: FastifyRequest): { userId: string | null; tenantId: string | null } | null;
 }
 
 /**
@@ -154,11 +160,18 @@ export interface DeviceAccessGrant {
 
 /**
  * Scoped access for a signed-in user. A provider that returns it gets per-device
- * authorization (src/auth/policy.ts); a provider that omits it keeps the
- * original all-or-nothing behaviour, where every signed-in user can do everything.
+ * and per-tenant authorization (src/auth/policy.ts); a provider that omits it
+ * keeps the original all-or-nothing behaviour, where every signed-in user can
+ * do everything.
+ *
+ * `platform` is operator-of-the-farm staff (every tenant). `admin` with a
+ * `tenantId` administers that tenant only; `admin` without one is treated as
+ * platform, which is what a provider written before tenants meant by it.
  */
 export interface UserAccess {
-    role: 'admin' | 'operator';
+    role: 'platform' | 'admin' | 'operator';
+    /** The user's tenant; omit or null for platform staff. */
+    tenantId?: string | null;
     groupIds: string[];
     grants: DeviceAccessGrant[];
 }

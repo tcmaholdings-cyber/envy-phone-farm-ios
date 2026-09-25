@@ -2,8 +2,12 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000001';
-const DEFAULT_TENANT_SLUG = 'beloura';
+import { getTableConfig } from 'drizzle-orm/pg-core';
+
+import {
+    assets, authAuditLog, authGroups, authLoginThrottle, authTenantDevices, authTenants, authUsers, executions, schedules,
+} from '../src/database/schema.js';
+import { DEFAULT_TENANT_ID, DEFAULT_TENANT_SLUG } from '../src/tenancy.js';
 
 const migration = await readFile(new URL('../drizzle/0006_tenants.sql', import.meta.url), 'utf8');
 const statements = migration.split('--> statement-breakpoint').map((statement) => statement.trim()).filter(Boolean);
@@ -46,4 +50,21 @@ test('migration 0006 makes the audit log append-only in the database', () => {
     assert.match(migration, /REVOKE UPDATE, DELETE, TRUNCATE ON "auth"\."audit_log" FROM phone_farm_app/);
     // Every statement is a single unit for the migrator; function bodies stay whole.
     assert.ok(statements.some((statement) => statement.startsWith('CREATE FUNCTION') && statement.endsWith('$$;')));
+});
+
+test('the drizzle schema carries the tenant columns the migration adds', () => {
+    for (const table of [schedules, executions, assets, authGroups]) {
+        const tenant = getTableConfig(table).columns.find((column) => column.name === 'tenant_id');
+        assert.ok(tenant?.notNull, `${getTableConfig(table).name}.tenant_id is not null`);
+    }
+    const userTenant = getTableConfig(authUsers).columns.find((column) => column.name === 'tenant_id');
+    assert.equal(userTenant?.notNull, false, 'platform staff have no tenant');
+    assert.ok(getTableConfig(assets).columns.some((column) => column.name === 'uploaded_by'));
+    assert.deepEqual(getTableConfig(authTenantDevices).columns.map((column) => column.name).sort(), ['assigned_at', 'tenant_id', 'udid']);
+    assert.ok(getTableConfig(authTenants).columns.some((column) => column.name === 'quotas'));
+    assert.ok(getTableConfig(authAuditLog).columns.some((column) => column.name === 'request_id'));
+    assert.ok(getTableConfig(authLoginThrottle).columns.some((column) => column.name === 'last_failure_at'));
+    for (const table of ['tenants', 'tenant_devices', 'audit_log', 'login_throttle']) {
+        assert.match(migration, new RegExp(`CREATE TABLE "auth"\\."${table}"`));
+    }
 });

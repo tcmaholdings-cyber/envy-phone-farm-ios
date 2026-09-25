@@ -4,7 +4,8 @@ import { createDatabaseConnection } from '../database/client.js';
 import type { AuthenticatedUser, AuthProvider } from '../plugin.js';
 import { AccountService, type ResolvedSession } from './accounts.js';
 import { isHttpsRequest } from './net.js';
-import { PgAuthStore } from './pg-store.js';
+import { PgAuthStore, PgTenantStore } from './pg-store.js';
+import { TenantService } from './tenants.js';
 
 /**
  * The built-in auth provider (`PHONE_FARM_AUTH_PLUGIN=builtin`): accounts in
@@ -27,6 +28,8 @@ export function isBuiltinPublicPath(path: string): boolean {
 
 export interface BuiltinAuthProvider extends AuthProvider {
     readonly accounts: AccountService;
+    /** Tenants and phone ownership; absent means one tenant owns everything. */
+    readonly tenants?: TenantService;
     /** The resolved session for this request, when `authenticate` found one. */
     sessionOf(request: FastifyRequest): ResolvedSession | undefined;
 }
@@ -60,11 +63,16 @@ export function authenticatedUserFrom(resolved: ResolvedSession): AuthenticatedU
     };
 }
 
-export function createBuiltinAuthProvider(accounts: AccountService, onClose?: () => Promise<void>): BuiltinAuthProvider {
+export interface BuiltinProviderExtras {
+    tenants?: TenantService;
+}
+
+export function createBuiltinAuthProvider(accounts: AccountService, onClose?: () => Promise<void>, extras: BuiltinProviderExtras = {}): BuiltinAuthProvider {
     const sessions = new WeakMap<FastifyRequest, ResolvedSession>();
     return {
         id: 'builtin',
         accounts,
+        ...(extras.tenants ? { tenants: extras.tenants } : {}),
         loginPath: LOGIN_PATH,
         logoutPath: LOGOUT_PATH,
         logoutMethod: 'POST',
@@ -91,18 +99,21 @@ export function createBuiltinAuthProvider(accounts: AccountService, onClose?: ()
 export async function createBuiltinAuthProviderFromEnv(): Promise<BuiltinAuthProvider> {
     const connection = createDatabaseConnection();
     try {
-        const result = await connection.pool.query<{ present: string | null }>(`select to_regclass('auth.users')::text as present`);
-        if (!result.rows[0]?.present) throw new Error('Built-in auth tables are missing; run npm run db:migrate');
+        // auth.tenants arrived with migration 0006; checking it catches a database one migration behind.
+        const result = await connection.pool.query<{ present: string | null }>(`select to_regclass('auth.tenants')::text as present`);
+        if (!result.rows[0]?.present) throw new Error('Built-in auth tables are missing or out of date; run npm run db:migrate');
     } catch (error) {
         await connection.close();
         throw error;
     }
     const idle = Number(process.env.PHONE_FARM_SESSION_IDLE_HOURS);
     const absolute = Number(process.env.PHONE_FARM_SESSION_MAX_DAYS);
+    const tenantStore = new PgTenantStore(connection);
     const accounts = new AccountService({
         store: new PgAuthStore(connection),
+        tenants: tenantStore,
         ...(Number.isFinite(idle) && idle > 0 ? { idleTimeoutMs: idle * 60 * 60_000 } : {}),
         ...(Number.isFinite(absolute) && absolute > 0 ? { absoluteTimeoutMs: absolute * 24 * 60 * 60_000 } : {}),
     });
-    return createBuiltinAuthProvider(accounts, () => connection.close());
+    return createBuiltinAuthProvider(accounts, () => connection.close(), { tenants: new TenantService(tenantStore) });
 }

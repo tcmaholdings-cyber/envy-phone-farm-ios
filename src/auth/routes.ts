@@ -34,11 +34,15 @@ export interface ShellOptions {
     scripts?: string[];
 }
 
+/** A registered phone labelled with the tenant that owns it. */
+export type OwnedDevice = RegisteredDevice & { tenantId: string };
+
 export interface BuiltinRouteContext {
     provider: BuiltinAuthProvider;
     renderShell(request: FastifyRequest | null, options: ShellOptions): string;
     accessOf(request: FastifyRequest): RequestAccess;
-    loadDevices(): Promise<RegisteredDevice[]>;
+    loadDevices(): Promise<OwnedDevice[]>;
+    tenantOfDevice(udid: string): Promise<string>;
     log(event: AuditEvent): void;
 }
 
@@ -90,7 +94,7 @@ function distinctSorted(values: Array<string | undefined>): string[] {
 }
 
 /** The Team page body. Exported for tests; every value is escaped here. */
-export function renderTeamMain(team: TeamSnapshot, devices: readonly RegisteredDevice[], currentUserId: string): string {
+export function renderTeamMain(team: TeamSnapshot, devices: readonly (RegisteredDevice & { tenantId?: string })[], currentUserId: string): string {
     const groupsById = new Map(team.groups.map((group) => [group.id, group]));
     const usersById = new Map(team.users.map((user) => [user.id, user]));
     const groupsOf = (userId: string) => team.memberships.filter((membership) => membership.userId === userId)
@@ -139,7 +143,7 @@ export function renderTeamMain(team: TeamSnapshot, devices: readonly RegisteredD
         const groupIds = team.memberships.filter(({ userId }) => userId === user.id).map(({ groupId }) => groupId);
         const grants: PolicyGrant[] = team.grants;
         const reachable = devices.flatMap((device) => {
-            const level = effectiveLevel({ id: user.id, role: user.role, disabled: user.disabled }, groupIds, grants, device);
+            const level = effectiveLevel({ id: user.id, role: user.role, tenantId: user.tenantId, disabled: user.disabled }, groupIds, grants, device);
             return level ? [`<li><span>${escapeHtml(device.name)}</span><span class="level-chip ${level}">${LEVEL_LABEL[level]}</span></li>`] : [];
         });
         return `<article class="effective-card"><h3>${escapeHtml(user.displayName)}${user.disabled ? ' <span class="muted">(disabled)</span>' : ''}</h3>${reachable.length ? `<ul>${reachable.join('')}</ul>` : '<p class="muted">No phones.</p>'}</article>`;
@@ -191,6 +195,8 @@ export function registerBuiltinAuthRoutes(app: FastifyInstance, context: Builtin
     const { provider, renderShell } = context;
     const accounts = provider.accounts;
     accounts.audit = context.log;
+    accounts.tenantOfDevice = context.tenantOfDevice;
+    if (provider.tenants) provider.tenants.audit = context.log;
 
     const actorOf = (request: FastifyRequest): Actor => {
         const session = provider.sessionOf(request);
@@ -278,26 +284,40 @@ export function registerBuiltinAuthRoutes(app: FastifyInstance, context: Builtin
     app.get('/api/me', async (request, reply) => {
         const session = provider.sessionOf(request);
         if (!session) return reply.code(401).send({ error: 'Authentication required' });
-        const { id, username, displayName, role, mustChangePassword } = session.user;
-        return { id, username, displayName, role, mustChangePassword };
+        const { id, username, displayName, role, mustChangePassword, tenantId } = session.user;
+        return { id, username, displayName, role, tenantId, mustChangePassword };
     });
 
-    // ---------- Team panel (admin-only through the route table) ----------
+    // ---------- Team panel (tenant admins and platform staff, through the route table) ----------
+    // A tenant admin always gets their own tenant. Platform staff pick one with
+    // ?tenant=<id> (default: the default tenant), or ?tenant=platform for the
+    // platform accounts themselves.
+
+    /** The tenant a Team request names: an id, null for the platform accounts, undefined for the default. */
+    const requestedTenant = (request: FastifyRequest): string | null | undefined => {
+        const value = (request.query as { tenant?: unknown } | undefined)?.tenant;
+        if (value === 'platform') return null;
+        return typeof value === 'string' && value ? value : undefined;
+    };
 
     app.get('/team', async (request, reply) => {
         const actor = actorOf(request);
-        const [team, devices] = await Promise.all([accounts.team(), context.loadDevices()]);
+        const requested = requestedTenant(request);
+        const team = await accounts.team(actor, requested);
+        const scope = requested === null ? null : await accounts.scopeTenant(actor, requested);
+        const devices = (await context.loadDevices()).filter((device) => device.tenantId === scope);
         return reply.header('cache-control', 'no-store').type('text/html').send(renderShell(request, {
             title: 'Team', current: '/team', bodyClass: 'page-team', scripts: ['team.js'],
             main: renderTeamMain(team, devices, actor.id),
         }));
     });
 
-    app.get('/api/team', async () => accounts.team());
+    app.get('/api/team', async (request) => accounts.team(actorOf(request), requestedTenant(request)));
 
     app.post('/api/team/users', async (request, reply) => {
         const body = (request.body ?? {}) as Record<string, unknown>;
-        const created = await accounts.createUser(actorOf(request), { ...body, username: body.username });
+        const tenantId = body.tenantId ?? requestedTenant(request) ?? undefined;
+        const created = await accounts.createUser(actorOf(request), { ...body, username: body.username, tenantId });
         // The temporary password is in this one response and nowhere else.
         return reply.code(201).header('cache-control', 'no-store').send(created);
     });
@@ -315,8 +335,11 @@ export function registerBuiltinAuthRoutes(app: FastifyInstance, context: Builtin
         return reply.header('cache-control', 'no-store').send(reset);
     });
 
-    app.post('/api/team/groups', async (request, reply) =>
-        reply.code(201).send(await accounts.createGroup(actorOf(request), (request.body ?? {}) as Record<string, unknown>)));
+    app.post('/api/team/groups', async (request, reply) => {
+        const body = (request.body ?? {}) as Record<string, unknown>;
+        const tenantId = body.tenantId ?? requestedTenant(request) ?? undefined;
+        return reply.code(201).send(await accounts.createGroup(actorOf(request), { ...body, tenantId }));
+    });
 
     app.patch<{ Params: { id: string } }>('/api/team/groups/:id', async (request) =>
         accounts.updateGroup(actorOf(request), request.params.id, (request.body ?? {}) as Record<string, unknown>));

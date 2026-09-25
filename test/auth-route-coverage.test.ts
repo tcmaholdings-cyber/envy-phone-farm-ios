@@ -58,8 +58,8 @@ test('a plugin can declare its own routes but cannot loosen a core route', () =>
     }]);
     assert.deepEqual(table.get('GET /plugins/x/report'), { kind: 'signed-in' });
     assert.deepEqual(table.get('POST /plugins/x/devices/:udid/run'), { kind: 'device', level: 'operate' });
-    assert.deepEqual(table.get('DELETE /api/devices/:udid'), { kind: 'admin' });
-    assert.deepEqual(table.get('GET /plugins/x/ping'), { kind: 'admin' }, 'HEAD is keyed as GET');
+    assert.deepEqual(table.get('DELETE /api/devices/:udid'), { kind: 'platform' });
+    assert.deepEqual(table.get('GET /plugins/x/ping'), { kind: 'platform' }, 'HEAD is keyed as GET; a plugin `admin` route is platform-only');
 });
 
 test('HEAD requests need what GET needs', () => {

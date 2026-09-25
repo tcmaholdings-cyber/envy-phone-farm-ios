@@ -21,7 +21,7 @@ const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(reso
 function executionRow(overrides: Partial<ExecutionRow> = {}): ExecutionRow {
     const now = new Date();
     return {
-        id: 'exec-1', scheduleId: null, deviceUdid: 'udid-1',
+        id: 'exec-1', scheduleId: null, deviceUdid: 'udid-1', tenantId: '00000000-0000-0000-0000-000000000001',
         pluginId: 'com.git-agni.tiktok', taskType: 'doomscroll', taskVersion: 1,
         payload: { durationMinutes: 5, personality: 'casual', likeEnabled: false, saveEnabled: false },
         scheduledFor: now, deadlineAt: new Date(now.getTime() + 30 * 60_000),

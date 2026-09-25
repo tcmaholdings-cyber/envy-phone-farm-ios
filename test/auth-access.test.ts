@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-    createAuthApp, seedUser, sessionFor, TEST_DEVICES, useDevicesFile, type FakeExecution, type FakeSchedule,
+    createAuthApp, DEFAULT_TENANT_ID, seedUser, sessionFor, TEST_DEVICES, useDevicesFile, type FakeExecution, type FakeSchedule,
 } from './auth-support.js';
 import { inject } from './support.js';
 
@@ -24,11 +24,11 @@ async function farm() {
         executions: [execution('e-r1-se', 'udid-r1-se'), execution('e-loose', 'udid-loose'), execution('e-r1-mini', 'udid-r1-mini', 'failed')],
     });
     const { store } = harness;
-    const admin = await seedUser(store, 'kash', 'admin');
+    const admin = await seedUser(store, 'kash', 'platform');
     const va1 = await seedUser(store, 'va1', 'operator', 'VA One');
     const va2 = await seedUser(store, 'va2', 'operator');
     const va3 = await seedUser(store, 'va3', 'operator');
-    const rack1 = await store.createGroup({ name: 'rack1', description: '' });
+    const rack1 = await store.createGroup({ tenantId: DEFAULT_TENANT_ID, name: 'rack1', description: '' });
     await store.addMember(rack1.id, va1.id);
     await store.createGrant({ userId: null, groupId: rack1.id, scopeType: 'rack', scopeValue: '1', level: 'view' });
     await store.createGrant({ userId: va1.id, groupId: null, scopeType: 'device', scopeValue: 'udid-r1-mini', level: 'operate' });
@@ -173,7 +173,7 @@ test('creating and changing schedules needs operate on that phone', async (conte
     assert.ok(!f.scheduler.calls.some((call) => call.includes('s-r2-mini') || call.includes('e-loose') || call.includes('e-r1-se')));
 });
 
-test('device setup, registration, team and asset deletion are admin-only', async (context) => {
+test('device setup and registration are platform-only; team and asset deletion need an admin', async (context) => {
     const f = await farm();
     context.after(() => f.app.close());
     const refusals: Array<[string, string, unknown?]> = [
@@ -196,10 +196,10 @@ test('device setup, registration, team and asset deletion are admin-only', async
         assert.equal(response.statusCode, 403, `${method} ${url}`);
     }
     assert.equal((await send(f, 'va1', 'PATCH', '/api/devices/udid-r2-mini', { rack: '9' })).statusCode, 404, 'an unseen phone stays a 404');
-    for (const url of ['/devices/register', '/team']) {
+    for (const [url, message] of [['/devices/register', /Platform access required/], ['/team', /Admin access required/]] as const) {
         const page = await get(f, 'va2', url, { accept: 'text/html' });
         assert.equal(page.statusCode, 403, url);
-        assert.match(page.body, /Admin access required/);
+        assert.match(page.body, message);
     }
     assert.equal(f.store.users.some(({ username }) => username === 'sneaky'), false);
     assert.deepEqual(f.scheduler.calls, []);

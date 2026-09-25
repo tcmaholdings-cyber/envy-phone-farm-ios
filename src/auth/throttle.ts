@@ -27,10 +27,17 @@ export interface LoginThrottleOptions {
 
 interface Entry { failures: number; lastFailureAt: number }
 
+/** What AccountService needs from a throttle; the in-memory one answers synchronously. */
+export interface LoginThrottleStore {
+    retryAfterMs(username: string, ip: string): number | Promise<number>;
+    recordFailure(username: string, ip: string): void | Promise<void>;
+    recordSuccess(username: string): void | Promise<void>;
+}
+
 export const DEFAULT_USERNAME_POLICY: ThrottlePolicy = { freeAttempts: 5, baseDelayMs: 30_000, maxDelayMs: 15 * 60_000 };
 export const DEFAULT_IP_POLICY: ThrottlePolicy = { freeAttempts: 20, baseDelayMs: 30_000, maxDelayMs: 15 * 60_000 };
 
-export class LoginThrottle {
+export class LoginThrottle implements LoginThrottleStore {
     private readonly entries = new Map<string, Entry>();
     private readonly usernamePolicy: ThrottlePolicy;
     private readonly ipPolicy: ThrottlePolicy;
