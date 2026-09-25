@@ -8,7 +8,7 @@ import { startHostLease } from '../hosts/lease.js';
 import type { WorkerHeartbeat } from '../observability/heartbeat.js';
 import { DeviceConnectionManager } from './connection-manager.js';
 import { localHostId } from './host-identity.js';
-import { closeDeviceRegistry, registryKind } from './registry.js';
+import { closeDeviceRegistry, loadRegisteredDevices, registryKind } from './registry.js';
 import { createWdaServiceHttpServer } from './wda-service-http.js';
 import { WdaLogStore, wdaLogOptionsFromEnv } from './wda-log.js';
 import { requestWdaService } from './wda-service-client.js';
@@ -17,6 +17,11 @@ import { wdaServiceSocketPath } from './wda-service-protocol.js';
 const socketPath = wdaServiceSocketPath();
 const lockPath = `${socketPath}.lock`;
 await mkdir(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+
+// Fail before taking the lock on a bad PHONE_FARM_HOST_ID / PHONE_FARM_REGISTRY or
+// an unreachable / unmigrated shared registry, rather than polling it forever.
+localHostId();
+if (registryKind() === 'postgres') await loadRegisteredDevices();
 
 function delay(milliseconds: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));

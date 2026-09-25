@@ -9,7 +9,8 @@ import { assertSafeAgentBind, startAgentListener } from '../agent/listener.js';
 import { createTikTokPlugin } from '../tiktok-plugin.js';
 import { defaultDashboardTheme } from '../dashboard-theme.js';
 import { DeviceRegistrationService } from '../devices/registration.js';
-import { closeDeviceRegistry } from '../devices/registry.js';
+import { closeDeviceRegistry, loadRegisteredDevices, registryKind } from '../devices/registry.js';
+import { localHostId } from '../devices/host-identity.js';
 import { createApp, type DashboardTheme } from './app.js';
 
 export interface StartServerOptions {
@@ -37,6 +38,10 @@ export async function startServer(options: StartServerOptions = {}) {
     // bind and checked before anything starts: never a wildcard address, never
     // without a strong PHONE_FARM_AGENT_TOKEN.
     const agentBind = process.env.PHONE_FARM_AGENT_BIND?.trim() ? assertSafeAgentBind(process.env.PHONE_FARM_AGENT_BIND) : null;
+    // Fail at startup, not on the first request, on a bad PHONE_FARM_REGISTRY /
+    // PHONE_FARM_HOST_ID or a shared registry that is unreachable or unmigrated.
+    localHostId();
+    if (registryKind() === 'postgres') await loadRegisteredDevices();
     const plugins = new PluginRegistry(loadedPlugins);
     const scheduler = await createSchedulerRuntime(plugins);
     const registrations = new DeviceRegistrationService();
