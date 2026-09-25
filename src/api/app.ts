@@ -712,9 +712,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         await options.registrations.cancel(request.params.id);
         return reply.code(204).send();
     });
-    app.post<{ Body: { name?: string; udid?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinateProfile?: string; rackSlot?: string; rack?: string; model?: string; pluginData?: Record<string, JsonObject> } }>(
+    app.post<{ Body: { name?: string; udid?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinateProfile?: string; rackSlot?: string; rack?: string; model?: string; signingTeam?: string; pluginData?: Record<string, JsonObject> } }>(
         '/api/devices', async (request, reply) => {
-            const { name, udid, wdaLocalPort, mjpegLocalPort, passcode, coordinateProfile, rackSlot, rack, model, pluginData } = request.body;
+            const { name, udid, wdaLocalPort, mjpegLocalPort, passcode, coordinateProfile, rackSlot, rack, model, signingTeam, pluginData } = request.body;
             if (!udid) return reply.code(400).send({ error: 'A device UDID is required' });
             if (passcode !== undefined && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
@@ -730,6 +730,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     ...(rackSlot !== undefined ? { rackSlot } : {}),
                     ...(rack !== undefined ? { rack: String(rack) } : {}),
                     ...(model !== undefined ? { model: String(model) } : {}),
+                    ...(signingTeam !== undefined ? { signingTeam: String(signingTeam) } : {}),
                     ...(passcode !== undefined ? { passcode } : {}),
                 };
                 devices.push(device);
@@ -738,9 +739,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             return reply.code(201).send(redactDevice(created));
         },
     );
-    app.patch<{ Params: { udid: string }; Body: { name?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinates?: unknown; disabled?: boolean; coordinateProfile?: string; rackSlot?: string; rack?: string; model?: string; pluginData?: Record<string, JsonObject> } }>(
+    app.patch<{ Params: { udid: string }; Body: { name?: string; wdaLocalPort?: number; mjpegLocalPort?: number; passcode?: string; coordinates?: unknown; disabled?: boolean; coordinateProfile?: string; rackSlot?: string; rack?: string; model?: string; signingTeam?: string; pluginData?: Record<string, JsonObject> } }>(
         '/api/devices/:udid', async (request, reply) => {
-            const { passcode, coordinates, name, wdaLocalPort, mjpegLocalPort, disabled, coordinateProfile, rackSlot, rack, model, pluginData } = request.body;
+            const { passcode, coordinates, name, wdaLocalPort, mjpegLocalPort, disabled, coordinateProfile, rackSlot, rack, model, signingTeam, pluginData } = request.body;
             if (passcode !== undefined && passcode !== '' && !PASSCODE_PATTERN.test(passcode)) {
                 return reply.code(400).send({ error: 'Device passcode must contain at least four digits' });
             }
@@ -759,6 +760,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 // rack / model: same rule — a value sets it, '' clears it
                 if (rack !== undefined) device.rack = String(rack);
                 if (model !== undefined) device.model = String(model);
+                // signingTeam: a value sets it (upper-cased), '' goes back to the host default
+                if (signingTeam !== undefined) device.signingTeam = String(signingTeam);
                 if (pluginData !== undefined) device.pluginData = pluginData;
                 if (disabled === true) device.disabled = true;
                 else if (disabled === false) delete device.disabled;

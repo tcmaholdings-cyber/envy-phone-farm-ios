@@ -15,22 +15,54 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
 }
 
 /**
+ * The env var holding a signing team's prebuilt WDA: `WDA_XCTESTRUN_<TEAM>`,
+ * with the team upper-cased and anything but letters, digits and `_` as `_`.
+ */
+export function signingTeamXctestrunKey(signingTeam: string): string {
+    return `WDA_XCTESTRUN_${signingTeam.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_')}`;
+}
+
+export interface WdaLaunchOptions {
+    /** The phone's Apple signing team (`signingTeam` in the registry); absent means the host default. */
+    signingTeam?: string;
+}
+
+/**
+ * Which prebuilt `.xctestrun` launches WDA for a phone: its team's
+ * `WDA_XCTESTRUN_<TEAM>` when set, else the host-wide `WDA_XCTESTRUN`, else
+ * none (build from the project). Apple caps a Team at 100 devices per
+ * membership year, so a large farm runs several Teams side by side and each
+ * phone must launch the build whose profile lists its UDID.
+ */
+export function xctestrunFor(env: NodeJS.ProcessEnv, signingTeam?: string): string | undefined {
+    if (signingTeam?.trim()) {
+        const specific = env[signingTeamXctestrunKey(signingTeam)];
+        if (specific) return specific;
+    }
+    return env.WDA_XCTESTRUN || undefined;
+}
+
+/**
  * The `xcodebuild test-without-building` arguments that launch WDA on one device.
  *
- * With WDA_XCTESTRUN set, the host runs a WDA build that was signed on another
- * Mac (`wda:prepare -- --generic`, then copied over): no Team, signing identity
- * or Apple ID is needed here, only Xcode to install and launch it.
+ * With WDA_XCTESTRUN (or the phone's team's WDA_XCTESTRUN_<TEAM>) set, the host
+ * runs a WDA build that was signed on another Mac (`wda:prepare -- --generic`,
+ * then copied over): no Team, signing identity or Apple ID is needed here, only
+ * Xcode to install and launch it. Without one, WDA is built from the project
+ * signed by the phone's team (a real Team ID then) or XCODE_ORG_ID.
  */
-export function wdaLaunchArgs(env: NodeJS.ProcessEnv, udid: string, projectPath: string): string[] {
-    if (env.WDA_XCTESTRUN) {
-        return ['test-without-building', '-xctestrun', env.WDA_XCTESTRUN, '-destination', `id=${udid}`];
+export function wdaLaunchArgs(env: NodeJS.ProcessEnv, udid: string, projectPath: string, options: WdaLaunchOptions = {}): string[] {
+    const xctestrun = xctestrunFor(env, options.signingTeam);
+    if (xctestrun) {
+        return ['test-without-building', '-xctestrun', xctestrun, '-destination', `id=${udid}`];
     }
+    const team = options.signingTeam?.trim() || required(env, 'XCODE_ORG_ID');
     return [
         'test-without-building',
         '-project', projectPath,
         '-scheme', 'WebDriverAgentRunner',
         '-destination', `id=${udid}`,
-        ...buildSettings(env, required(env, 'XCODE_ORG_ID'), required(env, 'WDA_BUNDLE_ID')),
+        ...buildSettings(env, team, required(env, 'WDA_BUNDLE_ID')),
     ];
 }
 

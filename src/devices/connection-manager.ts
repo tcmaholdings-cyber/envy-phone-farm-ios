@@ -46,6 +46,8 @@ interface RuntimeState {
     status: DeviceConnectionStatus;
     child?: ChildProcess;
     retryAt: number;
+    /** The signing team the running supervisor was launched with. */
+    spawnedTeam?: string;
 }
 
 interface ManagerOptions {
@@ -85,16 +87,29 @@ async function defaultEndpointReady(url: string): Promise<boolean> {
     }
 }
 
+/**
+ * The environment one phone's WDA supervisor (wda/start.ts) runs with: its
+ * UDID, its forwarded ports and its signing team, which picks the prebuilt
+ * WDA (`WDA_XCTESTRUN_<TEAM>`, see wda/runner-args.ts). The team is always
+ * set, empty for the host default, so an inherited value never leaks in.
+ */
+export function supervisorEnvironment(device: RegisteredDevice, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+    return {
+        ...env,
+        IOS_UDID: device.udid,
+        WDA_LOCAL_PORT: String(device.wdaLocalPort ?? Number(env.WDA_LOCAL_PORT ?? 8100)),
+        MJPEG_LOCAL_PORT: String(device.mjpegLocalPort ?? Number(env.MJPEG_LOCAL_PORT ?? 9100)),
+        WDA_SIGNING_TEAM: device.signingTeam ?? '',
+    };
+}
+
 function defaultSpawnSupervisor(device: RegisteredDevice): ChildProcess {
     const script = fileURLToPath(new URL('./wda/start.ts', import.meta.url));
+    // --env-file-if-exists does not override values already in the environment,
+    // so the per-phone ones below win over .env.
     return spawn(process.execPath, ['--env-file-if-exists=.env', '--env-file-if-exists=.env.devices', '--import', 'tsx', script], {
         cwd: process.cwd(),
-        env: {
-            ...process.env,
-            IOS_UDID: device.udid,
-            WDA_LOCAL_PORT: String(device.wdaLocalPort ?? Number(process.env.WDA_LOCAL_PORT ?? 8100)),
-            MJPEG_LOCAL_PORT: String(device.mjpegLocalPort ?? Number(process.env.MJPEG_LOCAL_PORT ?? 9100)),
-        },
+        env: supervisorEnvironment(device),
         stdio: ['ignore', 'pipe', 'pipe'],
     });
 }
@@ -177,6 +192,11 @@ export class DeviceConnectionManager implements DeviceConnections {
             await Promise.all(devices.map(async (device) => {
                 const runtime = this.runtimes.get(device.udid) ?? this.createRuntime(device);
                 runtime.device = device;
+                // A new signing team means a different WDA build: relaunch with it.
+                if (runtime.child && runtime.spawnedTeam !== (device.signingTeam ?? '')) {
+                    await this.stopChild(runtime);
+                    runtime.retryAt = 0;
+                }
                 this.setPhysical(runtime, attached.has(device.udid) ? 'connected' : 'disconnected');
                 if (!runtime.child && this.now() >= runtime.retryAt) this.startChild(runtime);
                 const wdaPort = device.wdaLocalPort ?? Number(process.env.WDA_LOCAL_PORT ?? 8100);
@@ -264,6 +284,7 @@ export class DeviceConnectionManager implements DeviceConnections {
         if (runtime.child || this.closing) return;
         try {
             const child = this.spawnSupervisor(runtime.device);
+            runtime.spawnedTeam = runtime.device.signingTeam ?? '';
             runtime.child = child;
             this.update(runtime, runtime.status.physical === 'connected' ? 'connecting' : 'disconnected',
                 runtime.status.physical === 'connected' ? 'Starting WDA' : 'Waiting for the USB cable');

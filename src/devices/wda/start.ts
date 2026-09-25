@@ -7,7 +7,7 @@ import path from 'node:path';
 import { diagnoseWdaLaunchFailure, wdaUnavailableTooLong } from './diagnostics.js';
 import { resolveDeveloperDir } from './xcode-env.js';
 import { resolveTargetUdid } from './target-device.js';
-import { wdaLaunchArgs } from './runner-args.js';
+import { signingTeamXctestrunKey, wdaLaunchArgs, xctestrunFor } from './runner-args.js';
 import { LineSplitter } from '../wda-log.js';
 
 function delay(milliseconds: number): Promise<void> {
@@ -38,7 +38,13 @@ const remotePort = Number.parseInt(process.env.WDA_REMOTE_PORT ?? '8100', 10);
 const mjpegLocalPort = Number.parseInt(process.env.MJPEG_LOCAL_PORT ?? '9100', 10);
 const mjpegRemotePort = Number.parseInt(process.env.MJPEG_REMOTE_PORT ?? '9100', 10);
 
-await access(process.env.WDA_XCTESTRUN ?? projectPath);
+// The phone's Apple signing team (wda-service passes WDA_SIGNING_TEAM from the registry).
+const signingTeam = process.env.WDA_SIGNING_TEAM?.trim() || undefined;
+const xctestrun = xctestrunFor(process.env, signingTeam);
+if (signingTeam && xctestrun && !process.env[signingTeamXctestrunKey(signingTeam)]) {
+    console.log(`Signing team ${signingTeam} has no ${signingTeamXctestrunKey(signingTeam)}; launching the host default WDA_XCTESTRUN`);
+}
+await access(xctestrun ?? projectPath);
 if (![localPort, remotePort, mjpegLocalPort, mjpegRemotePort].every(Number.isSafeInteger)) {
     throw new Error('WDA and MJPEG port values must be integers');
 }
@@ -122,7 +128,7 @@ const deviceConnections: DeviceConnections = factoryModule.DEVICE_CONNECTIONS_FA
     })();
 const { utilities } = require('appium-ios-device') as { utilities: IosUtilities };
 
-const args = wdaLaunchArgs(process.env, udid, projectPath);
+const args = wdaLaunchArgs(process.env, udid, projectPath, { signingTeam });
 
 let child: ChildProcess | undefined;
 let forwarding = false;

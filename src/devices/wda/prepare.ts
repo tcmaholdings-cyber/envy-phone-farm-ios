@@ -3,7 +3,7 @@ import { access, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { wdaBuildArgs } from './runner-args.js';
+import { signingTeamXctestrunKey, wdaBuildArgs } from './runner-args.js';
 import { resolveDeveloperDir } from './xcode-env.js';
 import { resolveBuildTargets } from './target-device.js';
 
@@ -68,17 +68,24 @@ const xcodeEnv = { env: { ...process.env, DEVELOPER_DIR: developerDir } };
 // `--generic [dir]` signs one build for every device registered on the Team
 // (no phone attached) so it can be copied to another host and run there with
 // WDA_XCTESTRUN; see docs/operations.md.
+// `--team <TEAMID>` signs that generic build with another Apple Team than
+// XCODE_ORG_ID (Apple allows 100 devices per Team; phones carry `signingTeam`),
+// into `.wda/prebuilt-<TEAMID>`, to be launched through WDA_XCTESTRUN_<TEAMID>.
 const genericIndex = process.argv.indexOf('--generic');
 if (genericIndex !== -1) {
     const next = process.argv[genericIndex + 1];
-    const derivedDataPath = path.resolve(next && !next.startsWith('--') ? next : '.wda/prebuilt');
-    await run('xcodebuild', wdaBuildArgs(process.env, projectPath, { generic: true, derivedDataPath }), xcodeEnv);
+    const teamIndex = process.argv.indexOf('--team');
+    const team = teamIndex !== -1 ? process.argv[teamIndex + 1]?.trim().toUpperCase() : undefined;
+    if (teamIndex !== -1 && !(team && /^[A-Z0-9]{10}$/.test(team))) throw new Error('--team needs an Apple Team ID (10 letters/digits)');
+    const derivedDataPath = path.resolve(next && !next.startsWith('--') ? next : team ? `.wda/prebuilt-${team}` : '.wda/prebuilt');
+    const buildEnv = team ? { ...process.env, XCODE_ORG_ID: team } : process.env;
+    await run('xcodebuild', wdaBuildArgs(buildEnv, projectPath, { generic: true, derivedDataPath }), xcodeEnv);
     const products = path.join(derivedDataPath, 'Build/Products');
     const xctestrun = (await readdir(products)).find((name) => name.endsWith('.xctestrun'));
     if (!xctestrun) throw new Error(`No .xctestrun was produced in ${products}`);
     console.log(`\nSigned WDA build: ${products}`);
     console.log('Copy that Build/Products folder to the phone host and set there:');
-    console.log(`WDA_XCTESTRUN=<copied folder>/${xctestrun}`);
+    console.log(`${team ? signingTeamXctestrunKey(team) : 'WDA_XCTESTRUN'}=<copied folder>/${xctestrun}`);
     process.exit(0);
 }
 
