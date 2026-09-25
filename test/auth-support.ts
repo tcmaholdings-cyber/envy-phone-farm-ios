@@ -292,6 +292,7 @@ export async function createAuthApp(options: {
     const { createBuiltinAuthProvider } = await import('../src/auth/builtin.js');
     const { LoginThrottle } = await import('../src/auth/throttle.js');
     const { TenantService } = await import('../src/auth/tenants.js');
+    const { MemoryAuditLog } = await import('../src/auth/audit.js');
     const { defaultDashboardTheme } = await import('../src/dashboard-theme.js');
     const { PluginRegistry } = await import('../src/registry.js');
     const { createTikTokPlugin } = await import('../src/tiktok-plugin.js');
@@ -304,7 +305,8 @@ export async function createAuthApp(options: {
         throttle: new LoginThrottle({ now: () => clock.now().getTime() }),
     });
     const tenants = new TenantService(tenantStore);
-    const provider = createBuiltinAuthProvider(accounts, undefined, { tenants });
+    const auditLog = new MemoryAuditLog();
+    const provider = createBuiltinAuthProvider(accounts, undefined, { tenants, auditLog });
     const scheduler = fakeScheduler(options.schedules, options.executions, async (udid) => tenantStore.assignments.get(udid) ?? DEFAULT_TENANT_ID);
     const remote = fakeRemote();
     const registrations = {
@@ -319,9 +321,11 @@ export async function createAuthApp(options: {
         discoverDevices: async () => [], wdaStatuses: async () => [],
         ...options.extra,
     });
-    accounts.audit = (event) => audit.push(event);
-    tenants.audit = (event) => audit.push(event);
-    return { app, store, tenantStore, tenants, accounts, provider, scheduler, remote, clock, audit };
+    // Record events for the test while still passing them on to the dashboard's audit log.
+    const forward = accounts.audit;
+    accounts.audit = (event) => { audit.push(event); forward(event); };
+    tenants.audit = (event) => { audit.push(event); forward(event); };
+    return { app, store, tenantStore, tenants, accounts, provider, scheduler, remote, clock, audit, auditLog };
 }
 
 /** A live session for `userId` without going through the sign-in form: returns the cookie value. */

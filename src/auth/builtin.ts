@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { createDatabaseConnection } from '../database/client.js';
 import type { AuthenticatedUser, AuthProvider } from '../plugin.js';
 import { AccountService, type ResolvedSession } from './accounts.js';
+import { PgAuditLog, type AuditLog } from './audit.js';
 import { isHttpsRequest } from './net.js';
 import { PgAuthStore, PgTenantStore } from './pg-store.js';
 import { TenantService } from './tenants.js';
@@ -30,6 +31,8 @@ export interface BuiltinAuthProvider extends AuthProvider {
     readonly accounts: AccountService;
     /** Tenants and phone ownership; absent means one tenant owns everything. */
     readonly tenants?: TenantService;
+    /** Where audit rows go (auth.audit_log); absent means the server log only. */
+    readonly auditLog?: AuditLog;
     /** The resolved session for this request, when `authenticate` found one. */
     sessionOf(request: FastifyRequest): ResolvedSession | undefined;
 }
@@ -65,6 +68,7 @@ export function authenticatedUserFrom(resolved: ResolvedSession): AuthenticatedU
 
 export interface BuiltinProviderExtras {
     tenants?: TenantService;
+    auditLog?: AuditLog;
 }
 
 export function createBuiltinAuthProvider(accounts: AccountService, onClose?: () => Promise<void>, extras: BuiltinProviderExtras = {}): BuiltinAuthProvider {
@@ -73,6 +77,7 @@ export function createBuiltinAuthProvider(accounts: AccountService, onClose?: ()
         id: 'builtin',
         accounts,
         ...(extras.tenants ? { tenants: extras.tenants } : {}),
+        ...(extras.auditLog ? { auditLog: extras.auditLog } : {}),
         loginPath: LOGIN_PATH,
         logoutPath: LOGOUT_PATH,
         logoutMethod: 'POST',
@@ -115,5 +120,7 @@ export async function createBuiltinAuthProviderFromEnv(): Promise<BuiltinAuthPro
         ...(Number.isFinite(idle) && idle > 0 ? { idleTimeoutMs: idle * 60 * 60_000 } : {}),
         ...(Number.isFinite(absolute) && absolute > 0 ? { absoluteTimeoutMs: absolute * 24 * 60 * 60_000 } : {}),
     });
-    return createBuiltinAuthProvider(accounts, () => connection.close(), { tenants: new TenantService(tenantStore) });
+    return createBuiltinAuthProvider(accounts, () => connection.close(), {
+        tenants: new TenantService(tenantStore), auditLog: new PgAuditLog(connection),
+    });
 }

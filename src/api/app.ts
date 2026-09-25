@@ -9,7 +9,9 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 
 import { FULL_ACCESS, requestAccessFor, type RequestAccess } from '../auth/access.js';
+import type { AuditLog } from '../auth/audit.js';
 import { isBuiltinAuthProvider } from '../auth/builtin.js';
+import { clientIp } from '../auth/net.js';
 import { levelSatisfies, type AccessLevel } from '../auth/policy.js';
 import { SINGLE_TENANT, type DeviceTenants } from '../auth/tenants.js';
 import { buildRouteRequirements, routeKey, type RouteRequirement } from '../auth/route-access.js';
@@ -66,6 +68,8 @@ export interface CreateAppOptions {
     hosts?: HostDirectory;
     /** Multi-host test seam: the fetch used to call other hosts' agents. */
     agentFetch?: typeof fetch;
+    /** Where audit rows go; defaults to the built-in provider's (auth.audit_log), else the server log. */
+    auditLog?: AuditLog | null;
 }
 
 /** What GET /agent/status answers: this host's phones with their USB and WDA state. */
@@ -250,7 +254,8 @@ function wantsPage(request: FastifyRequest): boolean {
 
 
 export async function createApp(options: CreateAppOptions): Promise<FastifyInstance> {
-    const app = Fastify({ logger: options.logger ?? false, bodyLimit: 50 * 1024 * 1024 });
+    // Random request ids: they are what ties an audit row to the server log, across web replicas.
+    const app = Fastify({ logger: options.logger ?? false, bodyLimit: 50 * 1024 * 1024, genReqId: () => crypto.randomUUID() });
     const routes: RegisteredRoute[] = [];
     const requirements = buildRouteRequirements(options.plugins.list());
     appRoutes.set(app, { routes, requirements });
@@ -262,6 +267,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     // One uploaded file: PHONE_FARM_MAX_UPLOAD_BYTES, default 200 MiB. A bigger
     // file fails the request with 413; each tenant also has a total budget.
     await app.register(multipart, { limits: { fileSize: maxUploadBytes(), files: 20 } });
+
+    app.addHook('onRequest', async (request, reply) => { reply.header('x-request-id', request.id); });
 
     // Server-rendered HTML must never be cached — a stale page + fresh assets
     // (or vice versa) breaks the dashboard after a deploy.
@@ -339,6 +346,45 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         });
     }
 
+    // The audit log: one row per state-changing request, after the response,
+    // with the outcome. Route pattern and ids only — never the body, the query
+    // string or typed text (src/auth/audit.ts). A failed write is logged, not
+    // turned into a failed request.
+    const auditLog = options.auditLog !== undefined ? options.auditLog : isBuiltinAuthProvider(provider) ? provider.auditLog ?? null : null;
+    const stringParam = (value: unknown) => (typeof value === 'string' && value ? value : null);
+    app.addHook('onResponse', async (request, reply) => {
+        if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return;
+        try {
+            const user = requestUsers.get(request);
+            const access = user ? accessOf(request) : null;
+            const params = (request.params ?? {}) as Record<string, unknown>;
+            const body = (request.body && typeof request.body === 'object' ? request.body : {}) as Record<string, unknown>;
+            const route = request.routeOptions.url ?? null;
+            const targetUdid = stringParam(params.udid) ?? stringParam(body.deviceUdid) ?? stringParam(body.udid);
+            const assetIds = Array.isArray(body.assetIds) ? body.assetIds.filter((id): id is string => typeof id === 'string') : [];
+            const targetIds = [stringParam(params.id), stringParam(params.userId), ...assetIds].filter((id): id is string => Boolean(id));
+            // A tenant user's rows are their tenant's. Platform staff acting on a
+            // tenant's phone are recorded under that tenant, so its admin sees it.
+            let tenantId = access?.tenantId ?? null;
+            if (access?.platform) tenantId = targetUdid ? (await deviceTenants()).tenantOf(targetUdid) : tenantFilter(request) ?? null;
+            const remoteAction = route === '/api/devices/:udid/remote/action';
+            const actionType = typeof body.type === 'string' && /^[A-Za-z]{1,20}$/.test(body.type) ? body.type : null;
+            const entry = {
+                tenantId, actorUserId: user?.id ?? null,
+                actorRole: user ? user.access?.role ?? user.roles[0] ?? null : null,
+                ip: clientIp(request) || null, method: request.method, route,
+                event: remoteAction ? 'remote.action' : 'http',
+                targetUdid, targetIds: targetIds.length ? targetIds : null, status: reply.statusCode, requestId: request.id,
+                // The action's kind (tap, swipe, type…) only; never coordinates or typed text.
+                detail: remoteAction && actionType ? `action=${actionType}` : null,
+            };
+            if (auditLog) await auditLog.record(entry);
+            else request.log.info({ audit: entry }, 'audit');
+        } catch (error) {
+            request.log.warn({ error: errorMessage(error) }, 'audit write failed');
+        }
+    });
+
     // Authorization, centrally: every route is looked up in the requirement
     // table (src/auth/route-access.ts). Admins, and users of a provider without
     // scoped access, pass straight through; operators are checked against the
@@ -359,15 +405,23 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const [devices, owners] = await Promise.all([loadRegisteredDevices(), deviceTenants()]);
         return devices.map((device) => ({ ...device, tenantId: owners.tenantOf(device.udid) }));
     };
-    const authorizeDevice = async (
+    /**
+     * Refuse (and answer) unless the caller has `level` on the phone. True when
+     * refused. A boolean, not the reply: a Fastify reply is thenable, so
+     * awaiting one would resolve to undefined and hide that it was sent.
+     */
+    const refuseDevice = async (
         request: FastifyRequest, reply: FastifyReply, access: RequestAccess, udid: unknown, level: AccessLevel, notFound = 'Device not found',
-    ) => {
+    ): Promise<boolean> => {
         const device = typeof udid === 'string' && udid ? (await loadOwnedDevices()).find((entry) => entry.udid === udid) : undefined;
         const granted = device ? access.levelFor(device) : null;
-        if (!granted) return deny(request, reply, 404, notFound);
-        if (!levelSatisfies(granted, level)) return deny(request, reply, 403, 'You have view-only access to this phone');
-        return undefined;
+        if (!granted) { deny(request, reply, 404, notFound); return true; }
+        if (!levelSatisfies(granted, level)) { deny(request, reply, 403, 'You have view-only access to this phone'); return true; }
+        return false;
     };
+    const authorizeDevice = async (
+        request: FastifyRequest, reply: FastifyReply, access: RequestAccess, udid: unknown, level: AccessLevel, notFound?: string,
+    ) => ((await refuseDevice(request, reply, access, udid, level, notFound)) ? reply : undefined);
     if (provider) {
         app.addHook('preHandler', async (request, reply) => {
             const url = request.routeOptions.url;
@@ -395,8 +449,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     if (keys.length && keys.every((key) => key === 'coordinates')) {
                         return authorizeDevice(request, reply, access, params.udid, 'operate');
                     }
-                    const refused = await authorizeDevice(request, reply, access, params.udid, 'view');
-                    return refused ?? deny(request, reply, 403, 'Only platform staff can change device settings');
+                    if (await refuseDevice(request, reply, access, params.udid, 'view')) return reply;
+                    return deny(request, reply, 403, 'Only platform staff can change device settings');
                 }
                 case 'schedule-create':
                     return authorizeDevice(request, reply, access, body.deviceUdid, 'operate');
@@ -530,6 +584,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const access = accessOf(request);
         if (teamEnabled && (access.platform || access.tenantAdmin)) {
             parts.push(`<a class="nav-link" href="/team"${current === '/team' ? ' aria-current="page"' : ''}>Team</a>`);
+            parts.push(`<a class="nav-link" href="/audit"${current === '/audit' ? ' aria-current="page"' : ''}>Audit</a>`);
         }
         if (user.displayName) parts.push(`<span class="nav-user">${escapeHtml(user.displayName)}</span>`);
         const logoutPath = provider.logoutPath;
@@ -1555,7 +1610,16 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             provider, renderShell, accessOf,
             loadDevices: loadOwnedDevices,
             tenantOfDevice: async (udid) => (await deviceTenants()).tenantOf(udid),
-            log: (event) => app.log.info({ audit: event }, `audit ${event.event}`),
+            auditLog,
+            log: (event) => {
+                app.log.info({ audit: event }, `audit ${event.event}`);
+                void auditLog?.record({
+                    tenantId: event.tenantId ?? null, actorUserId: event.actorId ?? null, actorRole: event.actorRole ?? null,
+                    ip: event.ip ?? null, method: null, route: null, event: event.event, targetUdid: null, targetIds: null,
+                    status: null, requestId: null,
+                    detail: [event.actor ? `actor=${event.actor}` : '', event.target ? `target=${event.target}` : '', event.detail ?? ''].filter(Boolean).join(' ') || null,
+                }).catch((error: unknown) => app.log.warn({ error: errorMessage(error) }, 'audit write failed'));
+            },
         });
     }
 

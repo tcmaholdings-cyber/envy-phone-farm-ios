@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { RegisteredDevice } from '../devices/registry.js';
 import { escapeHtml, jsonForScript } from '../html.js';
 import type { RequestAccess } from './access.js';
+import { auditCsv, type AuditEntry, type AuditLog } from './audit.js';
 import { AccountError, type Actor, type AuditEvent, type PublicUser, type TeamSnapshot } from './accounts.js';
 import {
     clearSessionCookie, LOGIN_PATH, LOGOUT_PATH, PASSWORD_PATH, SESSION_COOKIE, setSessionCookie, type BuiltinAuthProvider,
@@ -43,6 +44,8 @@ export interface BuiltinRouteContext {
     accessOf(request: FastifyRequest): RequestAccess;
     loadDevices(): Promise<OwnedDevice[]>;
     tenantOfDevice(udid: string): Promise<string>;
+    /** The audit log to read back on /audit; null means rows only reach the server log. */
+    auditLog: AuditLog | null;
     log(event: AuditEvent): void;
 }
 
@@ -185,6 +188,23 @@ ${groupChoices ? `<fieldset data-create-only><legend>Groups</legend><div class="
 <div class="field"><label for="group-description">Description <small>(optional)</small></label><input id="group-description" name="description" type="text" maxlength="200"></div>
 <p id="group-result" class="field-error" aria-live="polite"></p>
 <div class="form-actions"><span class="spacer"></span><button class="button secondary" type="button" data-close>Cancel</button><button class="button primary" type="submit">Save</button></div></form></dialog>`;
+}
+
+/** The audit page body. Exported for tests; every value is escaped here. */
+export function renderAuditMain(entries: readonly AuditEntry[], options: {
+    names: ReadonlyMap<string, string>; tenants: ReadonlyMap<string, string>; showTenant: boolean; olderHref: string | null; csvHref: string;
+}): string {
+    const cell = (value: string | null | undefined) => (value ? escapeHtml(value) : '<span class="muted">—</span>');
+    const rows = entries.map((entry) => {
+        const who = entry.actorUserId ? options.names.get(entry.actorUserId) ?? `${entry.actorRole ?? 'user'} (not in this organisation)` : entry.actorRole;
+        const target = [entry.targetUdid, ...(entry.targetIds ?? [])].filter(Boolean).join(' · ');
+        const what = entry.event === 'http' ? `${entry.method ?? ''} ${entry.route ?? '(no route)'}` : entry.event;
+        const outcome = entry.status === null ? '' : `<span class="status ${entry.status < 400 ? 'active' : 'paused'}"><span class="dot"></span>${entry.status}</span>`;
+        return `<tr><td>${isoTime(entry.at)}</td>${options.showTenant ? `<td>${cell(entry.tenantId ? options.tenants.get(entry.tenantId) ?? entry.tenantId : 'platform')}</td>` : ''}<td>${cell(who)}</td><td><code>${escapeHtml(what)}</code>${entry.detail ? `<p class="cell-note">${escapeHtml(entry.detail)}</p>` : ''}</td><td>${cell(target)}</td><td>${outcome}</td><td>${cell(entry.ip)}</td></tr>`;
+    }).join('');
+    const columns = options.showTenant ? 7 : 6;
+    return `<header class="page-header"><div><span class="eyebrow">Access</span><h1>Audit log</h1><p>Every change made through the dashboard or the API, newest first: who, from where, what, and whether it worked. Request bodies, passwords and typed text are never recorded.</p></div><div class="page-actions"><a class="button secondary" href="${escapeHtml(options.csvHref)}">Download CSV</a></div></header>
+<section class="panel team-section"><div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">When</th>${options.showTenant ? '<th scope="col">Organisation</th>' : ''}<th scope="col">Who</th><th scope="col">What</th><th scope="col">Target</th><th scope="col">Result</th><th scope="col">IP</th></tr></thead><tbody>${rows || `<tr><td colspan="${columns}" class="muted">Nothing recorded yet.</td></tr>`}</tbody></table></div>${options.olderHref ? `<p><a class="button secondary" href="${escapeHtml(options.olderHref)}">Older entries</a></p>` : ''}</section>`;
 }
 
 function authCard(title: string, eyebrow: string, intro: string, inner: string): string {
@@ -365,6 +385,60 @@ export function registerBuiltinAuthRoutes(app: FastifyInstance, context: Builtin
     app.delete<{ Params: { id: string } }>('/api/team/grants/:id', async (request, reply) => {
         await accounts.deleteGrant(actorOf(request), request.params.id);
         return reply.code(204).send();
+    });
+
+    // ---------- audit log (tenant admins: their tenant; platform staff: all, or ?tenant=) ----------
+
+    const auditQuery = (request: FastifyRequest, csv: boolean) => {
+        const access = context.accessOf(request);
+        const query = (request.query ?? {}) as Record<string, unknown>;
+        const limit = Number(query.limit);
+        const before = Number(query.before);
+        const tenant = query.tenant;
+        return {
+            // A tenant admin always gets their own tenant, whatever they ask for.
+            tenantId: access.platform ? (tenant === 'platform' ? null : typeof tenant === 'string' && tenant ? tenant : undefined) : access.tenantId ?? '',
+            limit: Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, csv ? 10_000 : 500) : csv ? 10_000 : 100,
+            ...(Number.isSafeInteger(before) && before > 0 ? { before } : {}),
+        };
+    };
+    const readAudit = async (request: FastifyRequest, csv: boolean) => {
+        const query = auditQuery(request, csv);
+        const entries = context.auditLog ? await context.auditLog.list(query) : [];
+        return { query, entries, nextBefore: entries.length === query.limit ? entries.at(-1)!.id : null };
+    };
+
+    app.get('/api/audit', async (request, reply) => {
+        const csv = (request.query as { format?: unknown } | undefined)?.format === 'csv';
+        const { entries, nextBefore } = await readAudit(request, csv);
+        reply.header('cache-control', 'no-store');
+        if (!csv) return reply.send({ entries, nextBefore });
+        const day = new Date().toISOString().slice(0, 10);
+        return reply.type('text/csv; charset=utf-8').header('content-disposition', `attachment; filename="audit-${day}.csv"`).send(auditCsv(entries));
+    });
+
+    app.get('/audit', async (request, reply) => {
+        const access = context.accessOf(request);
+        const { query, entries, nextBefore } = await readAudit(request, false);
+        const [users, tenants] = await Promise.all([
+            accounts.store.listUsers(access.platform ? undefined : access.tenantId ?? ''),
+            access.platform && provider.tenants ? provider.tenants.list() : Promise.resolve([]),
+        ]);
+        const keep = new URLSearchParams();
+        if (typeof query.tenantId === 'string') keep.set('tenant', query.tenantId);
+        else if (query.tenantId === null) keep.set('tenant', 'platform');
+        const older = nextBefore ? new URLSearchParams(keep) : null;
+        older?.set('before', String(nextBefore));
+        const csv = new URLSearchParams(keep);
+        csv.set('format', 'csv');
+        return reply.header('cache-control', 'no-store').type('text/html').send(renderShell(request, {
+            title: 'Audit log', current: '/audit', bodyClass: 'page-team',
+            main: renderAuditMain(entries, {
+                names: new Map(users.map((user) => [user.id, user.username])),
+                tenants: new Map(tenants.map((tenant) => [tenant.id, tenant.slug])),
+                showTenant: access.platform, olderHref: older ? `/audit?${older}` : null, csvHref: `/api/audit?${csv}`,
+            }),
+        }));
     });
 }
 
