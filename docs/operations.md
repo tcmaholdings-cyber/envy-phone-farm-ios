@@ -13,8 +13,9 @@ launchctl list | grep $P                      # what is loaded (PID, last exit c
 launchctl kickstart -k $U/$P.web              # restart one agent (also: worker, wda-service, appium)
 launchctl bootout $U/$P.worker                # stop one until next login / bootstrap
 launchctl bootstrap $U ~/Library/LaunchAgents/$P.worker.plist   # start it again
-deploy/launchd/uninstall-agents.sh            # stop + remove all five
-deploy/launchd/install-agents.sh              # (re)install all five — idempotent
+deploy/launchd/uninstall-agents.sh            # stop + remove all agents
+deploy/launchd/install-agents.sh              # (re)install all agents — idempotent
+                                              # (+ <prefix>.heartbeat when PHONE_FARM_HEARTBEAT_URL is set)
 ```
 
 Order matters only at first boot: `db` → `appium` + `wda-service` → `worker`
@@ -28,14 +29,137 @@ Postgres: `docker compose ps`, `npm run db:up`, `docker compose stop postgres`.
 | What | How |
 | --- | --- |
 | Process logs | `tail -f logs/web.log logs/worker.log logs/wda-service.log logs/appium.log` |
-| Dashboard health | `curl -s http://127.0.0.1:3000/health` — loaded plugins + versions |
-| Per-phone state | `curl -s --unix-socket .wda/wda-service.sock http://x/health` — `physical`, `wda`, `appium`, `message` per UDID |
+| One phone's WDA / xcodebuild output | `tail -f .wda/logs/<udid>.log` (rotated `.1`–`.3`), or the last lines: `curl -s --unix-socket .wda/wda-service.sock 'http://x/devices/<udid>/logs?lines=100'` |
+| Is the process up | `curl -s http://127.0.0.1:3000/health` — `{"ok":true,"release":"<sha>"}` |
+| Is the farm ready | `curl -s http://127.0.0.1:3000/health/ready` — 200/503 with one entry per dependency |
+| Metrics | `curl -s -H "Authorization: Bearer $PHONE_FARM_METRICS_TOKEN" http://127.0.0.1:3000/metrics` |
+| Per-phone state | `curl -s --unix-socket .wda/wda-service.sock http://x/health` — `physical`, `wda`, `appium`, `message`, `restarts`, `notReadySince`, `disconnectedSince` per UDID |
+| Worker alive | `psql "$DATABASE_URL" -c "select host, pid, queues, now() - beat_at as age from scheduler.worker_heartbeats"` |
 | Phones the OS sees | `xcrun xctrace list devices` |
 | Executions | dashboard → device → *Execution history*, or `GET /api/executions?udid=…`; full log `GET /api/executions/:id` |
 | Queue depth | `psql "$DATABASE_URL" -c "select name, count(*) from pgboss.job where state in ('created','active') group by 1"` |
 
-Set up an external uptime check against `/health` (through the SSH tunnel or
-VPN) and alert if any phone is not `ready` for more than 15 minutes.
+For alerting, see *Monitoring and alerts* below.
+
+## Monitoring and alerts
+
+Three layers, from the outside in. Set up all three on every farm host.
+
+### Endpoints
+
+| Endpoint | Who can call it | Answers |
+| --- | --- | --- |
+| `GET /health` | anyone | Liveness: `{"ok":true,"release":"<sha>"}`. It only says the web process answers. |
+| `GET /health/ready` | anyone (no session) | `200` when all four checks pass, else `503`. Body: `{"ok":…,"checks":{"database","appium","wdaService","worker"}}`, each `{"ok":true}` or `{"ok":false,"reason":…}` with reason `unreachable`, `timeout`, `no heartbeat` or `stale`; `worker` also carries `ageSeconds`. The reasons are fixed words; the real error goes to `logs/web.log` as `readiness check failed`. Each check is bounded at 3 s. |
+| `GET /metrics` | `Authorization: Bearer $PHONE_FARM_METRICS_TOKEN` | Prometheus text. `404` while the token is unset, `401` for a wrong one. |
+| `GET /api/devices/:udid/wda-log?lines=N` | admins | The phone's last N (up to 1000) supervisor lines, from the wda-service. |
+
+The four readiness checks: `database` runs `select 1`; `appium` asks Appium's
+`/status` on `APPIUM_HOST:APPIUM_PORT`; `wdaService` needs the socket's
+`/health` to answer 200 (it answers 503 while starting); `worker` needs the
+freshest row in `scheduler.worker_heartbeats` to be at most
+`PHONE_FARM_WORKER_STALE_SECONDS` (60) old. The worker writes that row every
+15 s, stamped with the database clock.
+
+### Metrics
+
+| Series | Meaning |
+| --- | --- |
+| `phone_farm_phones_registered{state}` | Registered phones, `active` / `disabled`. |
+| `phone_farm_phones_usb_connected`, `phone_farm_phone_usb_connected{udid,name}` | Active phones usbmux sees (total; per phone 1 or 0). |
+| `phone_farm_wda_phones{state}` | Supervised phones per WDA state (`ready`, `connecting`, `unlock-required`, `error`, `disconnected`). |
+| `phone_farm_wda_restarts_total{udid,name}` | Times WDA on the phone failed and was relaunched since wda-service started (counter). |
+| `phone_farm_phone_wda_not_ready_seconds{udid,name}` | How long WDA has not been ready (0 while ready). |
+| `phone_farm_phone_usb_disconnected_seconds{udid,name}` | How long the phone has been off USB (0 while attached). |
+| `phone_farm_queue_depth{queue,udid,name}`, `…_deferred`, `…_active` | pg-boss jobs waiting to run now / scheduled for later / running, per device queue. |
+| `phone_farm_queue_oldest_job_age_seconds{queue,udid,name}`, `…_max` | How long the oldest runnable job has waited (per queue; worst queue). |
+| `phone_farm_queue_depth_total` | Runnable jobs across all queues. |
+| `phone_farm_executions_last_hour{status}` | Executions updated in the last hour, per status. |
+| `phone_farm_worker_heartbeat_age_seconds`, `phone_farm_worker_host_heartbeat_age_seconds{host}`, `phone_farm_worker_queues{host}` | Worker liveness and how many device queues it serves. |
+| `phone_farm_process_uptime_seconds` | Web process uptime. |
+| `phone_farm_metrics_source_up{source}` | `usb`, `wda_service`, `database`: 0 means that source failed during this scrape and its series are missing, not zero. |
+
+Scrape through the tunnel or VPN; never open the port:
+
+```yaml
+scrape_configs:
+  - job_name: phone-farm
+    scrape_interval: 30s
+    authorization: { credentials_file: /etc/prometheus/phone-farm.token }
+    static_configs: [{ targets: ['farm-mini-1:3000'] }]
+```
+
+### Off-host heartbeat (dead-man's switch)
+
+A host that crashes, sleeps or loses its network cannot send an alert, so
+something outside has to notice the silence:
+
+1. Create a check in Healthchecks.io (or a *Push* monitor in Uptime Kuma) with
+   period **1 min** and grace **2 min**. Copy its ping URL.
+2. On the host, put `PHONE_FARM_HEARTBEAT_URL=<ping url>` in `.env` and run
+   `deploy/launchd/install-agents.sh`. That adds `<prefix>.heartbeat`, which
+   runs `deploy/launchd/heartbeat.sh` every 60 s: it calls `GET /health/ready`
+   and pings only on a 200. It never reports failure itself; silence is the alert.
+3. Check it with `deploy/launchd/heartbeat.sh --check`, which prints the
+   readiness answer without pinging. Each state change (ok, not ready, monitor
+   unreachable) is logged once to `logs/heartbeat.log`.
+
+Removing the variable and re-running the installer removes the agent. The URL
+is a credential: it stays in `.env` and is never written into the plist or a log.
+
+### Alert thresholds
+
+| Alert | Condition | Where |
+| --- | --- | --- |
+| **Host down** | no heartbeat ping for **more than 3 min** | the external monitor (period 1 min + grace 2 min) |
+| **Phone off USB** | `phone_farm_phone_usb_disconnected_seconds > 600` (10 min) | Prometheus |
+| **WDA not ready** | `phone_farm_phone_wda_not_ready_seconds > 900` (15 min) while the phone is on USB | Prometheus |
+| **Queue backlog** | `phone_farm_queue_oldest_job_age_seconds > 1800`: older than the 30-min run window, so the job will expire unrun | Prometheus |
+| **Worker stalled** | `phone_farm_worker_heartbeat_age_seconds > 120` | Prometheus (the host heartbeat stops too, because readiness fails) |
+| **WDA flapping** | `increase(phone_farm_wda_restarts_total[1h]) > 10` | Prometheus |
+| **Metrics source failing** | `phone_farm_metrics_source_up == 0` for 10 min | Prometheus |
+| **Backup stale** | the nightly backup has not succeeded for **more than 26 h** | a second push check pinged by the backup job (see *Backups*), period 1 day, grace 2 h |
+
+```yaml
+groups:
+  - name: phone-farm
+    rules:
+      - alert: PhoneOffUsb
+        expr: phone_farm_phone_usb_disconnected_seconds > 600
+        labels: { severity: warning }
+        annotations: { summary: '{{ $labels.name }} ({{ $labels.udid }}) off USB for 10+ min' }
+      - alert: WdaNotReady
+        expr: phone_farm_phone_wda_not_ready_seconds > 900 and on(udid) phone_farm_phone_usb_disconnected_seconds == 0
+        labels: { severity: warning }
+        annotations: { summary: '{{ $labels.name }} WDA not ready for 15+ min' }
+      - alert: QueueBacklog
+        expr: phone_farm_queue_oldest_job_age_seconds > 1800
+        labels: { severity: critical }
+      - alert: WorkerStalled
+        expr: phone_farm_worker_heartbeat_age_seconds > 120
+        labels: { severity: critical }
+      - alert: WdaFlapping
+        expr: increase(phone_farm_wda_restarts_total[1h]) > 10
+        labels: { severity: warning }
+      - alert: MetricsSourceDown
+        expr: phone_farm_metrics_source_up == 0
+        for: 10m
+        labels: { severity: warning }
+```
+
+### Runbook
+
+| Alert | First steps |
+| --- | --- |
+| Host down | Is the Mac reachable (Tailscale, ping)? If not: power, network, or it slept (`pmset -g`; automatic sleep must be off). If it is: `deploy/launchd/heartbeat.sh --check` shows which readiness check fails; follow that row. If readiness is 200 but no pings arrive, the host cannot reach the monitor (`logs/heartbeat.log` says `push-failed`). |
+| `database` not ready | `docker compose ps`; `npm run db:up`; `logs/db.log`. Docker Desktop needs the GUI session logged in. |
+| `appium` not ready | `launchctl kickstart -k $U/$P.appium`; `logs/appium.log`. |
+| `wdaService` not ready | `launchctl kickstart -k $U/$P.wda-service`; `logs/wda-service.log`. A stale `.wda/wda-service.sock.lock` clears itself within 15 s. |
+| `worker` stale or no heartbeat | `launchctl list \| grep $P.worker` (PID, last exit code); `tail logs/worker.log`. If migration 0003 was never applied the table is missing: `npm run db:migrate`. Restarting the worker kills running tasks, so check the dashboard for running executions first. |
+| Phone off USB | The card shows its `rackSlot`: reseat that cable or hub port and check the hub's power. Several phones on one hub dropping together points at the hub. |
+| WDA not ready or flapping | `tail -200 .wda/logs/<udid>.log` (or the admin route) shows xcodebuild's own error; then find the matching row in *Common failures*. Usual causes: locked phone, untrusted developer profile, profile missing the UDID, stale build. |
+| Queue backlog | Is that phone's WDA ready and the worker alive? A job waits for its phone and expires at the end of its window if the phone stays down. `select name, state, count(*) from pgboss.job group by 1, 2` shows the rest. |
+| Backup stale | Run the backup by hand, read its output, check free disk (`df -h`). |
 
 ### Grid timings
 
@@ -188,9 +312,15 @@ without forgetting: **Disconnect** on the grid (`"disabled": true`).
 Nightly, from a cron/launchd job on the host:
 
 ```sh
-docker compose exec -T postgres pg_dump -U phone_farm phone_farm | gzip > backups/pg-$(date +%F).sql.gz
-tar czf backups/state-$(date +%F).tgz .env devices.json .scheduler-data/assets
+set -o pipefail
+docker compose exec -T postgres pg_dump -U phone_farm phone_farm | gzip > backups/pg-$(date +%F).sql.gz \
+  && tar czf backups/state-$(date +%F).tgz .env devices.json .scheduler-data/assets \
+  && curl -fsS -m 10 -o /dev/null "$BACKUP_PING_URL"   # a second push check: period 1 day, grace 2 h
 ```
+
+`BACKUP_PING_URL` belongs to this job only (it is not read by the farm). The
+ping runs only when both steps succeeded, so a missing ping means the backup
+is stale — see *Alert thresholds*.
 
 Restore: `gunzip -c backups/pg-….sql.gz | docker compose exec -T postgres psql -U phone_farm phone_farm`,
 put the two files back, run `npm run db:migrate`, restart the agents.

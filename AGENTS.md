@@ -33,7 +33,8 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 | `src/plugin.ts` | **stable** plugin + auth interfaces; `src/registry.ts` resolves `{pluginId, taskType, taskVersion}` |
 | `src/auth/` | built-in accounts (`PHONE_FARM_AUTH_PLUGIN=builtin`): `policy.ts` (pure access rules), `route-access.ts` (the route → requirement table every request is checked against), `accounts.ts` (sign-in, sessions, Team rules), `pg-store.ts` (schema `auth`), `routes.ts` (login, password, Team pages + API), `cli.ts` (`npm run users`) |
 | `src/scheduler/` | pg-boss queue, recurrence, executor, worker |
-| `src/devices/` | discovery (usbmux), `devices.json` registry, registration wizard, WDA supervisor + remote, coordinate profiles |
+| `src/devices/` | discovery (usbmux), `devices.json` registry, registration wizard, WDA supervisor + remote, per-phone WDA logs (`wda-log.ts`), coordinate profiles |
+| `src/observability/` | `/health/ready` probes, Prometheus `/metrics` rendering, the worker heartbeat (`scheduler.worker_heartbeats`) |
 | `src/tiktok/`, `src/tiktok-plugin.ts` | the built-in plugin and its standalone entrypoints |
 | `static/dashboard/templates/*.html` | server templates with `__PLACEHOLDER__` slots (`__BRAND__`, `__BRAND_TITLE__`, `__FOOTER__`, `__PLUGIN_NAV__`, `__AUTH_NAV__`, TikTok slots) |
 | `test/` | `node:test` suites; `test/support.ts` has the CSRF-aware `inject()` |

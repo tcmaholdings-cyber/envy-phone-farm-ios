@@ -210,5 +210,8 @@ Registered devices live in `devices.json` (git‑ignored):
 | web returns 401 everywhere | An auth provider is configured — sign in, or unset `PHONE_FARM_AUTH_PLUGIN` on loopback. |
 | `sh: appium: command not found` in an agent | Invoke via `node node_modules/appium/index.js …` if npm did not link the bin. |
 
-`GET /health` lists the loaded plugins and versions. `wda:service`'s socket
-has `/health` with per‑device state.
+`GET /health` says the web process is up; `GET /health/ready` checks the
+database, Appium, the WDA service and the worker (200 or 503). The loaded
+plugins and versions are at `GET /api/plugins`. `wda:service`'s socket has
+`/health` with per‑device state, and each phone's WDA output is in
+`.wda/logs/<udid>.log`. Monitoring and alerts: [operations.md](operations.md#monitoring-and-alerts).
