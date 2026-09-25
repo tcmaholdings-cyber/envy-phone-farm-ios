@@ -58,14 +58,21 @@ function showError(message: string | null): void {
     errorBanner.scrollIntoView({ block: 'nearest' });
 }
 
+/** Platform staff pick an organisation with ?tenant=; new people and groups go into the one shown. */
+function inShownTenant(method: string, url: string): string {
+    const tenant = new URLSearchParams(location.search).get('tenant');
+    if (!tenant || method !== 'POST' || (url !== '/api/team/users' && url !== '/api/team/groups')) return url;
+    return `${url}?tenant=${encodeURIComponent(tenant)}`;
+}
+
 async function api<T>(method: string, url: string, body?: unknown): Promise<T> {
-    const response = await fetch(url, {
+    const response = await fetch(inShownTenant(method, url), {
         method,
         headers: body === undefined ? {} : { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
         cache: 'no-store',
     });
-    if (response.status === 401) { location.href = '/login?next=%2Fteam'; throw new Error('Signed out'); }
+    if (response.status === 401) { location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`; throw new Error('Signed out'); }
     if (!response.ok) {
         const data = await response.json().catch(() => ({})) as { error?: string };
         throw new Error(data.error ?? `Request failed (${response.status})`);

@@ -1,6 +1,8 @@
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import type { RegisteredDevice } from '../devices/registry.js';
+import type { SchedulerRepository } from '../scheduler/repository.js';
+import { DEFAULT_TENANT_ID } from '../tenancy.js';
 import { escapeHtml, jsonForScript } from '../html.js';
 import type { RequestAccess } from './access.js';
 import { auditCsv, type AuditEntry, type AuditLog } from './audit.js';
@@ -12,6 +14,7 @@ import { clientIp } from './net.js';
 import { MIN_PASSWORD_LENGTH } from './password.js';
 import { effectiveLevel, type AccessLevel, type PolicyGrant } from './policy.js';
 import type { GrantRecord, GroupRecord } from './store.js';
+import type { TenantRecord } from './tenants.js';
 
 /**
  * The built-in accounts' pages and API: sign-in, sign-out, password change,
@@ -33,6 +36,8 @@ export interface ShellOptions {
     current?: string;
     /** Scripts from /assets to load as modules. */
     scripts?: string[];
+    /** Load htmx (the page uses hx-* attributes). */
+    htmx?: boolean;
 }
 
 /** A registered phone labelled with the tenant that owns it. */
@@ -46,6 +51,8 @@ export interface BuiltinRouteContext {
     tenantOfDevice(udid: string): Promise<string>;
     /** The audit log to read back on /audit; null means rows only reach the server log. */
     auditLog: AuditLog | null;
+    /** For moving a phone between tenants: its running work and the old owner's schedules. */
+    scheduler: Pick<SchedulerRepository, 'activeExecution' | 'listSchedules' | 'setScheduleStatus'>;
     log(event: AuditEvent): void;
 }
 
@@ -96,15 +103,28 @@ function distinctSorted(values: Array<string | undefined>): string[] {
     return [...seen.values()].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
+export interface TeamTenant { id: string; slug: string; name: string; status?: string }
+
+/** Which organisation the Team page shows, and (platform staff) which others it can switch to. */
+export interface TeamContext {
+    /** The organisation shown; null for the platform accounts; undefined when there are no tenants to speak of. */
+    tenant?: TeamTenant | null;
+    /** Platform staff only: every organisation, for the switcher. */
+    tenants?: readonly TeamTenant[];
+}
+
+const ROLE_LABEL: Record<string, string> = { platform: 'Platform', admin: 'Admin', operator: 'Operator' };
+
 /** The Team page body. Exported for tests; every value is escaped here. */
-export function renderTeamMain(team: TeamSnapshot, devices: readonly (RegisteredDevice & { tenantId?: string })[], currentUserId: string): string {
+export function renderTeamMain(team: TeamSnapshot, devices: readonly (RegisteredDevice & { tenantId?: string })[], currentUserId: string, context: TeamContext = {}): string {
+    const staffView = context.tenant === null;
     const groupsById = new Map(team.groups.map((group) => [group.id, group]));
     const usersById = new Map(team.users.map((user) => [user.id, user]));
     const groupsOf = (userId: string) => team.memberships.filter((membership) => membership.userId === userId)
         .map(({ groupId }) => groupsById.get(groupId)).filter((group): group is GroupRecord => Boolean(group));
     const membersOf = (groupId: string) => team.memberships.filter((membership) => membership.groupId === groupId)
         .map(({ userId }) => usersById.get(userId)).filter((user): user is PublicUser => Boolean(user));
-    const admins = team.users.filter((user) => user.role === 'admin' && !user.disabled).length;
+    const admins = team.users.filter((user) => user.role === (staffView ? 'platform' : 'admin') && !user.disabled).length;
 
     const status = (user: PublicUser) => user.disabled
         ? '<span class="status paused"><span class="dot"></span>Disabled</span>'
@@ -116,7 +136,7 @@ export function renderTeamMain(team: TeamSnapshot, devices: readonly (Registered
         const you = user.id === currentUserId ? ' <span class="you-badge">You</span>' : '';
         const chips = groupsOf(user.id).map((group) => `<span class="chip">${escapeHtml(group.name)}</span>`).join('') || '<span class="muted">—</span>';
         const data = `data-id="${escapeHtml(user.id)}" data-username="${escapeHtml(user.username)}"`;
-        return `<tr data-user-id="${escapeHtml(user.id)}"><td><strong>${escapeHtml(user.displayName)}</strong>${you}</td><td><code>${escapeHtml(user.username)}</code></td><td><span class="role-badge ${user.role === 'admin' ? 'admin' : 'operator'}">${user.role === 'admin' ? 'Admin' : 'Operator'}</span></td><td><div class="chip-list">${chips}</div></td><td>${isoTime(user.lastLoginAt)}</td><td>${status(user)}</td><td><div class="inline-actions row-actions">`
+        return `<tr data-user-id="${escapeHtml(user.id)}"><td><strong>${escapeHtml(user.displayName)}</strong>${you}</td><td><code>${escapeHtml(user.username)}</code></td><td><span class="role-badge ${user.role === 'operator' ? 'operator' : 'admin'}">${escapeHtml(ROLE_LABEL[user.role] ?? user.role)}</span></td><td><div class="chip-list">${chips}</div></td><td>${isoTime(user.lastLoginAt)}</td><td>${status(user)}</td><td><div class="inline-actions row-actions">`
             + `<button class="icon-button" type="button" data-action="edit-user" ${data} data-name="${escapeHtml(user.displayName)}" data-role="${escapeHtml(user.role)}">Edit</button>`
             + `<button class="icon-button" type="button" data-action="reset-password" ${data}>Reset password</button>`
             + (user.id === currentUserId ? '' : `<button class="icon-button" type="button" data-action="toggle-user" ${data} data-disabled="${user.disabled ? 'false' : 'true'}">${user.disabled ? 'Enable' : 'Disable'}</button>`
@@ -158,24 +178,34 @@ export function renderTeamMain(team: TeamSnapshot, devices: readonly (Registered
         device: devices.map((device) => ({ value: device.udid, label: `${device.name}${device.rack ? ` · rack ${device.rack}` : ''}` })),
     };
     const groupChoices = team.groups.map((group) => `<label><input type="checkbox" name="groupIds" value="${escapeHtml(group.id)}"> ${escapeHtml(group.name)}</label>`).join('');
-
-    return `<header class="page-header"><div><span class="eyebrow">Access</span><h1>Team</h1><p>Who can sign in, the groups they belong to, and which phones each person can see or drive. Admins can do everything; operators only reach phones granted to them or to one of their groups.</p></div><div class="page-actions"><button class="button secondary" type="button" data-action="new-group">New group</button><button class="button primary" type="button" data-action="new-user">Add person</button></div></header>
-<div id="team-error" class="banner err" role="alert" hidden></div>
-<section class="panel team-section" aria-labelledby="people-title"><div class="section-heading"><div><span class="eyebrow">People</span><h2 id="people-title">Users</h2></div><span class="run-meta">${team.users.length} ${team.users.length === 1 ? 'person' : 'people'} · ${admins} active ${admins === 1 ? 'admin' : 'admins'}</span></div>
-<div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Name</th><th scope="col">Username</th><th scope="col">Role</th><th scope="col">Groups</th><th scope="col">Last sign-in</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead><tbody>${userRows || '<tr><td colspan="7" class="muted">Nobody yet.</td></tr>'}</tbody></table></div></section>
-<section class="panel team-section" aria-labelledby="groups-title"><div class="section-heading"><div><span class="eyebrow">Groups</span><h2 id="groups-title">Groups</h2></div><span class="run-meta">Grant a group access once; every member gets it.</span></div>
+    // Platform accounts have no groups or grants: they reach every phone of every organisation.
+    const tenantSections = staffView ? '' : `<section class="panel team-section" aria-labelledby="groups-title"><div class="section-heading"><div><span class="eyebrow">Groups</span><h2 id="groups-title">Groups</h2></div><span class="run-meta">Grant a group access once; every member gets it.</span></div>
 <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Group</th><th scope="col">Members</th><th scope="col">Add member</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead><tbody>${groupRows || '<tr><td colspan="4" class="muted">No groups yet. Create one for a shift or a rack team.</td></tr>'}</tbody></table></div></section>
 <section class="panel team-section" aria-labelledby="access-title"><div class="section-heading"><div><span class="eyebrow">Access</span><h2 id="access-title">Phone access</h2></div><span class="run-meta">View shows a phone · Operate also drives it</span></div>
 <form id="grant-form" class="grant-form" data-form="add-grant"><div class="field"><label for="grant-subject">Who</label><select id="grant-subject" name="subject" required><option value="">Choose a person or group…</option>${subjectOptions}</select></div><div class="field"><label for="grant-scope">Scope</label><select id="grant-scope" name="scopeType"><option value="all">All phones</option><option value="rack">A rack</option><option value="model">A model</option><option value="device">One phone</option></select></div><div class="field"><label for="grant-value">Which</label><select id="grant-value" name="scopeValue" disabled><option value="">Every phone</option></select></div><div class="field"><label for="grant-level">Level</label><select id="grant-level" name="level"><option value="view">View</option><option value="operate">Operate</option></select></div><button class="button primary" type="submit">Grant access</button></form>
 <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Who</th><th scope="col">Scope</th><th scope="col">Level</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead><tbody>${grantRows || '<tr><td colspan="4" class="muted">No access granted yet. Operators see no phones until they get a grant.</td></tr>'}</tbody></table></div></section>
 <section class="panel team-section" aria-labelledby="effective-title"><div class="section-heading"><div><span class="eyebrow">Result</span><h2 id="effective-title">What each operator can reach</h2></div><span class="run-meta">Their own grants plus their groups', highest level wins</span></div>
 <div class="effective-grid">${effective || '<p class="muted">No operators yet.</p>'}</div></section>
-<script type="application/json" id="team-scopes">${jsonForScript(scopes)}</script>
+`;
+    const where = context.tenant === undefined ? '' : context.tenant === null ? 'Platform staff' : context.tenant.name;
+    const switcher = context.tenants?.length ? `<form class="tenant-switch inline-add" method="get" action="/team"><label class="visually-hidden" for="team-tenant">Organisation</label><select id="team-tenant" name="tenant"><option value="platform"${staffView ? ' selected' : ''}>Platform staff</option>${context.tenants.map((tenant) => `<option value="${escapeHtml(tenant.id)}"${context.tenant?.id === tenant.id ? ' selected' : ''}>${escapeHtml(tenant.name)}${tenant.status === 'suspended' ? ' (suspended)' : ''}</option>`).join('')}</select><button class="button secondary" type="submit">Show</button></form>` : '';
+    const intro = staffView
+        ? 'Platform staff run the farm: every organisation, every phone, phone registration and the Tenants page. They belong to no organisation.'
+        : 'Who can sign in, the groups they belong to, and which phones each person can see or drive. Admins can do everything in this organisation; operators only reach phones granted to them or to one of their groups.';
+    const roleOptions = staffView
+        ? '<option value="platform">Platform — every organisation and the farm itself</option>'
+        : '<option value="operator">Operator — only granted phones</option><option value="admin">Admin — everything in this organisation, including the Team page</option>';
+
+    return `<header class="page-header"><div><span class="eyebrow">Access${where ? ` · ${escapeHtml(where)}` : ''}</span><h1>Team</h1><p>${intro}</p></div><div class="page-actions">${switcher}${staffView ? '' : '<button class="button secondary" type="button" data-action="new-group">New group</button>'}<button class="button primary" type="button" data-action="new-user">Add person</button></div></header>
+<div id="team-error" class="banner err" role="alert" hidden></div>
+<section class="panel team-section" aria-labelledby="people-title"><div class="section-heading"><div><span class="eyebrow">People</span><h2 id="people-title">Users</h2></div><span class="run-meta">${team.users.length} ${team.users.length === 1 ? 'person' : 'people'} · ${admins} active ${staffView ? 'platform' : admins === 1 ? 'admin' : 'admins'}</span></div>
+<div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Name</th><th scope="col">Username</th><th scope="col">Role</th><th scope="col">Groups</th><th scope="col">Last sign-in</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead><tbody>${userRows || '<tr><td colspan="7" class="muted">Nobody yet.</td></tr>'}</tbody></table></div></section>
+${tenantSections}<script type="application/json" id="team-scopes">${jsonForScript(scopes)}</script>
 <dialog id="user-dialog"><form id="user-form" class="modal" data-form="user"><div class="modal-head"><div><span class="eyebrow">Team</span><h2 id="user-dialog-title">Add person</h2></div><button class="icon-button" type="button" data-close>Close</button></div>
 <p id="user-dialog-help">They get a temporary password, shown once, and choose their own at first sign-in.</p>
 <div class="field" data-create-only><label for="user-username">Username</label><input id="user-username" name="username" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\\-]{1,31}" placeholder="e.g. maria" required></div>
 <div class="field"><label for="user-name">Display name</label><input id="user-name" name="displayName" type="text" maxlength="80" placeholder="e.g. Maria (VA)"></div>
-<div class="field"><label for="user-role">Role</label><select id="user-role" name="role"><option value="operator">Operator — only granted phones</option><option value="admin">Admin — everything, including the Team page</option></select></div>
+<div class="field"><label for="user-role">Role</label><select id="user-role" name="role">${roleOptions}</select></div>
 ${groupChoices ? `<fieldset data-create-only><legend>Groups</legend><div class="choices">${groupChoices}</div></fieldset>` : ''}
 <p id="user-result" class="field-error" aria-live="polite"></p>
 <div class="form-actions"><span class="spacer"></span><button class="button secondary" type="button" data-close>Cancel</button><button class="button primary" type="submit">Save</button></div></form></dialog>
@@ -205,6 +235,37 @@ export function renderAuditMain(entries: readonly AuditEntry[], options: {
     const columns = options.showTenant ? 7 : 6;
     return `<header class="page-header"><div><span class="eyebrow">Access</span><h1>Audit log</h1><p>Every change made through the dashboard or the API, newest first: who, from where, what, and whether it worked. Request bodies, passwords and typed text are never recorded.</p></div><div class="page-actions"><a class="button secondary" href="${escapeHtml(options.csvHref)}">Download CSV</a></div></header>
 <section class="panel team-section"><div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">When</th>${options.showTenant ? '<th scope="col">Organisation</th>' : ''}<th scope="col">Who</th><th scope="col">What</th><th scope="col">Target</th><th scope="col">Result</th><th scope="col">IP</th></tr></thead><tbody>${rows || `<tr><td colspan="${columns}" class="muted">Nothing recorded yet.</td></tr>`}</tbody></table></div>${options.olderHref ? `<p><a class="button secondary" href="${escapeHtml(options.olderHref)}">Older entries</a></p>` : ''}</section>`;
+}
+
+export interface TenantStats { phones: number; users: number }
+
+function limitText(used: number, limit: number | undefined): string {
+    return typeof limit === 'number' ? `${used} / ${limit}` : String(used);
+}
+
+function megabytes(bytes: number | undefined): string {
+    return typeof bytes === 'number' ? `${Math.round(bytes / 1024 ** 2).toLocaleString('en')} MB` : 'Default (5 GB)';
+}
+
+/** The Tenants page panel (platform staff). Exported for tests; every value is escaped here. */
+export function renderTenantsPanel(tenants: readonly TenantRecord[], stats: ReadonlyMap<string, TenantStats>, devices: readonly OwnedDevice[], notice?: { ok: boolean; message: string }): string {
+    const byId = new Map(tenants.map((tenant) => [tenant.id, tenant]));
+    const rows = tenants.map((tenant) => {
+        const counts = stats.get(tenant.id) ?? { phones: 0, users: 0 };
+        const suspended = tenant.status === 'suspended';
+        const toggle = tenant.id === DEFAULT_TENANT_ID ? '<span class="muted">Default</span>'
+            : `<button class="icon-button${suspended ? '' : ' danger'}" type="button" hx-patch="/api/tenants/${escapeHtml(tenant.id)}" hx-vals='${escapeHtml(JSON.stringify({ status: suspended ? 'active' : 'suspended' }))}' hx-target="#tenants-panel" hx-swap="outerHTML"${suspended ? '' : ` hx-confirm="${escapeHtml(`Suspend ${tenant.name}? Its people are signed out and its schedules stop until you activate it again.`)}"`}>${suspended ? 'Activate' : 'Suspend'}</button>`;
+        return `<tr data-tenant-id="${escapeHtml(tenant.id)}"><td><strong>${escapeHtml(tenant.name)}</strong></td><td><code>${escapeHtml(tenant.slug)}</code></td><td><span class="status ${suspended ? 'paused' : 'active'}"><span class="dot"></span>${suspended ? 'Suspended' : 'Active'}</span></td><td>${escapeHtml(limitText(counts.phones, tenant.quotas.maxPhones))}</td><td>${escapeHtml(limitText(counts.users, tenant.quotas.maxUsers))}</td><td>${escapeHtml(megabytes(tenant.quotas.maxUploadBytes))}</td><td><div class="inline-actions row-actions"><a class="icon-button" href="/team?tenant=${encodeURIComponent(tenant.id)}">Team</a>${toggle}</div></td></tr>`;
+    }).join('');
+    const phoneOptions = devices.map((device) => `<option value="${escapeHtml(device.udid)}">${escapeHtml(device.name)} · ${escapeHtml(byId.get(device.tenantId)?.name ?? device.tenantId)}</option>`).join('');
+    const tenantOptions = tenants.map((tenant) => `<option value="${escapeHtml(tenant.id)}">${escapeHtml(tenant.name)}</option>`).join('');
+    const banner = notice ? `<div class="banner ${notice.ok ? 'ok' : 'err'}" role="${notice.ok ? 'status' : 'alert'}"><strong>${escapeHtml(notice.message)}</strong></div>` : '';
+    return `<div id="tenants-panel">${banner}
+<section class="panel team-section" aria-labelledby="tenants-title"><div class="section-heading"><div><span class="eyebrow">Customers</span><h2 id="tenants-title">Organisations</h2></div><span class="run-meta">${tenants.length} ${tenants.length === 1 ? 'organisation' : 'organisations'}</span></div>
+<div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Name</th><th scope="col">Short name</th><th scope="col">Status</th><th scope="col">Phones</th><th scope="col">People</th><th scope="col">Upload budget</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>
+<form class="grant-form" hx-post="/api/tenants" hx-target="#tenants-panel" hx-swap="outerHTML"><div class="field"><label for="tenant-name">Name</label><input id="tenant-name" name="name" type="text" maxlength="80" required placeholder="e.g. Acme Media"></div><div class="field"><label for="tenant-slug">Short name</label><input id="tenant-slug" name="slug" type="text" maxlength="40" pattern="[a-z0-9][a-z0-9\-]{1,39}" required placeholder="acme"></div><div class="field"><label for="tenant-phones">Max phones</label><input id="tenant-phones" name="maxPhones" type="number" min="0" placeholder="No limit"></div><div class="field"><label for="tenant-users">Max people</label><input id="tenant-users" name="maxUsers" type="number" min="0" placeholder="No limit"></div><div class="field"><label for="tenant-upload">Upload budget (MB)</label><input id="tenant-upload" name="maxUploadMb" type="number" min="0" placeholder="5120"></div><button class="button primary" type="submit">Add organisation</button></form></section>
+<section class="panel team-section" aria-labelledby="assign-title"><div class="section-heading"><div><span class="eyebrow">Phones</span><h2 id="assign-title">Assign a phone</h2></div><span class="run-meta">Moving a phone cancels the old organisation's schedules on it</span></div>
+<form class="grant-form" hx-post="/api/tenant-devices" hx-target="#tenants-panel" hx-swap="outerHTML"><div class="field"><label for="assign-phone">Phone</label><select id="assign-phone" name="udid" required><option value="">Choose a phone…</option>${phoneOptions}</select></div><div class="field"><label for="assign-tenant">Organisation</label><select id="assign-tenant" name="tenantId" required>${tenantOptions}</select></div><button class="button primary" type="submit">Assign</button></form></section></div>`;
 }
 
 function authCard(title: string, eyebrow: string, intro: string, inner: string): string {
@@ -326,9 +387,15 @@ export function registerBuiltinAuthRoutes(app: FastifyInstance, context: Builtin
         const team = await accounts.team(actor, requested);
         const scope = requested === null ? null : await accounts.scopeTenant(actor, requested);
         const devices = (await context.loadDevices()).filter((device) => device.tenantId === scope);
+        const access = context.accessOf(request);
+        const tenants = provider.tenants ? await provider.tenants.list() : [];
+        const shown = scope === null ? null : tenants.find(({ id }) => id === scope);
         return reply.header('cache-control', 'no-store').type('text/html').send(renderShell(request, {
             title: 'Team', current: '/team', bodyClass: 'page-team', scripts: ['team.js'],
-            main: renderTeamMain(team, devices, actor.id),
+            main: renderTeamMain(team, devices, actor.id, {
+                ...(shown !== undefined ? { tenant: shown } : {}),
+                ...(access.platform ? { tenants } : {}),
+            }),
         }));
     });
 
@@ -440,5 +507,92 @@ export function registerBuiltinAuthRoutes(app: FastifyInstance, context: Builtin
             }),
         }));
     });
-}
 
+    // ---------- tenants (platform staff only, through the route table) ----------
+
+    const tenantService = provider.tenants;
+    const tenantStats = async (): Promise<Map<string, TenantStats>> => {
+        const [devices, users] = await Promise.all([context.loadDevices(), accounts.store.listUsers()]);
+        const stats = new Map<string, TenantStats>();
+        const entry = (id: string) => stats.get(id) ?? (stats.set(id, { phones: 0, users: 0 }), stats.get(id)!);
+        for (const device of devices) entry(device.tenantId).phones += 1;
+        for (const user of users) if (user.tenantId) entry(user.tenantId).users += 1;
+        return stats;
+    };
+    const tenantsPanel = async (notice?: { ok: boolean; message: string }) => {
+        const [tenants, stats, devices] = await Promise.all([tenantService!.list(), tenantStats(), context.loadDevices()]);
+        return renderTenantsPanel(tenants, stats, devices, notice);
+    };
+    /** Forms post fields; API clients post { quotas }. Empty fields mean the deployment default. */
+    const quotasFrom = (body: Record<string, unknown>) => {
+        if (body.quotas !== undefined) return body.quotas;
+        const mb = body.maxUploadMb;
+        const fromForm = {
+            ...(body.maxPhones !== undefined ? { maxPhones: body.maxPhones } : {}),
+            ...(body.maxUsers !== undefined ? { maxUsers: body.maxUsers } : {}),
+            ...(mb !== undefined ? { maxUploadBytes: mb === '' || mb === null ? null : Number(mb) * 1024 ** 2 } : {}),
+        };
+        return Object.keys(fromForm).length ? fromForm : undefined;
+    };
+    /** htmx gets the re-rendered panel (errors as a banner); API clients get JSON and the real status. */
+    const tenantAction = async (request: FastifyRequest, reply: FastifyReply, run: () => Promise<{ status: number; json: unknown; message: string }>) => {
+        if (!tenantService) return reply.code(404).send({ error: 'Tenants are not configured' });
+        const htmx = Boolean(request.headers['hx-request']);
+        try {
+            const result = await run();
+            if (htmx) return reply.type('text/html').send(await tenantsPanel({ ok: true, message: result.message }));
+            return reply.code(result.status).send(result.json);
+        } catch (error) {
+            if (!(error instanceof AccountError)) throw error;
+            if (htmx) return reply.type('text/html').send(await tenantsPanel({ ok: false, message: error.message }));
+            return reply.code(error.statusCode).send({ error: error.message });
+        }
+    };
+
+    app.get('/tenants', async (request, reply) => {
+        if (!tenantService) return reply.code(404).send({ error: 'Tenants are not configured' });
+        return reply.header('cache-control', 'no-store').type('text/html').send(renderShell(request, {
+            title: 'Organisations', current: '/tenants', bodyClass: 'page-team', htmx: true,
+            main: `<header class="page-header"><div><span class="eyebrow">Platform</span><h1>Organisations</h1><p>Each organisation (tenant) has its own phones, people, schedules and media, and never sees another's. Phones not assigned to anyone belong to the default organisation.</p></div></header>${await tenantsPanel()}`,
+        }));
+    });
+
+    app.get('/api/tenants', async (_request, reply) => {
+        if (!tenantService) return reply.code(404).send({ error: 'Tenants are not configured' });
+        const [tenants, stats] = await Promise.all([tenantService.list(), tenantStats()]);
+        return { tenants: tenants.map((tenant) => ({ ...tenant, ...(stats.get(tenant.id) ?? { phones: 0, users: 0 }) })) };
+    });
+
+    app.post('/api/tenants', async (request, reply) => tenantAction(request, reply, async () => {
+        const body = (request.body ?? {}) as Record<string, unknown>;
+        const tenant = await tenantService!.create(actorOf(request), { slug: body.slug, name: body.name, quotas: quotasFrom(body) });
+        return { status: 201, json: tenant, message: `Added ${tenant.name}.` };
+    }));
+
+    app.patch<{ Params: { id: string } }>('/api/tenants/:id', async (request, reply) => tenantAction(request, reply, async () => {
+        const body = (request.body ?? {}) as Record<string, unknown>;
+        const tenant = await tenantService!.update(actorOf(request), request.params.id, { name: body.name, status: body.status, quotas: quotasFrom(body) });
+        return { status: 200, json: tenant, message: `${tenant.name} is ${tenant.status}.` };
+    }));
+
+    app.post('/api/tenant-devices', async (request, reply) => tenantAction(request, reply, async () => {
+        const body = (request.body ?? {}) as Record<string, unknown>;
+        const devices = await context.loadDevices();
+        const device = typeof body.udid === 'string' ? devices.find(({ udid }) => udid === body.udid) : undefined;
+        if (!device) throw new AccountError(404, 'Device not found');
+        if (await context.scheduler.activeExecution(device.udid)) throw new AccountError(409, 'Stop the running automation before moving this phone');
+        const { tenant } = await tenantService!.assignDevice(actorOf(request), device.udid, body.tenantId, devices.map(({ udid }) => udid));
+        // The old owner's schedules must not keep running on a phone that is no longer theirs.
+        let cancelled = 0;
+        for (const schedule of await context.scheduler.listSchedules(500, device.udid, null)) {
+            if (schedule.tenantId !== tenant.id && !['cancelled', 'completed'].includes(schedule.status)) {
+                await context.scheduler.setScheduleStatus(schedule.id, 'cancelled');
+                cancelled += 1;
+            }
+        }
+        return {
+            status: 200, json: { udid: device.udid, tenantId: tenant.id, cancelledSchedules: cancelled },
+            message: `${device.name} now belongs to ${tenant.name}${cancelled ? `; ${cancelled} old ${cancelled === 1 ? 'schedule was' : 'schedules were'} cancelled` : ''}.`,
+        };
+    }));
+}

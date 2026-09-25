@@ -587,6 +587,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             parts.push(`<a class="nav-link" href="/team"${current === '/team' ? ' aria-current="page"' : ''}>Team</a>`);
             parts.push(`<a class="nav-link" href="/audit"${current === '/audit' ? ' aria-current="page"' : ''}>Audit</a>`);
         }
+        if (teamEnabled && access.platform && user.access) {
+            parts.push(`<a class="nav-link" href="/tenants"${current === '/tenants' ? ' aria-current="page"' : ''}>Organisations</a>`);
+        }
         if (user.displayName) parts.push(`<span class="nav-user">${escapeHtml(user.displayName)}</span>`);
         const logoutPath = provider.logoutPath;
         if (logoutPath) {
@@ -706,7 +709,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const v = themed.versions;
         const access = request ? accessOf(request) : FULL_ACCESS;
         const nav = shell.bare ? '' : `<nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/">Devices</a><a class="nav-link" href="/tasks">Tasks</a>${access.platform ? '<a class="nav-link" href="/devices/register">Register</a>' : ''}${pluginNavHtml}${authNav(request, shell.current)}</nav>`;
-        const scripts = (shell.scripts ?? []).map((name) => `<script type="module" src="/assets/${escapeHtml(name)}?v=${escapeHtml(v[name] ?? '')}"></script>`).join('');
+        const scripts = (shell.htmx ? `<script src="/assets/htmx.min.js?v=${escapeHtml(v['htmx.min.js'] ?? '')}"></script>` : '')
+            + (shell.scripts ?? []).map((name) => `<script type="module" src="/assets/${escapeHtml(name)}?v=${escapeHtml(v[name] ?? '')}"></script>`).join('');
         return `<!doctype html>
 <html lang="en">
 <head>
@@ -1612,6 +1616,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             loadDevices: loadOwnedDevices,
             tenantOfDevice: async (udid) => (await deviceTenants()).tenantOf(udid),
             auditLog,
+            scheduler: options.scheduler,
             log: (event) => {
                 app.log.info({ audit: event }, `audit ${event.event}`);
                 void auditLog?.record({

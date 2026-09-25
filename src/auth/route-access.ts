@@ -84,6 +84,13 @@ export const ROUTE_REQUIREMENTS: Readonly<Record<string, RouteRequirement>> = {
     'POST /api/team/grants': TENANT_ADMIN,
     'DELETE /api/team/grants/:id': TENANT_ADMIN,
 
+    // tenants (organisations) and which one owns each phone: platform staff only
+    'GET /tenants': PLATFORM,
+    'GET /api/tenants': PLATFORM,
+    'POST /api/tenants': PLATFORM,
+    'PATCH /api/tenants/:id': PLATFORM,
+    'POST /api/tenant-devices': PLATFORM,
+
     // audit log: platform staff every tenant's rows, a tenant admin their own tenant's
     'GET /audit': TENANT_ADMIN,
     'GET /api/audit': TENANT_ADMIN,
