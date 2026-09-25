@@ -9,6 +9,7 @@ import {
     wdaServiceSocketPath,
     type WdaServiceDevicesResponse,
     type WdaServiceErrorResponse,
+    type WdaServiceLogsResponse,
 } from './wda-service-protocol.js';
 
 export interface ServiceResponse {
@@ -119,6 +120,15 @@ export class WdaServiceClient implements DeviceConnections {
         return { ...status };
     }
 
+    async logs(udid: string, limit = 200): Promise<string[] | undefined> {
+        const response = await this.requestService(`/devices/${encodeURIComponent(udid)}/logs?lines=${limit}`, {
+            socketPath: this.socketPath,
+            timeoutMs: this.requestTimeoutMs,
+        });
+        if (response.statusCode === 404) return;
+        return parseJson<WdaServiceLogsResponse>(response).lines;
+    }
+
     async refresh(): Promise<void> {
         if (this.refreshing || this.closing) return;
         this.refreshing = true;
@@ -149,6 +159,9 @@ export class WdaServiceClient implements DeviceConnections {
                     message,
                     retryCount: previous?.retryCount ?? 0,
                     updatedAt: now,
+                    restarts: previous?.restarts ?? 0,
+                    notReadySince: previous?.notReadySince ?? now,
+                    disconnectedSince: previous?.disconnectedSince,
                 });
             }
         } finally {

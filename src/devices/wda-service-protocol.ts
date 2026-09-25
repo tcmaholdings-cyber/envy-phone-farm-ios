@@ -10,6 +10,15 @@ export interface WdaServiceHealthResponse extends WdaServiceDevicesResponse {
     status: 'ok' | 'starting';
 }
 
+export interface WdaServiceLogsResponse {
+    udid: string;
+    /** Timestamped supervisor/xcodebuild output, oldest first (at most `WDA_LOG_RECENT_LINES`). */
+    lines: string[];
+}
+
+/** Upper bound for `GET /devices/:udid/logs?lines=`. */
+export const MAX_LOG_LINES = 1_000;
+
 export interface WdaServiceErrorResponse {
     error: string;
 }

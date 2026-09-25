@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 import { connectedDeviceUdids } from './discovery.js';
 import { activeDevices, loadRegisteredDevices, type RegisteredDevice } from './registry.js';
+import { LineSplitter, redactSecret, WdaLogStore } from './wda-log.js';
 
 export type DeviceConnectionPhase = 'disconnected' | 'connecting' | 'unlock-required' | 'ready' | 'error';
 export type AppiumConnectionPhase = 'ready' | 'unavailable';
@@ -16,6 +17,12 @@ export interface DeviceConnectionStatus {
     message: string;
     retryCount: number;
     updatedAt: string;
+    /** Times WDA on this phone entered `error` (each one is followed by a relaunch). Monotonic for the service's life. */
+    restarts?: number;
+    /** Since when WDA has not been `ready`; absent while it is ready. */
+    notReadySince?: string;
+    /** Since when the phone has been off USB; absent while it is attached. */
+    disconnectedSince?: string;
 }
 
 export interface DeviceConnections {
@@ -24,6 +31,8 @@ export interface DeviceConnections {
     status(udid: string): DeviceConnectionStatus | undefined;
     statuses(): DeviceConnectionStatus[];
     reconnect(udid: string): Promise<DeviceConnectionStatus | undefined>;
+    /** The phone's most recent supervisor/xcodebuild output lines, oldest first. */
+    logs?(udid: string, limit?: number): string[] | undefined | Promise<string[] | undefined>;
 }
 
 interface SupervisorMessage {
@@ -35,7 +44,6 @@ interface RuntimeState {
     device: RegisteredDevice;
     status: DeviceConnectionStatus;
     child?: ChildProcess;
-    outputBuffer: string;
     retryAt: number;
 }
 
@@ -46,6 +54,8 @@ interface ManagerOptions {
     endpointReady?: (url: string) => Promise<boolean>;
     pollIntervalMs?: number;
     now?: () => number;
+    /** Where supervisor output goes; defaults to memory only (wda-service passes a file-backed store). */
+    logs?: WdaLogStore;
 }
 
 const supervisorPrefix = '[wda-state] ';
@@ -93,6 +103,7 @@ export class DeviceConnectionManager implements DeviceConnections {
     private readonly endpointReady: (url: string) => Promise<boolean>;
     private readonly pollIntervalMs: number;
     private readonly now: () => number;
+    private readonly logStore: WdaLogStore;
     private readonly runtimes = new Map<string, RuntimeState>();
     private timer?: NodeJS.Timeout;
     private running = false;
@@ -106,6 +117,12 @@ export class DeviceConnectionManager implements DeviceConnections {
         this.endpointReady = options.endpointReady ?? defaultEndpointReady;
         this.pollIntervalMs = options.pollIntervalMs ?? 2_000;
         this.now = options.now ?? Date.now;
+        this.logStore = options.logs ?? new WdaLogStore();
+    }
+
+    logs(udid: string, limit?: number): string[] | undefined {
+        if (!this.runtimes.has(udid)) return;
+        return this.logStore.tail(udid, limit) ?? [];
     }
 
     async start(): Promise<void> {
@@ -147,13 +164,14 @@ export class DeviceConnectionManager implements DeviceConnections {
                 if (!registered.has(udid)) {
                     await this.stopChild(runtime);
                     this.runtimes.delete(udid);
+                    this.logStore.forget(udid);
                 }
             }
             const attached = new Set(connected);
             await Promise.all(devices.map(async (device) => {
                 const runtime = this.runtimes.get(device.udid) ?? this.createRuntime(device);
                 runtime.device = device;
-                runtime.status.physical = attached.has(device.udid) ? 'connected' : 'disconnected';
+                this.setPhysical(runtime, attached.has(device.udid) ? 'connected' : 'disconnected');
                 if (!runtime.child && this.now() >= runtime.retryAt) this.startChild(runtime);
                 const wdaPort = device.wdaLocalPort ?? Number(process.env.WDA_LOCAL_PORT ?? 8100);
                 const ready = attached.has(device.udid)
@@ -186,13 +204,13 @@ export class DeviceConnectionManager implements DeviceConnections {
         if (this.timer) clearInterval(this.timer);
         this.timer = undefined;
         await Promise.all(Array.from(this.runtimes.values(), (runtime) => this.stopChild(runtime)));
+        await this.logStore.flush();
     }
 
     private createRuntime(device: RegisteredDevice): RuntimeState {
         const now = new Date(this.now()).toISOString();
         const runtime: RuntimeState = {
             device,
-            outputBuffer: '',
             retryAt: 0,
             status: {
                 udid: device.udid,
@@ -203,6 +221,9 @@ export class DeviceConnectionManager implements DeviceConnections {
                 message: 'Checking USB connection',
                 retryCount: 0,
                 updatedAt: now,
+                restarts: 0,
+                notReadySince: now,
+                disconnectedSince: now,
             },
         };
         this.runtimes.set(device.udid, runtime);
@@ -212,13 +233,25 @@ export class DeviceConnectionManager implements DeviceConnections {
     private update(runtime: RuntimeState, wda: DeviceConnectionPhase, message: string): void {
         if (runtime.status.wda === wda && runtime.status.message === message
             && runtime.status.appium === this.appium) return;
+        const now = new Date(this.now()).toISOString();
+        const previous = runtime.status;
         runtime.status = {
-            ...runtime.status,
+            ...previous,
             wda,
             appium: this.appium,
             message,
-            updatedAt: new Date(this.now()).toISOString(),
+            updatedAt: now,
+            restarts: (previous.restarts ?? 0) + (wda === 'error' && previous.wda !== 'error' ? 1 : 0),
+            notReadySince: wda === 'ready' ? undefined : previous.notReadySince ?? now,
         };
+        if (wda !== previous.wda) this.logStore.append(runtime.device.udid, `[wda-service] ${previous.wda} -> ${wda}: ${message}`);
+    }
+
+    private setPhysical(runtime: RuntimeState, physical: DeviceConnectionStatus['physical']): void {
+        runtime.status.physical = physical;
+        runtime.status.disconnectedSince = physical === 'connected'
+            ? undefined
+            : runtime.status.disconnectedSince ?? new Date(this.now()).toISOString();
     }
 
     private startChild(runtime: RuntimeState): void {
@@ -226,14 +259,18 @@ export class DeviceConnectionManager implements DeviceConnections {
         try {
             const child = this.spawnSupervisor(runtime.device);
             runtime.child = child;
-            runtime.outputBuffer = '';
             this.update(runtime, runtime.status.physical === 'connected' ? 'connecting' : 'disconnected',
                 runtime.status.physical === 'connected' ? 'Starting WDA' : 'Waiting for the USB cable');
-            const consume = (chunk: Buffer | string) => this.consumeOutput(runtime, chunk.toString());
-            child.stdout?.on('data', consume);
-            child.stderr?.on('data', consume);
+            // One splitter per stream: stdout and stderr interleave at chunk
+            // boundaries, so a shared buffer would glue half-lines together.
+            const streams = [child.stdout, child.stderr].map((stream) => {
+                const splitter = new LineSplitter();
+                stream?.on('data', (chunk: Buffer | string) => this.consumeLines(runtime, splitter.push(chunk)));
+                return splitter;
+            });
             child.once('error', (error) => this.update(runtime, 'error', error.message));
             child.once('exit', (code, signal) => {
+                for (const splitter of streams) this.consumeLines(runtime, splitter.flush());
                 if (runtime.child !== child) return;
                 runtime.child = undefined;
                 if (this.closing) return;
@@ -252,11 +289,9 @@ export class DeviceConnectionManager implements DeviceConnections {
         }
     }
 
-    private consumeOutput(runtime: RuntimeState, output: string): void {
-        runtime.outputBuffer += output;
-        const lines = runtime.outputBuffer.split(/\r?\n/);
-        runtime.outputBuffer = lines.pop() ?? '';
+    private consumeLines(runtime: RuntimeState, lines: string[]): void {
         for (const line of lines) {
+            if (line.trim()) this.logStore.append(runtime.device.udid, redactSecret(line, runtime.device.passcode));
             const state = parseSupervisorMessage(line);
             if (!state) continue;
             if (state.state === 'error') runtime.status.retryCount += 1;
