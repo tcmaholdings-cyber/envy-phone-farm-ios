@@ -35,27 +35,38 @@ export function startWorkerHeartbeat(
     const host = options.host ?? os.hostname();
     const pid = options.pid ?? process.pid;
     const startedAt = options.startedAt ?? new Date();
+    return startPeriodicBeat('Worker heartbeat', options.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS, async () => {
+        await pool.query(
+            `insert into scheduler.worker_heartbeats (host, pid, started_at, beat_at, queues)
+             values ($1, $2, $3, now(), $4)
+             on conflict (host) do update
+             set pid = excluded.pid, started_at = excluded.started_at, beat_at = excluded.beat_at, queues = excluded.queues`,
+            [host, pid, startedAt, queues()],
+        );
+    });
+}
+
+/**
+ * Run `write` now and every `intervalMs` (unref'd), never throwing: a failure
+ * is logged once per distinct message. Shared by the worker heartbeat and the
+ * host lease (src/hosts/lease.ts).
+ */
+export function startPeriodicBeat(label: string, intervalMs: number, write: () => Promise<void>): WorkerHeartbeat {
     let lastError = '';
     let inFlight: Promise<void> = Promise.resolve();
     const beat = async (): Promise<void> => {
         try {
-            await pool.query(
-                `insert into scheduler.worker_heartbeats (host, pid, started_at, beat_at, queues)
-                 values ($1, $2, $3, now(), $4)
-                 on conflict (host) do update
-                 set pid = excluded.pid, started_at = excluded.started_at, beat_at = excluded.beat_at, queues = excluded.queues`,
-                [host, pid, startedAt, queues()],
-            );
+            await write();
             lastError = '';
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            if (message !== lastError) console.error(`Worker heartbeat failed: ${message}`);
+            if (message !== lastError) console.error(`${label} failed: ${message}`);
             lastError = message;
         }
     };
     const tick = () => { inFlight = beat(); };
     tick();
-    const timer = setInterval(tick, options.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS);
+    const timer = setInterval(tick, intervalMs);
     timer.unref();
     return {
         beat: () => { tick(); return inFlight; },

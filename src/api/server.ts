@@ -5,9 +5,12 @@ import { configuredPluginModules, loadAuthProvider, loadPlugins } from '../loade
 import { PluginRegistry } from '../registry.js';
 import { createSchedulerRuntime } from '../scheduler/runtime.js';
 import { assertSafeBind } from '../security.js';
+import { assertSafeAgentBind, startAgentListener } from '../agent/listener.js';
 import { createTikTokPlugin } from '../tiktok-plugin.js';
 import { defaultDashboardTheme } from '../dashboard-theme.js';
 import { DeviceRegistrationService } from '../devices/registration.js';
+import { closeDeviceRegistry, loadRegisteredDevices, registryKind } from '../devices/registry.js';
+import { localHostId } from '../devices/host-identity.js';
 import { createApp, type DashboardTheme } from './app.js';
 
 export interface StartServerOptions {
@@ -31,6 +34,14 @@ export async function startServer(options: StartServerOptions = {}) {
     const host = options.host ?? process.env.WEB_HOST ?? '127.0.0.1';
     const port = options.port ?? Number(process.env.WEB_PORT ?? 3000);
     assertSafeBind(host, authProvider);
+    // The host agent's listener (multi-host) is separate from the dashboard's
+    // bind and checked before anything starts: never a wildcard address, never
+    // without a strong PHONE_FARM_AGENT_TOKEN.
+    const agentBind = process.env.PHONE_FARM_AGENT_BIND?.trim() ? assertSafeAgentBind(process.env.PHONE_FARM_AGENT_BIND) : null;
+    // Fail at startup, not on the first request, on a bad PHONE_FARM_REGISTRY /
+    // PHONE_FARM_HOST_ID or a shared registry that is unreachable or unmigrated.
+    localHostId();
+    if (registryKind() === 'postgres') await loadRegisteredDevices();
     const plugins = new PluginRegistry(loadedPlugins);
     const scheduler = await createSchedulerRuntime(plugins);
     const registrations = new DeviceRegistrationService();
@@ -42,9 +53,14 @@ export async function startServer(options: StartServerOptions = {}) {
     await app.listen({ host, port });
     const address = app.server.address() as AddressInfo;
     console.log(`Phone Farm listening on http://${host}:${address.port}`);
+    const agentListener = agentBind ? await startAgentListener(app, agentBind) : null;
+    if (agentListener) console.log(`Host agent (/agent/* only) listening on ${agentListener.address.host}:${agentListener.address.port}`);
     return {
         app, plugins,
-        async close() { await app.close(); await registrations.close(); await scheduler.close(); await authProvider?.close?.(); },
+        async close() {
+            await agentListener?.close();
+            await app.close(); await registrations.close(); await scheduler.close(); await authProvider?.close?.(); await closeDeviceRegistry();
+        },
     };
 }
 

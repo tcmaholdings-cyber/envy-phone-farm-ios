@@ -102,7 +102,12 @@ export interface PluginRouteContext {
     remote: RemoteControl;
     loadDevices(): Promise<RegisteredDevice[]>;
     saveDevices(devices: RegisteredDevice[]): Promise<void>;
-    /** Load → mutate → save devices.json atomically under the shared in-process lock. Prefer this over load+saveDevices. */
+    /**
+     * Load → mutate → save the device registry atomically (devices.json under the
+     * in-process lock, or one Postgres transaction with PHONE_FARM_REGISTRY=postgres).
+     * Prefer this over load+saveDevices. With Postgres the list holds every host's
+     * phones (`hostId`); passcodes are present only for this host's.
+     */
     mutateDevices<T>(mutate: (devices: RegisteredDevice[]) => T | Promise<T>): Promise<T>;
     renderActivity(deviceUdid: string, message?: string): Promise<string>;
 }

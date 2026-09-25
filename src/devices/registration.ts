@@ -10,6 +10,7 @@ import { switchTikTokAccount, tapCoordinate } from '../tiktok/actions.js';
 import { coordinateProfiles, coordinatesForProfile, profileForProductType, type CoordinateProfile } from './coordinates.js';
 import { connectedDevices, type Device } from './discovery.js';
 import { loadRegisteredDevices, mutateRegisteredDevices, RACK_MAX_LENGTH, RACK_SLOT_MAX_LENGTH, type RegisteredDevice } from './registry.js';
+import { localDevices } from './host-identity.js';
 import { passcodeForDevice, setDevicePasscode } from './secrets.js';
 import { WdaRemoteControl } from './wda-remote.js';
 import { diagnoseWdaLaunchFailure } from './wda/diagnostics.js';
@@ -214,7 +215,8 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
         }
         const candidate = (await this.candidates()).find((device) => device.udid === udid);
         if (!candidate) throw new Error('The selected device is not connected or is already registered');
-        const ports = await allocateDevicePorts(await this.loadDevices(), Array.from(this.sessions.values()));
+        // Forwarded ports only have to be free on this Mac: other hosts' phones do not count.
+        const ports = await allocateDevicePorts(localDevices(await this.loadDevices()), Array.from(this.sessions.values()));
         const checks = Object.fromEntries(checkNames.map((name) => [name, check('pending', 'Not checked yet')])) as RegistrationSession['checks'];
         const session: RegistrationSession = {
             id: udid,

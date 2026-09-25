@@ -36,6 +36,13 @@
       "when": 1790333322327,
       "tag": "0004_execution_effect_committed",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790333781400,
+      "tag": "0005_fleet_hosts_devices",
+      "breakpoints": true
     }
   ]
 }

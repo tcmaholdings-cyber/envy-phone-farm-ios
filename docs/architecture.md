@@ -24,6 +24,12 @@ server‑rendered HTML with HTMX, and live video is MJPEG, not WebSockets.
         └────────────────────┘              └──────────────────┘
 ```
 
+That is one host. Several Macs can share one PostgreSQL, each running these
+four processes for the phones on its own USB tree, with every dashboard able
+to show and drive every phone: see [multi-host.md](multi-host.md) (shared
+`fleet.devices` registry, host leases in `fleet.hosts`, `/agent/*` routes over
+Tailscale, per-phone Apple signing team).
+
 ## The four processes
 
 ### `web` — `src/api/server.ts` → `startServer()` → `src/api/app.ts`
@@ -58,6 +64,10 @@ Fastify app on `WEB_PORT` (default 3000).
   worker heartbeat; 200/503) and `GET /metrics` (Prometheus text, bearer
   `PHONE_FARM_METRICS_TOKEN`). See *Monitoring and alerts* in
   [operations.md](operations.md#monitoring-and-alerts).
+- Serves `/agent/*` (bearer `PHONE_FARM_AGENT_TOKEN`) for its own phones, and
+  forwards requests for another host's phones to that host's agent after the
+  usual grant check; `PHONE_FARM_AGENT_BIND` opens an `/agent/*`-only listener on
+  the Tailscale IP ([multi-host.md](multi-host.md)).
 - Loads plugins (`PHONE_FARM_PLUGINS`) and the auth provider
   (`PHONE_FARM_AUTH_PLUGIN`); mounts each plugin's **panels** on the device
   page and its **routes** under `/plugins/<pluginId>`.
@@ -79,7 +89,8 @@ Headless. Owns task execution.
 - One pg-boss worker per **active** registered device, queue
   `ios-device-<hash(udid)>`. A device with `disabled: true` in `devices.json`
   is skipped here and by `wda-service` — the entry stays but nothing supervises
-  it.
+  it. Only phones this host owns are worked (`PHONE_FARM_HOST_ID`; every phone
+  in `devices.json` is local); another host's worker takes the rest.
 - Every 5 s, `materializeDue()` turns due schedules into `executions` rows and
   enqueues jobs; every 30 s it picks up newly registered devices and stops
   working the queues of removed or disabled ones (one failing device does not
@@ -98,7 +109,8 @@ Headless. Owns task execution.
 - On SIGTERM it drains (see `operations.md`): no new jobs, waiting tasks are
   re-queued, running ones get `WORKER_DRAIN_SECONDS` before SIGTERM → SIGKILL,
   and orphaned Appium sessions for the phone are deleted.
-- Every 15 s it upserts its host's row in `scheduler.worker_heartbeats`
+- Every 15 s it upserts its host's row in `scheduler.worker_heartbeats` (and,
+  with `PHONE_FARM_REGISTRY=postgres`, the host lease in `fleet.hosts`)
   (pid, start time, queue count); `/health/ready` fails when it goes stale.
 - Must load the **same plugin versions** as `web`.
 
@@ -108,7 +120,8 @@ Persistent WebDriverAgent supervisor, controlled over a Unix socket
 
 - Keeps one WDA session alive per registered device, (re)launching
   `xcodebuild test-without-building` as needed and USB‑forwarding WDA
-  (`8100`, `8101`, …) and MJPEG (`9100`, `9101`, …).
+  (`8100`, `8101`, …) and MJPEG (`9100`, `9101`, …). Only this host's phones;
+  each is launched from its signing team's build (`WDA_XCTESTRUN_<TEAM>`).
 - `GET /health` on the socket reports per‑device `{ physical, wda, appium,
   message, restarts, notReadySince, disconnectedSince }`. States: `ready`,
   `unlock-required`, `error`, …
@@ -164,7 +177,9 @@ without the UI, for scripted or bulk (`--all`) setup.
 | PostgreSQL `scheduler.*` | `schedules`, `executions`, `execution_attempts`, `execution_logs`, `assets`, `worker_heartbeats` (one row per host, refreshed every 15 s). Drizzle ORM; migrations in `drizzle/`. |
 | PostgreSQL `pgboss.*` | Job queue (one partitioned queue per device). |
 | PostgreSQL `drizzle.*` | Applied‑migration ledger. |
-| `devices.json` | Registered devices: `udid`, `name`, ports, `coordinateProfile`, per‑device `coordinates` overrides, `passcode`, `disabled`, `pluginData`. Git‑ignored, `0600`. |
+| PostgreSQL `fleet.*` | With `PHONE_FARM_REGISTRY=postgres`: `devices` (every host's phones, each with its `host_id`; ports unique per host; `has_passcode` but never the passcode) and `hosts` (one row per Mac, lease refreshed every 15 s, agent URL). See [multi-host.md](multi-host.md). |
+| `devices.json` | Registered devices (default `file` registry): `udid`, `name`, ports, `coordinateProfile`, per‑device `coordinates` overrides, `passcode`, `disabled`, `signingTeam`, `pluginData`. Git‑ignored, `0600`. |
+| `device-secrets.json` | With the Postgres registry: this host's device passcodes, beside the real `devices.json`. Git‑ignored, `0600`. |
 | `.env` | Configuration and secrets (DB URL, signing IDs, auth keys). Git‑ignored. Device passcodes live in `devices.json`, not here. |
 | `.scheduler-data/assets/` | Uploaded media for `post`‑style tasks, content‑addressed. |
 | `.wda/` | wda-service socket and locks; `.wda/logs/<udid>.log` per-phone WDA output. |
@@ -209,7 +224,9 @@ in `src/scheduler/recurrence.ts`; the next occurrence is written to
 | `src/api/` | Fastify app factory, controllers, middleware, HTTP routes |
 | `src/scheduler/` | runtime, repository, pg-boss queue, recurrence, worker, executor |
 | `src/database/` | Drizzle client, schema, migrate/setup entrypoints |
-| `src/devices/` | discovery, registry (`devices.json`), registration flow, WDA remote, wda-service, coordinate profiles, passcode lookup |
+| `src/devices/` | discovery, registry (`registry.ts`: `devices.json` or Postgres via `registry-pg.ts`), host identity, local passcode store (`device-secrets.ts`), `import-to-db`, registration flow, WDA remote, wda-service, coordinate profiles |
+| `src/hosts/` | Multi-host: the host lease (`fleet.hosts` upsert) and the host directory dashboards read |
+| `src/agent/` | Multi-host: the host agent's token check, its `/agent/*`-only listener (`PHONE_FARM_AGENT_BIND`) and the client that reaches other hosts' phones |
 | `src/devices/wda/` | `prepare.ts` (patch + build + sign WDA), `start.ts` (single-device WDA supervisor), `target-device.ts` (resolve which device a CLI command targets), diagnostics |
 | `src/tiktok/` | TikTok automation entrypoints (`doomscroll.ts`, `post.ts`), OCR, coordinates |
 | `src/tiktok-plugin.ts` | The built‑in plugin: task definitions, device panel, routes |

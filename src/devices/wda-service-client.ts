@@ -1,6 +1,7 @@
 import http from 'node:http';
 
 import { loadRegisteredDevices, type RegisteredDevice } from './registry.js';
+import { localDevices } from './host-identity.js';
 import type {
     DeviceConnections,
     DeviceConnectionStatus,
@@ -80,7 +81,7 @@ export class WdaServiceClient implements DeviceConnections {
 
     constructor(options: WdaServiceClientOptions = {}) {
         this.socketPath = options.socketPath ?? wdaServiceSocketPath();
-        this.loadDevices = options.loadDevices ?? loadRegisteredDevices;
+        this.loadDevices = options.loadDevices ?? (async () => localDevices(await loadRegisteredDevices()));
         this.pollIntervalMs = options.pollIntervalMs ?? 2_000;
         this.requestTimeoutMs = options.requestTimeoutMs ?? 2_000;
         this.requestService = options.requestService ?? requestWdaService;
