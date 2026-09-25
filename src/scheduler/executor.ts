@@ -3,14 +3,18 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 
 import type { DeviceAutomation, PluginProcessSpecification, TaskExecutionContext } from '../plugin.js';
-import { discoverConnectedDevices, type Device } from '../devices/discovery.js';
+import { connectedDevices, connectedDeviceUdids, type Device } from '../devices/discovery.js';
 import { loadRegisteredDevices, type RegisteredDevice } from '../devices/registry.js';
 import { passcodeForDevice } from '../devices/secrets.js';
 import { WdaRemoteControl } from '../devices/wda-remote.js';
 import type { ExecutionRow } from '../database/schema.js';
 import type { PluginRegistry } from '../registry.js';
-import type { TaskExecutionResult } from '../types.js';
+import type { DeviceIdentity, TaskExecutionResult } from '../types.js';
 import type { SchedulerRepository } from './repository.js';
+import { createStartGate, taskStartConcurrency, taskStartWarmupMs } from './start-gate.js';
+
+/** One gate per worker process: every phone's task starts through it. */
+const taskStartGate = createStartGate(taskStartConcurrency());
 
 async function endpointReady(url: string): Promise<boolean> {
     try {
@@ -20,20 +24,77 @@ async function endpointReady(url: string): Promise<boolean> {
     }
 }
 
-async function waitForDevice(execution: ExecutionRow, registered: RegisteredDevice, signal: AbortSignal): Promise<Device> {
+export interface WaitForDeviceDependencies {
+    /** Connected UDIDs. Must be the shared, cached usbmux sweep — never a per-caller lockdown sweep. */
+    connectedUdids(): Promise<string[]>;
+    /** Connected devices with lockdown details, from the shared cache; read once, when the phone is present. */
+    connectedDevices(): Promise<Device[]>;
+    endpointReady(url: string): Promise<boolean>;
+    sleep(milliseconds: number, signal: AbortSignal): Promise<void>;
+    pollMs: number;
+}
+
+function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+        if (signal.aborted) return resolve();
+        const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+        const timer = setTimeout(done, milliseconds);
+        signal.addEventListener('abort', done, { once: true });
+    });
+}
+
+// The presence check used to call discoverConnectedDevices() — three lockdown
+// round trips to *every* attached phone — once per waiting job every 5 s. With
+// 34 jobs waiting on 35 phones that is thousands of usbmuxd connections at
+// once, which overflows usbmuxd's accept backlog: every client on the host then
+// gets ECONNREFUSED on /var/run/usbmuxd. Presence now comes from the
+// process-wide shared usbmux sweep (no lockdown at all, and concurrent waiters
+// share one read); lockdown details are read once, from the shared cached
+// sweep, when the phone is actually there.
+export const defaultWaitForDeviceDependencies: WaitForDeviceDependencies = {
+    connectedUdids: () => connectedDeviceUdids(5_000),
+    connectedDevices: () => connectedDevices(30_000),
+    endpointReady,
+    sleep: abortableSleep,
+    pollMs: 5_000,
+};
+
+export async function waitForDevice(
+    execution: Pick<ExecutionRow, 'deviceUdid' | 'deadlineAt'>,
+    registered: RegisteredDevice,
+    signal: AbortSignal,
+    dependencies: WaitForDeviceDependencies = defaultWaitForDeviceDependencies,
+): Promise<DeviceIdentity> {
     const wdaPort = registered.wdaLocalPort ?? Number(process.env.WDA_LOCAL_PORT ?? 8100);
     const appiumHost = process.env.APPIUM_HOST ?? '127.0.0.1';
     const appiumPort = Number(process.env.APPIUM_PORT ?? 4725);
     let lastProblem = 'device is offline';
     while (Date.now() <= execution.deadlineAt.getTime()) {
         if (signal.aborted) throw new Error('Execution stopped while waiting for the device');
-        const device = (await discoverConnectedDevices()).find(({ udid }) => udid === execution.deviceUdid);
-        if (!device) lastProblem = 'device is offline';
-        else if (!await endpointReady(`http://127.0.0.1:${wdaPort}/status`)) lastProblem = `WDA is unavailable on port ${wdaPort}`;
-        else if (!await endpointReady(`http://${appiumHost}:${appiumPort}/status`)) lastProblem = `Appium is unavailable on port ${appiumPort}`;
-        else return device;
-        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        // A refused usbmuxd connection is transient, and one failed shared sweep
+        // is seen by every waiter at the same moment. Poll again, like an offline
+        // phone, instead of failing the whole batch on one refusal.
+        let present = false;
+        let sweepError: string | undefined;
+        try {
+            present = (await dependencies.connectedUdids()).includes(execution.deviceUdid);
+        } catch (error) {
+            sweepError = error instanceof Error ? error.message : String(error);
+        }
+        if (sweepError) lastProblem = `usbmuxd is unavailable (${sweepError})`;
+        else if (!present) lastProblem = 'device is offline';
+        else if (!await dependencies.endpointReady(`http://127.0.0.1:${wdaPort}/status`)) lastProblem = `WDA is unavailable on port ${wdaPort}`;
+        else if (!await dependencies.endpointReady(`http://${appiumHost}:${appiumPort}/status`)) lastProblem = `Appium is unavailable on port ${appiumPort}`;
+        else {
+            const discovered = (await dependencies.connectedDevices().catch(() => [] as Device[]))
+                .find(({ udid }) => udid === execution.deviceUdid);
+            // A cached sweep older than the reconnect will not list the phone yet;
+            // the registry identity is enough to run on, and costs no USB traffic.
+            return discovered ?? { udid: registered.udid, name: registered.name };
+        }
+        await dependencies.sleep(dependencies.pollMs, signal);
     }
+    if (signal.aborted) throw new Error('Execution stopped while waiting for the device');
     throw new Error(`Execution window expired: ${lastProblem}`);
 }
 
@@ -137,7 +198,7 @@ export async function executeAutomation(
     const stopPoll = setInterval(() => void repository.stopRequested(execution.id).then((requested) => {
         if (requested) controller.abort(new Error('Stop requested'));
     }).catch(console.error), 1_000);
-    let device: Device;
+    let device: DeviceIdentity;
     try {
         device = await waitForDevice(execution, registered, controller.signal);
     } catch (error) {
@@ -166,7 +227,19 @@ export async function executeAutomation(
             assets: await repository.executionAssets(execution),
             signal: controller.signal,
             log: (line) => repository.appendLogs(execution.id, attempt, [line]),
-            runProcess: (specification) => runPluginProcess(specification, environment, controller.signal, (lines) => repository.appendLogs(execution.id, attempt, lines)),
+            runProcess: async (specification) => {
+                if (taskStartGate.wouldWait()) {
+                    await repository.appendLogs(execution.id, attempt, ['Waiting for a start slot (PHONE_FARM_TASK_START_CONCURRENCY)']);
+                }
+                const release = await taskStartGate.acquire(controller.signal);
+                const warmup = setTimeout(release, taskStartWarmupMs());
+                try {
+                    return await runPluginProcess(specification, environment, controller.signal, (lines) => repository.appendLogs(execution.id, attempt, lines));
+                } finally {
+                    clearTimeout(warmup);
+                    release();
+                }
+            },
         };
         return await definition.execute(context, execution.payload);
     } catch (error) {
