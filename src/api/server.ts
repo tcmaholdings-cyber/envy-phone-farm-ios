@@ -8,6 +8,7 @@ import { assertSafeBind } from '../security.js';
 import { createTikTokPlugin } from '../tiktok-plugin.js';
 import { defaultDashboardTheme } from '../dashboard-theme.js';
 import { DeviceRegistrationService } from '../devices/registration.js';
+import { closeDeviceRegistry } from '../devices/registry.js';
 import { createApp, type DashboardTheme } from './app.js';
 
 export interface StartServerOptions {
@@ -44,7 +45,7 @@ export async function startServer(options: StartServerOptions = {}) {
     console.log(`Phone Farm listening on http://${host}:${address.port}`);
     return {
         app, plugins,
-        async close() { await app.close(); await registrations.close(); await scheduler.close(); await authProvider?.close?.(); },
+        async close() { await app.close(); await registrations.close(); await scheduler.close(); await authProvider?.close?.(); await closeDeviceRegistry(); },
     };
 }
 

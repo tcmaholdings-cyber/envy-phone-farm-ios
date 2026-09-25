@@ -1,7 +1,14 @@
 import { chmod, mkdir, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
+import { Pool } from 'pg';
+
+import { databaseUrl } from '../database/client.js';
+import { startHostLease } from '../hosts/lease.js';
+import type { WorkerHeartbeat } from '../observability/heartbeat.js';
 import { DeviceConnectionManager } from './connection-manager.js';
+import { localHostId } from './host-identity.js';
+import { closeDeviceRegistry, registryKind } from './registry.js';
 import { createWdaServiceHttpServer } from './wda-service-http.js';
 import { WdaLogStore, wdaLogOptionsFromEnv } from './wda-log.js';
 import { requestWdaService } from './wda-service-client.js';
@@ -59,8 +66,18 @@ await unlink(socketPath).catch((error: NodeJS.ErrnoException) => {
 
 // Per-phone xcodebuild output: rotated files under WDA_LOG_DIR (.wda/logs) + the last lines in memory.
 const logOptions = wdaLogOptionsFromEnv();
-const connections = new DeviceConnectionManager({ logs: new WdaLogStore(logOptions) });
+const hostId = localHostId();
+const connections = new DeviceConnectionManager({ logs: new WdaLogStore(logOptions), hostId });
 console.log(`WDA supervisor logs: ${logOptions.directory}/<udid>.log`);
+// With the shared Postgres registry this host supervises only its own phones
+// and keeps its fleet.hosts row (the lease) fresh, like the worker does.
+let lease: { pool: Pool; beat: WorkerHeartbeat } | undefined;
+if (registryKind() === 'postgres') {
+    const pool = new Pool({ connectionString: databaseUrl(), max: 1, allowExitOnIdle: true });
+    pool.on('error', (error) => console.error(`Host lease pool: ${error.message}`));
+    lease = { pool, beat: startHostLease(pool, { hostId }) };
+    console.log(`WDA service is host ${hostId} (shared Postgres registry)`);
+}
 let stopping = false;
 let ready = false;
 const server = createWdaServiceHttpServer(connections, () => void shutdown('request'), () => ready);
@@ -71,6 +88,9 @@ async function shutdown(reason: string): Promise<void> {
     console.log(`Stopping WDA service after ${reason}`);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await connections.close();
+    await lease?.beat.stop();
+    await lease?.pool.end().catch(() => undefined);
+    await closeDeviceRegistry();
     await unlink(socketPath).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== 'ENOENT') throw error;
     });

@@ -10,6 +10,9 @@ import { createQueue, ensureDeviceQueue, queueNameForDevice, type ExecutionJob }
 import { SchedulerRepository } from './repository.js';
 import { createTikTokPlugin } from '../tiktok-plugin.js';
 import { startWorkerHeartbeat } from '../observability/heartbeat.js';
+import { localDevices, localHostId } from '../devices/host-identity.js';
+import { closeDeviceRegistry, registryKind } from '../devices/registry.js';
+import { startHostLease } from '../hosts/lease.js';
 
 export interface WorkerRuntime { close(): Promise<void> }
 
@@ -167,14 +170,18 @@ export interface DeviceWorkerOperations {
  * Bring the set of subscribed queues in line with the active devices: one
  * device failing to subscribe must not skip the others, and a device that was
  * removed or disabled stops being worked (a job already running on it finishes).
+ * Only phones this host owns are worked: with the shared Postgres registry a
+ * second Mac's worker would otherwise compete for — and fail — jobs for phones
+ * on another USB tree. A phone moved to another host stops being worked here.
  * `working` maps queue name → UDID and is updated in place.
  */
 export async function syncDeviceWorkers(
     devices: readonly RegisteredDevice[],
     working: Map<string, string>,
     operations: DeviceWorkerOperations,
+    hostId: string = localHostId(),
 ): Promise<{ added: string[]; removed: string[]; failed: string[] }> {
-    const active = activeDevices(devices);
+    const active = activeDevices(localDevices(devices, hostId));
     const wanted = new Set(active.map(({ udid }) => queueNameForDevice(udid)));
     const added: string[] = [];
     const removed: string[] = [];
@@ -213,6 +220,8 @@ export async function startWorker(plugins: PluginRegistry): Promise<WorkerRuntim
     const tracker = new ExecutionTracker();
     const handle = createExecutionHandler(repository, plugins, tracker);
     const workingQueues = new Map<string, string>();
+    // Fails fast on a malformed PHONE_FARM_HOST_ID, before any queue is worked.
+    const hostId = localHostId();
     const operations: DeviceWorkerOperations = {
         async subscribe(device) {
             const queue = await ensureDeviceQueue(boss, device.udid);
@@ -232,7 +241,7 @@ export async function startWorker(plugins: PluginRegistry): Promise<WorkerRuntim
     const registerDeviceWorkers = () => {
         // Serialised, and a failed pass must not poison the chain for the next one.
         syncing = syncing.catch(() => undefined).then(async () => {
-            if (!tracker.draining) await syncDeviceWorkers(await loadRegisteredDevices(), workingQueues, operations);
+            if (!tracker.draining) await syncDeviceWorkers(await loadRegisteredDevices(), workingQueues, operations, hostId);
         });
         return syncing;
     };
@@ -247,7 +256,9 @@ export async function startWorker(plugins: PluginRegistry): Promise<WorkerRuntim
         void repository.sweepOrphanedAssets().catch(console.error);
     }, 60 * 60_000);
     const reconcileTimer = setInterval(() => void repository.reconcileQueueStates().catch(console.error), 60_000);
-    const heartbeat = startWorkerHeartbeat(connection.pool, () => workingQueues.size);
+    const heartbeat = startWorkerHeartbeat(connection.pool, () => workingQueues.size, { host: hostId });
+    // With the shared registry, keep this host's fleet.hosts row fresh (its lease).
+    const lease = registryKind() === 'postgres' ? startHostLease(connection.pool, { hostId }) : null;
     let closing: Promise<void> | undefined;
     return {
         close() {
@@ -267,8 +278,10 @@ export async function startWorker(plugins: PluginRegistry): Promise<WorkerRuntim
                 if (abandoned) console.error(`${abandoned} execution(s) did not stop in time`);
                 // The heartbeat runs through the drain: a draining worker is alive.
                 await heartbeat.stop();
+                await lease?.stop();
                 await boss.stop({ graceful: true, timeout: 10_000 });
                 await connection.close();
+                await closeDeviceRegistry();
             })();
             return closing;
         },

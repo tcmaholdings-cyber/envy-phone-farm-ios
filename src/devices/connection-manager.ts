@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { connectedDeviceUdids } from './discovery.js';
+import { localDevices, localHostId } from './host-identity.js';
 import { activeDevices, loadRegisteredDevices, type RegisteredDevice } from './registry.js';
 import { LineSplitter, redactSecret, WdaLogStore } from './wda-log.js';
 
@@ -49,6 +50,8 @@ interface RuntimeState {
 
 interface ManagerOptions {
     loadDevices?: () => Promise<RegisteredDevice[]>;
+    /** This Mac's PHONE_FARM_HOST_ID; phones another host owns are never supervised here. */
+    hostId?: string;
     connectedUdids?: () => Promise<string[]>;
     spawnSupervisor?: (device: RegisteredDevice) => ChildProcess;
     endpointReady?: (url: string) => Promise<boolean>;
@@ -103,6 +106,7 @@ export class DeviceConnectionManager implements DeviceConnections {
     private readonly endpointReady: (url: string) => Promise<boolean>;
     private readonly pollIntervalMs: number;
     private readonly now: () => number;
+    private readonly hostId: string;
     private readonly logStore: WdaLogStore;
     private readonly runtimes = new Map<string, RuntimeState>();
     private timer?: NodeJS.Timeout;
@@ -117,6 +121,7 @@ export class DeviceConnectionManager implements DeviceConnections {
         this.endpointReady = options.endpointReady ?? defaultEndpointReady;
         this.pollIntervalMs = options.pollIntervalMs ?? 2_000;
         this.now = options.now ?? Date.now;
+        this.hostId = options.hostId ?? localHostId();
         this.logStore = options.logs ?? new WdaLogStore();
     }
 
@@ -157,8 +162,9 @@ export class DeviceConnectionManager implements DeviceConnections {
             ]);
             this.appium = appiumReady ? 'ready' : 'unavailable';
             // Disabled devices are supervised exactly like unregistered ones:
-            // their WDA child is stopped and their runtime forgotten.
-            const devices = activeDevices(allDevices);
+            // their WDA child is stopped and their runtime forgotten. So are
+            // phones another Mac owns (shared Postgres registry): not our USB tree.
+            const devices = activeDevices(localDevices(allDevices, this.hostId));
             const registered = new Set(devices.map(({ udid }) => udid));
             for (const [udid, runtime] of this.runtimes) {
                 if (!registered.has(udid)) {

@@ -1,5 +1,6 @@
 import { discoverConnectedDeviceUdids } from '../discovery.js';
 import { loadRegisteredDevices } from '../registry.js';
+import { localDevices } from '../host-identity.js';
 
 export interface ResolveTargetOptions {
     /** Defaults to `process.argv`. */
@@ -38,7 +39,7 @@ function udidFromArgv(argv: readonly string[]): string | undefined {
 export async function resolveTargetUdid(options: ResolveTargetOptions = {}): Promise<string> {
     const argv = options.argv ?? process.argv;
     const env = options.env ?? process.env;
-    const loadRegistered = options.loadRegistered ?? (() => loadRegisteredDevices());
+    const loadRegistered = options.loadRegistered ?? (async () => localDevices(await loadRegisteredDevices()));
     const loadConnected = options.loadConnected ?? discoverConnectedDeviceUdids;
 
     const fromArgv = udidFromArgv(argv);
@@ -71,7 +72,7 @@ export async function resolveTargetUdid(options: ResolveTargetOptions = {}): Pro
 export async function resolveBuildTargets(options: ResolveTargetOptions = {}): Promise<string[]> {
     const argv = options.argv ?? process.argv;
     if (argv.includes('--all')) {
-        const loadRegistered = options.loadRegistered ?? (() => loadRegisteredDevices());
+        const loadRegistered = options.loadRegistered ?? (async () => localDevices(await loadRegisteredDevices()));
         const registered = await loadRegistered();
         if (registered.length === 0) throw new Error('--all was given but devices.json has no devices');
         return registered.map(({ udid }) => udid);
