@@ -1,0 +1,60 @@
+# Typecheck, tests, compiled-asset drift and a release build on every PR and
+# on pushes to main and feature branches.
+#
+# GitHub-hosted runners only, no secrets, read-only token: pull requests from
+# anyone run here, so nothing in this workflow may reach devices, signing
+# material, a production database or a self-hosted runner (SECURITY.md).
+# macOS because production is macOS (Apple silicon) and the dependency tree
+# includes native modules (sharp, node-native-ocr) built for it.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'feat/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (node ${{ matrix.node }})
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the engines floor in package.json; 25 is what the farm host runs.
+        node: ['22', '25']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck and test
+        run: npm run check
+
+      - name: Compiled browser assets match static/dashboard/ts
+        run: |
+          npm run build:web
+          if ! git diff --exit-code --stat -- static/dashboard/assets \
+             || [ -n "$(git status --porcelain -- static/dashboard/assets)" ]; then
+            echo "::error::static/dashboard/assets is stale. Run 'npm run build:web' and commit the output."
+            git status --porcelain -- static/dashboard/assets
+            exit 1
+          fi
+
+      - name: Release tarball builds
+        run: scripts/release.sh --skip-build-check --out "$RUNNER_TEMP/release"
