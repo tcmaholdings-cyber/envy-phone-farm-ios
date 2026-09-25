@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { coordinatesForProfile, validateCoordinateOverrides, type DeviceCoordinateOverrides, type DeviceProfileName } from './coordinates.js';
@@ -141,10 +141,31 @@ export async function saveRegisteredDevices(devices: RegisteredDevice[], registr
         if (unique.has(device.udid)) throw new Error(`Device ${device.udid} is already registered`);
         unique.add(device.udid);
     }
-    await mkdir(path.dirname(registryPath), { recursive: true });
-    const temporaryPath = `${registryPath}.${process.pid}.tmp`;
+    const target = await writeTarget(registryPath);
+    await mkdir(path.dirname(target), { recursive: true });
+    const temporaryPath = `${target}.${process.pid}.tmp`;
     await writeFile(temporaryPath, `${JSON.stringify(devices, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporaryPath, registryPath);
+    await rename(temporaryPath, target);
+}
+
+/**
+ * The file an atomic save must replace. A release deploy links devices.json to
+ * `shared/devices.json`; renaming over the link itself would swap it for a
+ * plain file inside that release and the next deploy would lose every change,
+ * so resolve the link and replace the file it points at.
+ */
+async function writeTarget(registryPath: string): Promise<string> {
+    try {
+        return await realpath(registryPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    try {  // a dangling link: create the file it names
+        const link = await readlink(registryPath);
+        return path.resolve(path.dirname(registryPath), link);
+    } catch {
+        return registryPath;
+    }
 }
 
 // Every load-modify-save of devices.json in one process must go through here,
