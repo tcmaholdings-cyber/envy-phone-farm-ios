@@ -4,7 +4,7 @@ import test from 'node:test';
 import type { ChildProcess } from 'node:child_process';
 
 import { DeviceConnectionManager, supervisorEnvironment } from '../src/devices/connection-manager.js';
-import { signingTeamXctestrunKey, wdaBuildArgs, wdaLaunchArgs, xctestrunFor } from '../src/devices/wda/runner-args.js';
+import { signingAuthArgs, signingTeamXctestrunKey, wdaBuildArgs, wdaLaunchArgs, xctestrunFor } from '../src/devices/wda/runner-args.js';
 
 const env = { XCODE_ORG_ID: 'TEAM123456', WDA_BUNDLE_ID: 'com.example.wda' };
 
@@ -96,4 +96,15 @@ test('wdaBuildArgs signs for one device, or generically into a derived data fold
     assert.ok(!generic.includes('-allowProvisioningDeviceRegistration'), 'a generic build has no device to register');
     assert.ok(generic.includes('generic/platform=iOS'));
     assert.deepEqual(generic.slice(generic.indexOf('-derivedDataPath'), generic.indexOf('-derivedDataPath') + 2), ['-derivedDataPath', '/d']);
+});
+
+test('wdaBuildArgs signs with an App Store Connect API key when all three settings are set', () => {
+    const key = { XCODE_AUTH_KEY_PATH: '/k/AuthKey_ABC.p8', XCODE_AUTH_KEY_ID: 'ABC', XCODE_AUTH_KEY_ISSUER_ID: 'issuer' };
+    const args = wdaBuildArgs({ ...env, ...key }, '/p', { generic: true, derivedDataPath: '/d' });
+    const at = args.indexOf('-authenticationKeyPath');
+    assert.deepEqual(args.slice(at, at + 6), [
+        '-authenticationKeyPath', '/k/AuthKey_ABC.p8', '-authenticationKeyID', 'ABC', '-authenticationKeyIssuerID', 'issuer',
+    ]);
+    assert.deepEqual(signingAuthArgs(env), [], 'no key configured: Xcode account signing as before');
+    assert.throws(() => signingAuthArgs({ XCODE_AUTH_KEY_ID: 'ABC' }), /all of XCODE_AUTH_KEY_PATH/);
 });

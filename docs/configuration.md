@@ -51,6 +51,7 @@ big rack that feels sluggish, lower them on a two-phone bench.
 | `XCODE_ORG_ID` | Apple Developer **Team ID** used to sign WebDriverAgent. |
 | `XCODE_SIGNING_ID` | Signing identity, normally `Apple Development`. |
 | `WDA_BUNDLE_ID` | Bundle id of the signed WebDriverAgent runner, unique per Team. |
+| `XCODE_AUTH_KEY_PATH`, `XCODE_AUTH_KEY_ID`, `XCODE_AUTH_KEY_ISSUER_ID` | Optional App Store Connect API key (`.p8` path, key id, issuer id) passed to `xcodebuild` by `wda:prepare`, so signing works without an Apple ID signed in to Xcode. Set all three or none. Create the key in App Store Connect → Users and Access → Integrations with the Admin role. |
 | `IOS_PLATFORM_VERSION` | iOS version of the fleet (Appium capability). |
 | `XCODE_DEVELOPER_DIR` | Optional. Pin a specific Xcode (`/Applications/Xcode-26.app/Contents/Developer`) instead of `xcode-select`'s. |
 | `IOS_UDID` | Optional. Pins which phone the CLI scripts (`wda:prepare`, `wda:start`) target when more than one is connected; `--udid` wins over it. |

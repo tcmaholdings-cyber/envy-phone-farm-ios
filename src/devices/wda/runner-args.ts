@@ -8,6 +8,22 @@ const buildSettings = (env: NodeJS.ProcessEnv, teamId: string, bundleId: string)
     'COMPILER_INDEX_STORE_ENABLE=NO',
 ];
 
+/**
+ * App Store Connect API key flags for xcodebuild's automatic signing, so a
+ * signing Mac needs no Xcode Apple ID sign-in (which did not persist on the
+ * laptop, 2026-09-25). All three env vars or none; a partial set is an error.
+ */
+export function signingAuthArgs(env: NodeJS.ProcessEnv): string[] {
+    const keyPath = env.XCODE_AUTH_KEY_PATH;
+    const keyId = env.XCODE_AUTH_KEY_ID;
+    const issuerId = env.XCODE_AUTH_KEY_ISSUER_ID;
+    if (!keyPath && !keyId && !issuerId) return [];
+    if (!keyPath || !keyId || !issuerId) {
+        throw new Error('Set all of XCODE_AUTH_KEY_PATH, XCODE_AUTH_KEY_ID and XCODE_AUTH_KEY_ISSUER_ID, or none');
+    }
+    return ['-authenticationKeyPath', keyPath, '-authenticationKeyID', keyId, '-authenticationKeyIssuerID', issuerId];
+}
+
 function required(env: NodeJS.ProcessEnv, name: string): string {
     const value = env[name];
     if (!value) throw new Error(`${name} is required in .env`);
@@ -82,6 +98,7 @@ export function wdaBuildArgs(
     return [
         'build-for-testing',
         '-allowProvisioningUpdates',
+        ...signingAuthArgs(env),
         ...('udid' in target && env.ALLOW_PROVISIONING_DEVICE_REGISTRATION === 'true'
             ? ['-allowProvisioningDeviceRegistration']
             : []),
