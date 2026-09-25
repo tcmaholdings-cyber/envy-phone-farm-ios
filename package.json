@@ -33,6 +33,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node --env-file-if-exists=.env --import tsx src/database/migrate.ts",
     "db:setup": "node --env-file-if-exists=.env --import tsx src/database/setup.ts",
+    "deploy:smoke": "node --env-file-if-exists=.env --env-file-if-exists=.env.devices --import tsx scripts/smoke.ts",
     "users": "node --env-file-if-exists=.env --import tsx src/auth/cli.ts",
     "devices": "node --env-file-if-exists=.env --env-file-if-exists=.env.devices --import tsx src/devices/cli.ts",
     "worker": "node --env-file-if-exists=.env --env-file-if-exists=.env.devices --import tsx src/scheduler/worker.ts",

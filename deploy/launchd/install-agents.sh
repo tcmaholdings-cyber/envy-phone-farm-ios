@@ -20,17 +20,37 @@
 #                         PHONE_FARM_HEARTBEAT_URL (off-host dead-man's switch).
 #                         Installed only when that variable is set (env or .env);
 #                         removed again when it is not.
-# Logs: <repo>/logs/<agent>.log (git-ignored). Restart one: `launchctl kickstart -k gui/$(id -u)/<label>`.
+#
+# Where the agents run from:
+#   release layout (scripts/deploy.sh; this script lives in <root>/releases/<id>/,
+#   or PHONE_FARM_ROOT is set): WorkingDirectory <root>/current, logs in
+#   <root>/shared/logs. A deploy only re-points current and restarts the agents;
+#   the plists never name a release, so they survive every deploy unchanged.
+#   flat checkout (development, or a host not yet migrated): WorkingDirectory is
+#   this checkout, logs in <repo>/logs.
+# Overrides: PHONE_FARM_WORKDIR (WorkingDirectory), PHONE_FARM_LOG_DIR.
+# Restart one: `launchctl kickstart -k gui/$(id -u)/<label>`. Safe to re-run.
 set -euo pipefail
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 PREFIX=${PHONE_FARM_LAUNCHD_PREFIX:-com.phone-farm}
 AGENTS="$HOME/Library/LaunchAgents"
-LOGS="$REPO/logs"
+ROOT=${PHONE_FARM_ROOT:-}
+if [ -z "$ROOT" ] && [ "$(basename "$(dirname "$REPO")")" = releases ]; then
+  ROOT=$(dirname "$(dirname "$REPO")")
+fi
+if [ -n "$ROOT" ]; then
+  [ -L "$ROOT/current" ] || { echo "$ROOT/current is missing — deploy a release first (scripts/deploy.sh)"; exit 1; }
+  WORKDIR=${PHONE_FARM_WORKDIR:-$ROOT/current}
+  LOGS=${PHONE_FARM_LOG_DIR:-$ROOT/shared/logs}
+else
+  WORKDIR=${PHONE_FARM_WORKDIR:-$REPO}
+  LOGS=${PHONE_FARM_LOG_DIR:-$REPO/logs}
+fi
 DRY=${1:-}
 NODE_BIN=$(dirname "$(command -v node)")
 NPM="$NODE_BIN/npm"
 [ -x "$NPM" ] || { echo "npm not found next to node ($NODE_BIN)"; exit 1; }
-[ -f "$REPO/.env" ] || { echo "$REPO/.env is missing — copy .env.example first"; exit 1; }
+[ -f "$WORKDIR/.env" ] || { echo "$WORKDIR/.env is missing — copy .env.example first"; exit 1; }
 mkdir -p "$AGENTS" "$LOGS"
 # launchd SIGKILLs a job this many seconds after SIGTERM (its default is 20).
 # The worker drains running tasks for WORKER_DRAIN_SECONDS (default 120), then
@@ -46,7 +66,7 @@ plist () {  # name, keepalive(true|false), program args (xml <string> lines), [e
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$PREFIX.$name</string>
-  <key>WorkingDirectory</key><string>$REPO</string>
+  <key>WorkingDirectory</key><string>$WORKDIR</string>
   <key>ProgramArguments</key>
   <array>
 $args
@@ -74,7 +94,7 @@ npm_args () {  # npm script name -> ProgramArguments xml
 
 # The heartbeat agent exists only when a push URL is configured. The URL itself
 # stays in .env (0600); heartbeat.sh reads it at run time, never the plist.
-heartbeat_url=${PHONE_FARM_HEARTBEAT_URL:-$(grep -E '^[[:space:]]*(export[[:space:]]+)?PHONE_FARM_HEARTBEAT_URL=.' "$REPO/.env" 2>/dev/null | tail -n 1 || true)}
+heartbeat_url=${PHONE_FARM_HEARTBEAT_URL:-$(grep -E '^[[:space:]]*(export[[:space:]]+)?PHONE_FARM_HEARTBEAT_URL=.' "$WORKDIR/.env" 2>/dev/null | tail -n 1 || true)}
 
 declare -a NAMES=(db appium wda-service worker web)
 if [ -n "$heartbeat_url" ]; then
@@ -91,14 +111,14 @@ fi
 for name in "${NAMES[@]}"; do
   extra=
   case $name in
-    db)      args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/db-up.sh</string>' "$REPO"); keep=false ;;
+    db)      args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/db-up.sh</string>' "$WORKDIR"); keep=false ;;
     # launchd labels cannot hold ':', so the label is wda-service but the npm script is wda:service.
     wda-service) args=$(npm_args "wda:service"); keep=true ;;
     # Long ExitTimeOut so a restart drains running tasks instead of killing them mid-post.
     worker)  args=$(npm_args worker); keep=true
              extra=$'\n  <key>ExitTimeOut</key><integer>'"$WORKER_EXIT_TIMEOUT"'</integer>' ;;
     # One-shot every 60 s (StartInterval), not a daemon; curl --max-time bounds each run.
-    heartbeat) args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/heartbeat.sh</string>' "$REPO"); keep=false
+    heartbeat) args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/heartbeat.sh</string>' "$WORKDIR"); keep=false
                extra=$'\n  <key>StartInterval</key><integer>60</integer>' ;;
     *)       args=$(npm_args "$name"); keep=true ;;
   esac
@@ -122,4 +142,4 @@ done
 echo
 echo "Agents loaded. Status:"
 launchctl list | grep "$PREFIX" || true
-echo "Logs: $LOGS/*.log   ·   Restart one: launchctl kickstart -k gui/$(id -u)/$PREFIX.web"
+echo "Runs from: $WORKDIR   ·   Logs: $LOGS/*.log   ·   Restart one: launchctl kickstart -k gui/$(id -u)/$PREFIX.web"
