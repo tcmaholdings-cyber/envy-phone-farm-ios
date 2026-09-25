@@ -1,17 +1,22 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { writePrivateFileAtomic } from './atomic-file.js';
+import { writePrivateFileAtomic, writeTarget } from './atomic-file.js';
 
 /**
  * The host-local secret store used with the Postgres registry.
  *
  * Device passcodes never enter Postgres (AGENTS.md invariant 4): the shared
  * database only records `has_passcode`. The passcode itself stays in this
- * 0600, git-ignored JSON file on the Mac that owns the phone —
- * `PHONE_FARM_DEVICE_SECRETS_PATH`, default `device-secrets.json`:
+ * 0600, git-ignored JSON file on the Mac that owns the phone:
  *
  *     { "<udid>": { "passcode": "123456" } }
+ *
+ * Where: `PHONE_FARM_DEVICE_SECRETS_PATH`, else `device-secrets.json` in the
+ * directory that really holds devices.json. In the release layout devices.json
+ * is a link to `~/phone-farm/shared/devices.json`, so the secrets land in
+ * `shared/` too and survive the next deploy instead of staying behind in an
+ * old release directory.
  */
 export interface DeviceSecret {
     passcode?: string;
@@ -19,17 +24,29 @@ export interface DeviceSecret {
 
 export type DeviceSecrets = Record<string, DeviceSecret>;
 
-export function defaultDeviceSecretsPath(env: NodeJS.ProcessEnv = process.env): string {
-    return path.resolve(env.PHONE_FARM_DEVICE_SECRETS_PATH ?? 'device-secrets.json');
+export async function defaultDeviceSecretsPath(env: NodeJS.ProcessEnv = process.env): Promise<string> {
+    if (env.PHONE_FARM_DEVICE_SECRETS_PATH?.trim()) return path.resolve(env.PHONE_FARM_DEVICE_SECRETS_PATH.trim());
+    const devicesFile = await writeTarget(path.resolve(env.DEVICES_CONFIG_PATH ?? 'devices.json'));
+    return path.join(path.dirname(devicesFile), 'device-secrets.json');
 }
 
 export class DeviceSecretStore {
-    constructor(readonly filePath: string = defaultDeviceSecretsPath()) {}
+    private resolved: Promise<string> | undefined;
+
+    /** Without `filePath`, the location is resolved on first use (see `defaultDeviceSecretsPath`). */
+    constructor(private readonly explicitPath?: string) {}
+
+    /** Where the secrets are read from and written to. */
+    filePath(): Promise<string> {
+        this.resolved ??= this.explicitPath ? Promise.resolve(path.resolve(this.explicitPath)) : defaultDeviceSecretsPath();
+        return this.resolved;
+    }
 
     async read(): Promise<DeviceSecrets> {
+        const file = await this.filePath();
         let raw: string;
         try {
-            raw = await readFile(this.filePath, 'utf8');
+            raw = await readFile(file, 'utf8');
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
             throw error;
@@ -39,9 +56,9 @@ export class DeviceSecretStore {
             parsed = JSON.parse(raw);
         } catch (error) {
             // Never echo the file: it holds passcodes.
-            throw new Error(`${this.filePath} contains invalid JSON (${error instanceof SyntaxError ? 'syntax error' : 'unreadable'})`);
+            throw new Error(`${file} contains invalid JSON (${error instanceof SyntaxError ? 'syntax error' : 'unreadable'})`);
         }
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${this.filePath} must hold a JSON object keyed by UDID`);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${file} must hold a JSON object keyed by UDID`);
         const secrets: DeviceSecrets = {};
         for (const [udid, value] of Object.entries(parsed as Record<string, unknown>)) {
             if (!value || typeof value !== 'object') continue;
@@ -58,7 +75,7 @@ export class DeviceSecretStore {
             const passcode = secrets[udid]?.passcode;
             if (passcode) compact[udid] = { passcode };
         }
-        // Through a symlink to the file it names, like devices.json (release layout: shared/).
-        await writePrivateFileAtomic(this.filePath, `${JSON.stringify(compact, null, 2)}\n`);
+        // Through a symlink to the file it names, like devices.json.
+        await writePrivateFileAtomic(await this.filePath(), `${JSON.stringify(compact, null, 2)}\n`);
     }
 }

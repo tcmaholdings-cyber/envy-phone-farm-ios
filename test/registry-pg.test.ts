@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { DeviceSecretStore } from '../src/devices/device-secrets.js';
+import { defaultDeviceSecretsPath, DeviceSecretStore } from '../src/devices/device-secrets.js';
 import { importDevicesToRegistry } from '../src/devices/import-to-db.js';
 import { assignMissingPorts, planDeviceWrites, PostgresDeviceRegistry, rowToDevice } from '../src/devices/registry-pg.js';
 import { redactDevice, type RegisteredDevice } from '../src/devices/registry.js';
@@ -54,7 +54,7 @@ test('a passcode is written to the local 0600 secret file and never to Postgres'
     const { db, registry, secrets } = await setup();
     await registry.mutate((devices) => { devices.push({ udid: 'u1', name: 'One', passcode: '246810', pluginData: {} }); });
     assert.deepEqual(await secrets.read(), { u1: { passcode: '246810' } });
-    assert.equal((await stat(secrets.filePath)).mode & 0o777, 0o600);
+    assert.equal((await stat(await secrets.filePath())).mode & 0o777, 0o600);
     assert.equal(db.devices[0]!.has_passcode, true);
     assert.ok(!db.allValues().some((value) => value.includes('246810')), 'the passcode reached a SQL statement');
 
@@ -217,6 +217,18 @@ test('the secret store writes through a release symlink instead of replacing it'
     assert.ok((await lstat(link)).isSymbolicLink(), 'the link survives the save');
     assert.deepEqual(JSON.parse(await readFile(shared, 'utf8')), { u: { passcode: '1357' } });
     assert.equal((await stat(shared)).mode & 0o777, 0o600);
+});
+
+test('by default the secrets sit beside the real devices.json, so a release link keeps them in shared/', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'pf-secrets-default-'));
+    const shared = path.join(directory, 'shared');
+    const release = path.join(directory, 'releases', 'r1');
+    await mkdir(shared, { recursive: true });
+    await mkdir(release, { recursive: true });
+    await writeFile(path.join(shared, 'devices.json'), '[]');
+    await symlink(path.join(shared, 'devices.json'), path.join(release, 'devices.json'));
+    assert.equal(await defaultDeviceSecretsPath({ DEVICES_CONFIG_PATH: path.join(release, 'devices.json') }), path.join(await realpath(shared), 'device-secrets.json'));
+    assert.equal(await defaultDeviceSecretsPath({ PHONE_FARM_DEVICE_SECRETS_PATH: '/x/y.json' }), '/x/y.json');
 });
 
 test('the secret store ignores junk and never echoes a malformed file', async () => {
