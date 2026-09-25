@@ -37,6 +37,13 @@ export interface TaskExecutionContext {
     signal: AbortSignal;
     log(line: string): Promise<void>;
     runProcess(specification: PluginProcessSpecification): Promise<TaskExecutionResult>;
+    /**
+     * Call immediately *before* an irreversible side effect (a public post).
+     * From then on the execution is never retried or re-run. A subprocess
+     * reports the same thing by printing `EFFECT_COMMITTED_MARKER`
+     * (src/scheduler/effects.ts). Optional so older hosts stay compatible.
+     */
+    commitEffect?(description: string): Promise<void>;
 }
 
 export interface PluginProcessSpecification {

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { remote, type Browser } from 'webdriverio';
 
-import { loadRegisteredDevices, resolveDeviceCoordinates, WdaRemoteControl } from '@git-agni/phone-farm-core';
+import { loadRegisteredDevices, reportEffectCommitted, resolveDeviceCoordinates, WdaRemoteControl } from '@git-agni/phone-farm-core';
 import type { PostManifest } from './post-manifest.js';
 import { type TikTokCoordinates } from './coordinates.js';
 import { coordinateProfile, registeredAccounts } from './runtime-settings.js';
@@ -259,6 +259,9 @@ if (!reachedCaptionScreen || !driver) {
 
 try {
     await addCaption(driver, tiktokCoordinates, manifest.caption);
+    // Reported *before* the tap: from here on the scheduler never retries or
+    // re-runs this execution, even if the tap or the upload then fails.
+    await reportEffectCommitted(manifest.destination === 'publish' ? 'TikTok Post tap' : 'TikTok Drafts tap');
     if (manifest.destination === 'publish') {
         await tapCoordinate(driver, tiktokCoordinates.finish.x, tiktokCoordinates.finish.y, 'Post');
         console.log('TikTok post submitted');
