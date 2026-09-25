@@ -16,6 +16,10 @@
 #   <prefix>.wda-service  WebDriverAgent supervisor (one WDA per phone)
 #   <prefix>.worker       scheduler worker
 #   <prefix>.web          dashboard + API on WEB_HOST:WEB_PORT
+#   <prefix>.heartbeat    every 60 s: GET /health/ready, and only on 200 ping
+#                         PHONE_FARM_HEARTBEAT_URL (off-host dead-man's switch).
+#                         Installed only when that variable is set (env or .env);
+#                         removed again when it is not.
 # Logs: <repo>/logs/<agent>.log (git-ignored). Restart one: `launchctl kickstart -k gui/$(id -u)/<label>`.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -29,8 +33,8 @@ NPM="$NODE_BIN/npm"
 [ -f "$REPO/.env" ] || { echo "$REPO/.env is missing — copy .env.example first"; exit 1; }
 mkdir -p "$AGENTS" "$LOGS"
 
-plist () {  # name, keepalive(true|false), program args (xml <string> lines)
-  local name=$1 keep=$2 args=$3
+plist () {  # name, keepalive(true|false), program args (xml <string> lines), [extra xml]
+  local name=$1 keep=$2 args=$3 extra=${4:-}
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,7 +54,7 @@ $args
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><$keep/>
-  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ThrottleInterval</key><integer>10</integer>$extra
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>$LOGS/$name.log</string>
   <key>StandardErrorPath</key><string>$LOGS/$name.log</string>
@@ -63,15 +67,34 @@ npm_args () {  # npm script name -> ProgramArguments xml
   printf '    <string>%s</string>\n    <string>run</string>\n    <string>%s</string>' "$NPM" "$1"
 }
 
+# The heartbeat agent exists only when a push URL is configured. The URL itself
+# stays in .env (0600); heartbeat.sh reads it at run time, never the plist.
+heartbeat_url=${PHONE_FARM_HEARTBEAT_URL:-$(grep -E '^[[:space:]]*(export[[:space:]]+)?PHONE_FARM_HEARTBEAT_URL=.' "$REPO/.env" 2>/dev/null | tail -n 1 || true)}
+
 declare -a NAMES=(db appium wda-service worker web)
+if [ -n "$heartbeat_url" ]; then
+  NAMES+=(heartbeat)
+elif [ "$DRY" != "--dry-run" ]; then
+  # Idempotent in both directions: unsetting the URL and re-running removes the agent.
+  if launchctl bootout "gui/$(id -u)/$PREFIX.heartbeat" 2>/dev/null || [ -f "$AGENTS/$PREFIX.heartbeat.plist" ]; then
+    rm -f "$AGENTS/$PREFIX.heartbeat.plist"
+    echo "removed $PREFIX.heartbeat (PHONE_FARM_HEARTBEAT_URL is not set)"
+  fi
+else
+  echo "(PHONE_FARM_HEARTBEAT_URL is not set: no heartbeat agent)"
+fi
 for name in "${NAMES[@]}"; do
+  extra=
   case $name in
     db)      args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/db-up.sh</string>' "$REPO"); keep=false ;;
     # launchd labels cannot hold ':', so the label is wda-service but the npm script is wda:service.
     wda-service) args=$(npm_args "wda:service"); keep=true ;;
+    # One-shot every 60 s (StartInterval), not a daemon; curl --max-time bounds each run.
+    heartbeat) args=$(printf '    <string>/bin/bash</string>\n    <string>%s/deploy/launchd/heartbeat.sh</string>' "$REPO"); keep=false
+               extra=$'\n  <key>StartInterval</key><integer>60</integer>' ;;
     *)       args=$(npm_args "$name"); keep=true ;;
   esac
-  content=$(plist "$name" "$keep" "$args")
+  content=$(plist "$name" "$keep" "$args" "$extra")
   target="$AGENTS/$PREFIX.$name.plist"
   if [ "$DRY" = "--dry-run" ]; then
     echo "----- $target"; echo "$content"; continue
