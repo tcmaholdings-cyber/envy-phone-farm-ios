@@ -81,11 +81,23 @@ Headless. Owns task execution.
   is skipped here and by `wda-service` — the entry stays but nothing supervises
   it.
 - Every 5 s, `materializeDue()` turns due schedules into `executions` rows and
-  enqueues jobs; every 30 s it picks up newly registered devices.
+  enqueues jobs; every 30 s it picks up newly registered devices and stops
+  working the queues of removed or disabled ones (one failing device does not
+  hold up the rest).
 - For each job: `executeAutomation()` (`src/scheduler/executor.ts`) waits for
   the device + WDA + Appium to be ready, builds a `TaskExecutionContext`, and
   calls the task's `execute()`. Handles attempts, retry policy, stop requests,
-  and the run‑window deadline.
+  and the run‑window deadline. Presence comes from the shared, cached usbmux
+  sweep, so waiting jobs do not each sweep every phone over lockdown.
+- A schedule is materialized in its own savepoint; a task version that is not
+  installed records a `skipped` execution instead of blocking the batch. The
+  pg-boss job expiry covers run window + task duration + 10 min.
+- A task that reports its irreversible side effect (the TikTok Post/Drafts tap)
+  sets `executions.effect_committed_at`; such an execution is never retried or
+  re-run.
+- On SIGTERM it drains (see `operations.md`): no new jobs, waiting tasks are
+  re-queued, running ones get `WORKER_DRAIN_SECONDS` before SIGTERM → SIGKILL,
+  and orphaned Appium sessions for the phone are deleted.
 - Every 15 s it upserts its host's row in `scheduler.worker_heartbeats`
   (pid, start time, queue count); `/health/ready` fails when it goes stale.
 - Must load the **same plugin versions** as `web`.

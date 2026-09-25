@@ -22,6 +22,22 @@ Order matters only at first boot: `db` → `appium` + `wda-service` → `worker`
 + `web`. KeepAlive restarts a crashed process after 10 s, so a temporarily
 missing dependency just produces a few retries in the log.
 
+Restarting the worker is safe but not instant, and it is never needed to pick
+up a new phone (it re-reads `devices.json` every 30 s). On SIGTERM it stops
+taking jobs, then drains for up to `WORKER_DRAIN_SECONDS` (120 s): a task still
+waiting for its phone is queued again for the next worker, a doomscroll is
+stopped, and a post is given the time to finish. Whatever is still running at
+the deadline is stopped (SIGTERM, SIGKILL 15 s later), and any Appium session
+it left open is deleted. launchd's `ExitTimeOut` for the worker is 180 s, so
+`kickstart -k` can take up to three minutes.
+
+A run that failed *after* its post was submitted is marked failed with "Not
+re-run: the task already committed its side effect". It is never retried, by
+the scheduler or by the Retry button, because that would post twice. Check the
+account and schedule a new post if it really did not go out. A schedule whose
+task version is no longer installed records a **skipped** run with the reason
+and moves on to its next occurrence.
+
 Postgres: `docker compose ps`, `npm run db:up`, `docker compose stop postgres`.
 
 ## Watching

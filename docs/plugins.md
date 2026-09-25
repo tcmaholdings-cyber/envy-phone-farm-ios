@@ -108,10 +108,16 @@ export const likeTask: TaskDefinition<LikePayload> = {
 | `workspaceDirectory` | Private temp dir, deleted after the run |
 | `signal` | `AbortSignal` — fires on stop request or deadline. **Check it and return `{ stopped: true }` promptly.** |
 | `log(line)` | Append one line to the durable execution log |
-| `runProcess(spec)` | Spawn `node --import tsx <entrypoint>`; stdout/stderr stream into the execution log; killed on abort. Returns `{ exitCode, stopped, error? }` |
+| `runProcess(spec)` | Spawn `node --import tsx <entrypoint>`; stdout/stderr stream into the execution log; on abort it gets SIGTERM, then SIGKILL after `WORKER_KILL_GRACE_SECONDS`. Returns `{ exitCode, stopped, error? }` |
+| `commitEffect(description)` | Optional. Call it immediately **before** an irreversible side effect (a public post). From then on the execution is never retried or re-run. A `runProcess` subprocess does the same by printing a line that starts with `EFFECT_COMMITTED_MARKER` (or `await reportEffectCommitted('…')`, both exported by the package). |
 
 `execute` returns `TaskExecutionResult`: `{ exitCode: number | null, stopped:
 boolean, error?: string }`. `exitCode === 0 && !error` is success.
+
+When the worker shuts down it signals `context.signal` at once only if the task
+`supportsStop`; a task that does not is left to finish for up to
+`WORKER_DRAIN_SECONDS`, then stopped. A task that failed after `commitEffect`
+is not retried, whatever its `retryPolicy` says.
 
 ## Versioning (the one rule that matters)
 
