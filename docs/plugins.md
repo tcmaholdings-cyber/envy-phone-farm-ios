@@ -213,9 +213,13 @@ routeAccess: {
 },
 ```
 
-A route you do not declare is **admin-only**. A `device` route answers 404 for
-a phone the caller cannot see. A signed-in route that returns per-phone data
-must filter it itself. You cannot change the requirement of a core route.
+A route you do not declare — or declare as `admin` — is **platform-only**
+(the farm operator's staff). A `device` route answers 404 for a phone the
+caller cannot see, including every phone of another tenant. A signed-in route
+that returns per-phone data must filter it itself, to the caller's tenant and
+phones: `context.requestActor(request)` gives the caller's user and tenant ids
+([tenants.md](tenants.md#for-plugin-authors)). You cannot change the
+requirement of a core route.
 
 ### WDA extensions
 `wdaExtensions` declares patch files (path + sha256) your plugin needs applied

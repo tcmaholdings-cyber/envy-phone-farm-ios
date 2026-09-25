@@ -148,7 +148,7 @@ The simplest way is the built-in accounts:
 PHONE_FARM_AUTH_PLUGIN=builtin
 
 npm run db:migrate                                    # creates the auth tables
-npm run users -- create alice --role admin --name "Alice"
+npm run users -- create alice --role platform --name "Alice"
 # prints a temporary password once, on stdout — hand it over privately
 npm run web
 ```
@@ -156,7 +156,8 @@ npm run web
 Open the dashboard, sign in as `alice` with the temporary password, and choose
 a real one (12+ characters). Add more people from **Team** in the navigation;
 [operations.md](operations.md#team-access-and-vas) explains roles, groups and
-per-phone access. Other CLI commands: `npm run users -- reset-password <username>`
+per-phone access, and [tenants.md](tenants.md) how to host several customer
+organisations on one farm. Other CLI commands: `npm run users -- reset-password <username>`
 and `npm run users -- list`.
 
 To use your own identity system instead, set `PHONE_FARM_AUTH_PLUGIN` to an

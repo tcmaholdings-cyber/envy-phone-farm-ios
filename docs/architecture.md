@@ -77,9 +77,15 @@ Fastify app on `WEB_PORT` (default 3000).
   provider who is calling; a `preHandler` looks the matched route up in one
   table (`src/auth/route-access.ts`) and checks the caller's level on the phone
   the route touches (`src/auth/policy.ts`). List routes filter to the caller's
-  phones. With `PHONE_FARM_AUTH_PLUGIN=builtin` users, groups, grants and
-  sessions live in Postgres schema `auth`; with no provider everything is
-  allowed (loopback-only use). The worker is system-level and never checks users.
+  tenant and phones; another tenant's phone, schedule, run, upload, person or
+  group is a 404 ([tenants.md](tenants.md)). With `PHONE_FARM_AUTH_PLUGIN=builtin`
+  tenants, users, groups, grants, phone ownership and sessions live in Postgres
+  schema `auth`; with no provider everything is allowed (loopback-only use).
+  The worker is system-level and never checks users (it does skip a suspended
+  tenant's schedules).
+- **Audit.** An `onResponse` hook writes every state-changing request to the
+  append-only `auth.audit_log` (route pattern and ids, never bodies);
+  account events get rows of their own ([tenants.md](tenants.md#audit-log)).
 - Owns device **registration** (`DeviceRegistrationService`) and creates the
   scheduler runtime used to enqueue work.
 
@@ -128,7 +134,7 @@ Persistent WebDriverAgent supervisor, controlled over a Unix socket
 - Every line a phone's supervisor child prints (its xcodebuild output and
   `[wda-state]` markers) goes to `.wda/logs/<udid>.log`, rotated at 5 MB × 3,
   and the last 200 lines stay in memory: `GET /devices/:udid/logs` on the
-  socket, `GET /api/devices/:udid/wda-log` (admins) on the dashboard.
+  socket, `GET /api/devices/:udid/wda-log` (platform staff) on the dashboard.
 - Single‑supervisor by design; a lock prevents duplicates.
 
 ### `appium` — `appium --address 127.0.0.1 --port 4725`
@@ -177,6 +183,7 @@ without the UI, for scripted or bulk (`--all`) setup.
 | PostgreSQL `scheduler.*` | `schedules`, `executions`, `execution_attempts`, `execution_logs`, `assets`, `worker_heartbeats` (one row per host, refreshed every 15 s). Drizzle ORM; migrations in `drizzle/`. |
 | PostgreSQL `pgboss.*` | Job queue (one partitioned queue per device). |
 | PostgreSQL `drizzle.*` | Applied‑migration ledger. |
+| PostgreSQL `auth.*` | Built-in accounts: `tenants`, `tenant_devices` (phone → tenant by UDID; none = the default tenant), `users`, `groups`, `group_members`, `grants`, `sessions`, `login_throttle`, and the append-only `audit_log`. `tenant_id` also sits on `scheduler.schedules`, `executions` and `assets`. See [tenants.md](tenants.md). |
 | PostgreSQL `fleet.*` | With `PHONE_FARM_REGISTRY=postgres`: `devices` (every host's phones, each with its `host_id`; ports unique per host; `has_passcode` but never the passcode) and `hosts` (one row per Mac, lease refreshed every 15 s, agent URL). See [multi-host.md](multi-host.md). |
 | `devices.json` | Registered devices (default `file` registry): `udid`, `name`, ports, `coordinateProfile`, per‑device `coordinates` overrides, `passcode`, `disabled`, `signingTeam`, `pluginData`. Git‑ignored, `0600`. |
 | `device-secrets.json` | With the Postgres registry: this host's device passcodes, beside the real `devices.json`. Git‑ignored, `0600`. |
@@ -232,7 +239,8 @@ in `src/scheduler/recurrence.ts`; the next occurrence is written to
 | `src/tiktok-plugin.ts` | The built‑in plugin: task definitions, device panel, routes |
 | `src/plugin.ts` | **Stable plugin & auth interfaces** |
 | `src/observability/` | Readiness probes, Prometheus text rendering, the worker heartbeat |
-| `src/auth/` | Built-in accounts: access policy, route requirement table, sessions and sign-in, Team pages/API, `npm run users` |
+| `src/auth/` | Built-in accounts: access policy (roles and tenants), route requirement table, sessions and sign-in, Team, Organisations and Audit pages/API, the audit log (`audit.ts`), tenants (`tenants.ts`), the Postgres sign-in throttle, `npm run users` |
+| `src/tenancy.ts` | The default tenant, quota types and upload limits |
 | `src/registry.ts` | `PluginRegistry` — task resolution and validation |
 | `src/loader.ts` | Dynamic import of `PHONE_FARM_PLUGINS` / `PHONE_FARM_AUTH_PLUGIN` |
 | `src/example-plugin.ts` | Minimal reference plugin |

@@ -160,7 +160,7 @@ its UDID is provisioned in:
 2. Copy that folder to the hosts and set, per Team,
    `WDA_XCTESTRUN_ABCDE12345=/Users/<user>/phone-farm/shared/.wda/prebuilt-ABCDE12345/<name>.xctestrun`.
 3. Give each phone its team: `PATCH /api/devices/<udid>` with
-   `{"signingTeam": "ABCDE12345"}` (admins; `""` goes back to the host default).
+   `{"signingTeam": "ABCDE12345"}` (platform staff; `""` goes back to the host default).
 
 `wda-service` launches a phone with `WDA_XCTESTRUN_<TEAM>`, else the host-wide
 `WDA_XCTESTRUN`, else a local build signed with that Team; changing the team

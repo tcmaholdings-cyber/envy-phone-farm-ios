@@ -15,7 +15,7 @@ npm run web / worker / wda:service / appium    # the four processes (see docs/ge
 npm run db:up && npm run db:migrate            # bundled Postgres + schema
 npm run db:generate                            # after editing src/database/schema.ts -> new drizzle migration
 npm run wda:prepare -- --udid <udid>           # sign/build WebDriverAgent (graphical session only)
-npm run users -- create <name> --role admin     # built-in accounts: first admin (prints a temp password once)
+npm run users -- create <name> --role platform  # built-in accounts: first platform account (prints a temp password once); --role admin --tenant <slug> for a customer admin
 npm run devices -- set-rack <rack> --all        # label every registered phone's rack
 scripts/deploy-remote.sh <user@host>            # build a release tarball, copy it, deploy it (docs/deploy.md)
 ```
@@ -32,7 +32,7 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 | `src/branding.ts` | env-driven white-label (name, label, credit, logo, footer) |
 | `static/dashboard/styles.css` | the Envy theme; every colour is a `:root` token (`test/styles-lint.test.ts`) — re-skin by editing `:root` only |
 | `src/plugin.ts` | **stable** plugin + auth interfaces; `src/registry.ts` resolves `{pluginId, taskType, taskVersion}` |
-| `src/auth/` | built-in accounts (`PHONE_FARM_AUTH_PLUGIN=builtin`): `policy.ts` (pure access rules), `route-access.ts` (the route → requirement table every request is checked against), `accounts.ts` (sign-in, sessions, Team rules), `pg-store.ts` (schema `auth`), `routes.ts` (login, password, Team pages + API), `cli.ts` (`npm run users`) |
+| `src/auth/` | built-in accounts (`PHONE_FARM_AUTH_PLUGIN=builtin`): `policy.ts` (pure access rules: roles platform/admin/operator, tenants), `route-access.ts` (the route → requirement table every request is checked against), `accounts.ts` (sign-in, sessions, Team rules, tenant-scoped), `tenants.ts` (tenants, phone ownership), `audit.ts` (append-only audit log), `throttle.ts` (sign-in throttle, Postgres), `pg-store.ts` (schema `auth`), `routes.ts` (login, password, Team, Organisations, Audit pages + API), `cli.ts` (`npm run users`). See `docs/tenants.md` |
 | `src/scheduler/` | pg-boss queue, recurrence, executor, worker |
 | `src/devices/` | discovery (usbmux), the device registry (`registry.ts`: `devices.json` by default, `fleet.devices` via `registry-pg.ts` with `PHONE_FARM_REGISTRY=postgres`), host identity, registration wizard, WDA supervisor + remote, per-phone WDA logs (`wda-log.ts`), coordinate profiles |
 | `src/hosts/`, `src/agent/` | multi-host (`docs/multi-host.md`): host lease + directory (`fleet.hosts`); the `/agent/*` token, listener and client that reach another host's phones |
@@ -78,7 +78,10 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 9. **Every route is in the access table.** A new route needs an entry in
    `ROUTE_REQUIREMENTS` (`src/auth/route-access.ts`) or its plugin's
    `routeAccess`; `test/auth-route-coverage.test.ts` fails otherwise. Lists
-   filter to the caller's phones; an ungranted phone is a 404, never a 403.
+   filter to the caller's tenant and phones; an ungranted phone, and anything
+   of another tenant, is a 404, never a 403 (`test/tenant-isolation.test.ts`
+   walks every id-taking route). New tables holding customer data carry
+   `tenant_id` and every query path filters on it.
 
 ## Conventions
 

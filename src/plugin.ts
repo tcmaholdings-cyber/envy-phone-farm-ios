@@ -121,7 +121,8 @@ export interface PluginRouteContext {
 /**
  * Who may call a plugin route when scoped access is on (the built-in accounts).
  * `device` checks the user's level on the phone named by the route's `:udid`
- * parameter. A plugin route without a declaration is admin-only.
+ * parameter (which includes the phone belonging to the caller's tenant). A plugin
+ * route without a declaration, or declared `admin`, is platform-staff only.
  */
 export type PluginRouteAccess =
     | { kind: 'signed-in' }
