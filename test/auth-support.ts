@@ -200,7 +200,10 @@ export const TEST_DEVICES = [
  * plugin, the Envy theme and fake scheduler/remote/discovery. Call
  * `useDevicesFile` first.
  */
-export async function createAuthApp(options: { clock?: ReturnType<typeof testClock>; schedules?: FakeSchedule[]; executions?: FakeExecution[] } = {}) {
+export async function createAuthApp(options: {
+    clock?: ReturnType<typeof testClock>; schedules?: FakeSchedule[]; executions?: FakeExecution[];
+    extra?: Partial<import('../src/api/app.js').CreateAppOptions>;
+} = {}) {
     const { createApp } = await import('../src/api/app.js');
     const { AccountService } = await import('../src/auth/accounts.js');
     const { createBuiltinAuthProvider } = await import('../src/auth/builtin.js');
@@ -228,6 +231,7 @@ export async function createAuthApp(options: { clock?: ReturnType<typeof testClo
         scheduler: scheduler as never, authProvider: provider, dashboardTheme: defaultDashboardTheme,
         registrations: registrations as never, remote: remote as never,
         discoverDevices: async () => [], wdaStatuses: async () => [],
+        ...options.extra,
     });
     accounts.audit = (event) => audit.push(event);
     return { app, store, accounts, provider, scheduler, remote, clock, audit };

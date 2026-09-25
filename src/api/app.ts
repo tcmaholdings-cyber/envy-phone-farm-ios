@@ -36,6 +36,8 @@ import type { AuthenticatedUser, AuthProvider, PluginNavLink } from '../plugin.j
 import type { PluginRegistry } from '../registry.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming } from '../types.js';
 import { ScheduleTransitionError, type SchedulerRepository } from '../scheduler/repository.js';
+import { PROMETHEUS_CONTENT_TYPE, renderMetrics } from '../observability/metrics.js';
+import { checkReadiness, createDefaultProbes, type ObservabilityProbes } from '../observability/probes.js';
 
 export interface CreateAppOptions {
     plugins: PluginRegistry;
@@ -48,6 +50,10 @@ export interface CreateAppOptions {
     remote?: RemoteControl;
     discoverDevices?: () => Promise<Device[]>;
     wdaStatuses?: () => Promise<DeviceConnectionStatus[]>;
+    /** Dependency probes for /health/ready and /metrics; defaults to Postgres, Appium and the wda-service socket. */
+    observability?: ObservabilityProbes;
+    /** A phone's recent supervisor output; defaults to the wda-service socket. Undefined means unknown phone. */
+    wdaLogs?: (udid: string, limit: number) => Promise<string[] | undefined>;
 }
 
 export interface DashboardTheme {
@@ -144,6 +150,22 @@ export function gridScreenshotTimeoutMs(): number {
 }
 
 /** The supervisor's per-device WDA state, read once per grid poll. */
+async function supervisorLogs(udid: string, limit: number): Promise<string[] | undefined> {
+    const response = await requestWdaService(`/devices/${encodeURIComponent(udid)}/logs?lines=${limit}`, { timeoutMs: 1_500 });
+    if (response.statusCode === 404) return;
+    if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`WDA service returned ${response.statusCode}`);
+    const lines = (JSON.parse(response.body) as { lines?: unknown }).lines;
+    if (!Array.isArray(lines)) throw new Error('WDA service returned no log lines');
+    return lines.map(String);
+}
+
+/** Compare a presented bearer token with the configured one without leaking its length or prefix through timing. */
+function tokenMatches(presented: string | undefined, expected: string): boolean {
+    if (!presented) return false;
+    const digest = (value: string) => crypto.createHash('sha256').update(value).digest();
+    return crypto.timingSafeEqual(digest(presented), digest(expected));
+}
+
 async function supervisorStatuses(): Promise<DeviceConnectionStatus[]> {
     const response = await requestWdaService('/devices', { timeoutMs: 1_500 });
     if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`WDA service returned ${response.statusCode}`);
@@ -297,6 +319,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         app.addHook('onRequest', async (request, reply) => {
             const pathname = pathOf(request);
             if (provider.isPublicPath(pathname)) return;
+            // Machine endpoints that authenticate themselves (a bearer token, not a session).
+            if (requirements.get(routeKey(request.method, request.routeOptions.url ?? ''))?.kind === 'token') return;
             const user = await provider.authenticate(request, reply);
             if (reply.sent) return reply;
             if (!user) {
@@ -354,6 +378,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             switch (requirement?.kind) {
                 case 'public':
                 case 'signed-in':
+                case 'token':
                     return;
                 case 'any-operate':
                     return access.anyOperate ? undefined : deny(request, reply, 403, 'You need operate access to at least one phone');
@@ -571,17 +596,62 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return `<section id="device-activity" class="run-panel" hx-get="/api/devices/${encodeURIComponent(deviceUdid)}/fragments/activity" hx-trigger="every 1s" hx-swap="outerHTML"><div class="run-heading"><span class="status ${escapeHtml(execution.status)}"><span class="dot"></span>${escapeHtml(execution.status)}</span><span class="run-meta">${escapeHtml(summary)} · <time datetime="${escapeHtml(execution.scheduledFor.toISOString())}" data-local-time>${escapeHtml(execution.scheduledFor.toISOString().slice(0, 16).replace('T', ' '))} UTC</time></span></div>${errorBanner}${stop}<pre role="log" aria-live="polite">${detail?.logs.length ? detail.logs.map(escapeHtml).join('\n') : escapeHtml(execution.error ?? 'Waiting for worker output…')}</pre></section>`;
     };
 
+    // Liveness, anonymous: the process answers, plus the deployed commit. Plugin
+    // versions moved to the signed-in GET /api/plugins; anonymous callers get
+    // nothing to fingerprint.
     app.get('/health', async () => {
-        const body: Record<string, unknown> = {
-            ok: true,
-            plugins: options.plugins.list().map(({ id, version }) => ({ id, version })),
-        };
+        const body: { ok: true; release?: string } = { ok: true };
         // Deploy tooling writes a RELEASED file (sha, subject, deployedAt) into the
-        // working directory; surface it so "what's live" is answerable over HTTP.
+        // working directory; surface the sha so "what's live" is answerable over HTTP.
         try {
-            body.release = JSON.parse(await readFile(path.resolve(process.env.PHONE_FARM_RELEASE_FILE ?? 'RELEASED'), 'utf8'));
+            const release = JSON.parse(await readFile(path.resolve(process.env.PHONE_FARM_RELEASE_FILE ?? 'RELEASED'), 'utf8')) as { sha?: unknown };
+            if (typeof release.sha === 'string' && /^[0-9a-f]{7,64}$/i.test(release.sha)) body.release = release.sha;
         } catch { /* no release marker — fine */ }
         return body;
+    });
+    const probes = options.observability ?? createDefaultProbes();
+    if (!options.observability) app.addHook('onClose', async () => probes.close());
+    // Readiness, anonymous: 200 only when Postgres, Appium, the wda-service
+    // socket and a fresh worker heartbeat all check out; 503 otherwise. The body
+    // names each check with a fixed reason; real errors go to the server log.
+    app.get('/health/ready', async (request, reply) => {
+        const report = await checkReadiness(probes, {
+            onFailure: (check, error) => request.log.warn({ check, error: errorMessage(error) }, 'readiness check failed'),
+        });
+        return reply.code(report.ok ? 200 : 503).header('cache-control', 'no-store').send(report);
+    });
+    // Prometheus scrape. Off (404) unless PHONE_FARM_METRICS_TOKEN is set; then
+    // it needs `Authorization: Bearer <token>`. A failing source is reported as
+    // phone_farm_metrics_source_up{source=…} 0 rather than failing the scrape.
+    app.get('/metrics', async (request, reply) => {
+        const expected = process.env.PHONE_FARM_METRICS_TOKEN;
+        if (!expected) return reply.code(404).send({ error: 'Not found' });
+        const header = request.headers.authorization;
+        const presented = header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : undefined;
+        if (!tokenMatches(presented, expected)) {
+            return reply.code(401).header('www-authenticate', 'Bearer realm="metrics"').send({ error: 'Authentication required' });
+        }
+        const settle = async <T>(source: string, work: () => Promise<T>): Promise<T | null> => {
+            try {
+                return await work();
+            } catch (error) {
+                request.log.warn({ source, error: errorMessage(error) }, 'metrics source failed');
+                return null;
+            }
+        };
+        const [devices, usb, wda, queues, executions, heartbeats] = await Promise.all([
+            settle('registry', () => loadRegisteredDevices()),
+            settle('usb', async () => new Set((await discover()).map(({ udid }) => udid))),
+            settle('wda_service', () => wdaStatuses()),
+            settle('queues', () => probes.queueStats()),
+            settle('executions', () => probes.executionsLastHour()),
+            settle('heartbeats', () => probes.workerHeartbeats()),
+        ]);
+        const body = renderMetrics({
+            now: Date.now(), uptimeSeconds: process.uptime(), devices: devices ?? [], usbUdids: usb, wda,
+            queues, executionsLastHour: executions, heartbeats,
+        });
+        return reply.type(PROMETHEUS_CONTENT_TYPE).header('cache-control', 'no-store').send(body);
     });
     app.get('/api/plugins', async () => options.plugins.list().map((plugin) => ({
         id: plugin.id, version: plugin.version, displayName: plugin.displayName,
@@ -814,6 +884,24 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         }
         await remote.performAction(request.params.udid, request.body);
         return { ok: true };
+    });
+    // The phone's recent WDA supervisor + xcodebuild output (the full history
+    // is in WDA_LOG_DIR/<udid>.log on the host). Admins only: build output names
+    // the signing team and host paths.
+    const wdaLogs = options.wdaLogs ?? supervisorLogs;
+    app.get<{ Params: { udid: string }; Querystring: { lines?: string } }>('/api/devices/:udid/wda-log', async (request, reply) => {
+        const registered = (await loadRegisteredDevices()).some(({ udid }) => udid === request.params.udid);
+        if (!registered) return reply.code(404).send({ error: 'Device is not registered' });
+        const requested = Number(request.query.lines ?? 200);
+        const limit = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, 1_000) : 200;
+        let lines: string[] | undefined;
+        try {
+            lines = await wdaLogs(request.params.udid, limit);
+        } catch (error) {
+            request.log.warn({ error: errorMessage(error) }, 'wda-service log request failed');
+            return reply.code(503).send({ error: 'WDA service is unavailable' });
+        }
+        return reply.header('cache-control', 'no-store').send({ udid: request.params.udid, lines: lines ?? [] });
     });
     app.get<{ Params: { udid: string } }>('/api/devices/:udid/connection', async (request, reply) => {
         const registered = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);

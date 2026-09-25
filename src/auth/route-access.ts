@@ -17,6 +17,8 @@ import type { AccessLevel } from './policy.js';
  * - `schedule-create`   — `operate` on the phone named by `body.deviceUdid`.
  * - `schedule` / `execution` — the level on the phone that schedule/run belongs to.
  * - `any-operate`       — `operate` on at least one phone (asset uploads).
+ * - `token`             — no session; the handler checks its own bearer token
+ *                         (GET /metrics and PHONE_FARM_METRICS_TOKEN).
  *
  * An unknown or ungranted phone answers 404, not 403, so ids cannot be probed.
  */
@@ -29,17 +31,23 @@ export type RouteRequirement =
     | { kind: 'schedule-create' }
     | { kind: 'schedule'; level: AccessLevel }
     | { kind: 'execution'; level: AccessLevel }
-    | { kind: 'any-operate' };
+    | { kind: 'any-operate' }
+    | { kind: 'token' };
 
 const PUBLIC: RouteRequirement = { kind: 'public' };
 const SIGNED_IN: RouteRequirement = { kind: 'signed-in' };
 const ADMIN: RouteRequirement = { kind: 'admin' };
 const VIEW: RouteRequirement = { kind: 'device', level: 'view' };
 const OPERATE: RouteRequirement = { kind: 'device', level: 'operate' };
+const TOKEN: RouteRequirement = { kind: 'token' };
 
 export const ROUTE_REQUIREMENTS: Readonly<Record<string, RouteRequirement>> = {
     // service
     'GET /health': PUBLIC,
+    // readiness: pass/fail per dependency with fixed reasons, nothing sensitive
+    'GET /health/ready': PUBLIC,
+    // Prometheus scrape: bearer PHONE_FARM_METRICS_TOKEN, 404 when unset
+    'GET /metrics': TOKEN,
     'GET /api/plugins': SIGNED_IN,
     'GET /docs': SIGNED_IN,
 
@@ -94,6 +102,8 @@ export const ROUTE_REQUIREMENTS: Readonly<Record<string, RouteRequirement>> = {
     'POST /api/devices/:udid/checks': OPERATE,
     'GET /api/devices/:udid/connection': VIEW,
     'POST /api/devices/:udid/reconnect': OPERATE,
+    // raw xcodebuild output (team ids, host paths): admins only
+    'GET /api/devices/:udid/wda-log': ADMIN,
     'GET /api/devices/:udid/fragments/summary': VIEW,
     'GET /api/devices/:udid/fragments/activity': VIEW,
 
