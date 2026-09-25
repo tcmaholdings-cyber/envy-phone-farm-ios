@@ -367,7 +367,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             // tenant's phone are recorded under that tenant, so its admin sees it.
             let tenantId = access?.tenantId ?? null;
             if (access?.platform) tenantId = targetUdid ? (await deviceTenants()).tenantOf(targetUdid) : tenantFilter(request) ?? null;
-            const remoteAction = route === '/api/devices/:udid/remote/action';
+            // The dashboard's remote control and the host agent's, which a peer dashboard calls.
+            const remoteAction = route === '/api/devices/:udid/remote/action' || route === '/agent/devices/:udid/remote/action';
             const actionType = typeof body.type === 'string' && /^[A-Za-z]{1,20}$/.test(body.type) ? body.type : null;
             const entry = {
                 tenantId, actorUserId: user?.id ?? null,

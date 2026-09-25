@@ -44,11 +44,14 @@ test('every id-taking route answers another tenant\'s ids with 404 (or 403 when 
         if (!takesId || !requirement) continue;
         for (const [attacker, victim] of [[farm.beloura, farm.acme], [farm.acme, farm.beloura]] as const) {
             for (const who of ['admin', 'operator'] as Who[]) {
-                let expected: number;
+                let expected: number | number[];
                 switch (requirement.kind) {
                     case 'public':
-                    case 'token':
                         continue;
+                    case 'token':
+                        // Service-to-service (metrics, the host agent): a session cookie is no credential.
+                        expected = [401, 404];
+                        break;
                     case 'platform':
                         expected = 403;
                         break;
@@ -70,7 +73,9 @@ test('every id-taking route answers another tenant\'s ids with 404 (or 403 when 
                     method: method as 'GET', url: request.url, cookies: attacker.cookies[who],
                     headers: { accept: 'application/json' }, ...(request.payload ? { payload: request.payload } : {}),
                 });
-                assert.equal(response.statusCode, expected, `${attacker.admin.username.split('-')[0]} ${who}: ${method} ${request.url} → ${response.statusCode} ${response.body.slice(0, 120)}`);
+                const label = `${attacker.admin.username.split('-')[0]} ${who}: ${method} ${request.url} → ${response.statusCode} ${response.body.slice(0, 120)}`;
+                if (Array.isArray(expected)) assert.ok(expected.includes(response.statusCode), label);
+                else assert.equal(response.statusCode, expected, label);
                 checked++;
             }
         }
