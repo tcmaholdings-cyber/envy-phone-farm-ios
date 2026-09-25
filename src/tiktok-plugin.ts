@@ -264,7 +264,10 @@ export function createTikTokPlugin(configuration: TikTokPluginConfiguration = {}
                             const hash = crypto.createHash('sha256');
                             createReadStream(file.path).on('data', (chunk) => hash.update(chunk)).once('error', reject).once('end', () => resolve(hash.digest('hex')));
                         }),
-                    }))));
+                    }))), {
+                        // The media belongs to the tenant that owns the phone, uploaded by the signed-in user.
+                        deviceUdid: device.udid, uploadedBy: context.requestActor?.(request)?.userId ?? null,
+                    });
                     assetIds = stored.map(({ id }) => id);
                     const schedule = await context.scheduler.createTask({
                         deviceUdid: device.udid,

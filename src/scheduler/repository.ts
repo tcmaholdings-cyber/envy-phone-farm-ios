@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
 import { fromDrizzle, type PgBoss } from 'pg-boss';
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import {
 } from '../database/schema.js';
 import type { TaskDefinition } from '../plugin.js';
 import type { PluginRegistry } from '../registry.js';
+import { DEFAULT_TENANT_ID, tenantUploadBudget, type TenantQuotas } from '../tenancy.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming, StoredAsset, TaskEnvelope } from '../types.js';
 import { EFFECT_COMMITTED_REFUSAL } from './effects.js';
 import { ensureDeviceQueue, queueNameForDevice } from './queue.js';
@@ -20,6 +21,41 @@ export interface ExecutionDetail extends ExecutionRow { logs: string[] }
 
 /** Thrown by setScheduleStatus for a disallowed status change (e.g. resuming a completed schedule). */
 export class ScheduleTransitionError extends Error {}
+
+/** An asset id that is not this tenant's, or is already attached: the same answer as a missing one. */
+export class AssetNotFoundError extends Error {
+    readonly statusCode = 404;
+    constructor() { super('Asset not found'); }
+}
+
+/** An upload that would take a tenant past its stored-upload budget. */
+export class UploadQuotaError extends Error {
+    readonly statusCode = 413;
+    constructor(readonly budgetBytes: number) {
+        super(`Uploads for this organisation are limited to ${formatBytes(budgetBytes)} in total; remove old media or ask for a larger quota`);
+    }
+}
+
+function formatBytes(bytes: number): string {
+    if (bytes >= 1024 ** 3) return `${Math.round((bytes / 1024 ** 3) * 10) / 10} GB`;
+    if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)} MB`;
+    return `${bytes} bytes`;
+}
+
+/** Who owns an upload. `tenantId` wins; otherwise the tenant of `deviceUdid`; otherwise the default tenant. */
+export interface AssetOwner {
+    tenantId?: string | null;
+    deviceUdid?: string;
+    uploadedBy?: string | null;
+}
+
+/**
+ * The tenant that currently owns a phone: its auth.tenant_devices row, or the
+ * default tenant when it has none (drizzle/0006_tenants.sql).
+ */
+export function deviceTenantSql(udid: string): SQL {
+    return sql`coalesce((select tenant_id from auth.tenant_devices where udid = ${udid}), ${DEFAULT_TENANT_ID}::uuid)`;
+}
 
 /**
  * Schedule status state machine. A completed or cancelled schedule can only be
@@ -60,6 +96,8 @@ type DueOccurrence = NonNullable<ReturnType<typeof latestDueOccurrence>>;
 export interface DueScheduleRow {
     id: string; device_udid: string; plugin_id: string; task_type: string; task_version: number;
     payload: JsonObject; timing: ScheduleTiming; run_window_minutes: number; next_run_at: Date;
+    /** Absent only in rows built by older callers; the execution then gets the column default. */
+    tenant_id?: string;
 }
 
 export type MaterializationPlan =
@@ -101,6 +139,10 @@ export function errorSummary(error: unknown): string {
     return error.cause instanceof Error ? error.cause.message : error.message;
 }
 
+function isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
 function taskEnvelope(row: Pick<ScheduleRow, 'pluginId' | 'taskType' | 'taskVersion' | 'payload'>): TaskEnvelope {
     return { pluginId: row.pluginId, taskType: row.taskType, taskVersion: row.taskVersion, payload: row.payload };
 }
@@ -121,8 +163,12 @@ export class SchedulerRepository {
         const validated = validateTaskInput(this.plugins, input, devicePluginData, now);
         const nextRunAt = initialRunAt(validated.timing, now);
         await this.assertNoScheduleConflict(validated.deviceUdid, validated.task, nextRunAt);
+        // A schedule belongs to the tenant that owns its phone, whoever creates it.
+        const tenantId = await this.tenantForDevice(validated.deviceUdid);
+        await this.assertAttachable(tenantId, assetIds);
         await ensureDeviceQueue(this.boss, validated.deviceUdid);
         const [schedule] = await this.connection.db.insert(schedules).values({
+            tenantId,
             deviceUdid: validated.deviceUdid,
             pluginId: validated.task.pluginId,
             taskType: validated.task.taskType,
@@ -133,7 +179,7 @@ export class SchedulerRepository {
             nextRunAt,
         }).returning();
         if (!schedule) throw new Error('Unable to create schedule');
-        await this.attachAssets(schedule.id, assetIds);
+        await this.attachAssets(schedule.id, assetIds, tenantId);
         if (schedule.nextRunAt && schedule.nextRunAt <= now) await this.materializeDue(now, schedule.id);
         return schedule;
     }
@@ -154,51 +200,125 @@ export class SchedulerRepository {
         }
     }
 
+    /** The tenant that owns `udid` now (the default tenant when it has no auth.tenant_devices row). */
+    async tenantForDevice(udid: string): Promise<string> {
+        const result = await this.connection.db.execute(sql`select ${deviceTenantSql(udid)}::text as tenant_id`);
+        return String((result.rows[0] as { tenant_id?: string } | undefined)?.tenant_id ?? DEFAULT_TENANT_ID);
+    }
+
+    /** Bytes of uploads a tenant holds, and its budget (auth.tenants.quotas.maxUploadBytes, default 5 GiB). */
+    async uploadUsage(tenantId: string): Promise<{ usedBytes: number; budgetBytes: number }> {
+        const result = await this.connection.db.execute(sql`select
+            (select coalesce(sum(size), 0) from scheduler.assets where tenant_id = ${tenantId}::uuid)::bigint as used,
+            (select quotas from auth.tenants where id = ${tenantId}::uuid) as quotas`);
+        const row = result.rows[0] as { used?: string | number; quotas?: TenantQuotas | null } | undefined;
+        return { usedBytes: Number(row?.used ?? 0), budgetBytes: tenantUploadBudget(row?.quotas) };
+    }
+
+    /**
+     * Record uploaded files as assets of their owner's tenant. Refuses (and
+     * records nothing) when they would take the tenant past its upload budget;
+     * the caller removes the files.
+     */
     async registerAssets(files: Array<{
         relativePath: string; originalName: string; mimeType: string; size: number; sha256: string;
-    }>): Promise<Array<{ id: string; name: string; mimeType: string }>> {
+    }>, owner: AssetOwner = {}): Promise<Array<{ id: string; name: string; mimeType: string }>> {
         if (!files.length) return [];
-        const rows = await this.connection.db.insert(assets).values(files).returning();
+        const tenantId = owner.tenantId ?? (owner.deviceUdid ? await this.tenantForDevice(owner.deviceUdid) : DEFAULT_TENANT_ID);
+        const incoming = files.reduce((total, file) => total + file.size, 0);
+        const { usedBytes, budgetBytes } = await this.uploadUsage(tenantId);
+        if (usedBytes + incoming > budgetBytes) throw new UploadQuotaError(budgetBytes);
+        const rows = await this.connection.db.insert(assets)
+            .values(files.map((file) => ({ ...file, tenantId, uploadedBy: owner.uploadedBy ?? null }))).returning();
         return rows.map((asset) => ({ id: asset.id, name: asset.originalName, mimeType: asset.mimeType }));
     }
 
-    async attachAssets(scheduleId: string, assetIds: string[]): Promise<void> {
-        if (assetIds.length) await this.connection.db.update(assets).set({ scheduleId }).where(inArray(assets.id, assetIds));
+    /** Every id must be an unattached asset of `tenantId`; anything else is "not found". */
+    private async assertAttachable(tenantId: string, assetIds: readonly string[]): Promise<void> {
+        const unique = [...new Set(assetIds)];
+        if (!unique.length) return;
+        if (unique.some((id) => !isUuid(id))) throw new AssetNotFoundError();
+        const rows = await this.connection.db.select({ id: assets.id }).from(assets).where(and(
+            inArray(assets.id, unique), eq(assets.tenantId, tenantId), isNull(assets.scheduleId), isNull(assets.executionId),
+        ));
+        if (rows.length !== unique.length) throw new AssetNotFoundError();
     }
 
-    async deleteAssets(assetIds: string[]): Promise<void> { await this.purgeAssetIds(assetIds); }
+    async attachAssets(scheduleId: string, assetIds: string[], tenantId?: string): Promise<void> {
+        if (!assetIds.length) return;
+        const owner = tenantId ?? (await this.schedule(scheduleId))?.tenantId;
+        if (!owner) throw new AssetNotFoundError();
+        await this.connection.db.update(assets).set({ scheduleId })
+            .where(and(inArray(assets.id, assetIds), eq(assets.tenantId, owner), isNull(assets.scheduleId)));
+    }
 
-    /** Newest first. `deviceUdid` narrows to one phone, or to a set of phones (an operator's). */
-    async listSchedules(limit = 100, deviceUdid?: string | readonly string[]): Promise<ScheduleRow[]> {
-        const query = this.connection.db.select().from(schedules);
-        if (Array.isArray(deviceUdid)) {
-            if (!deviceUdid.length) return [];
-            return query.where(inArray(schedules.deviceUdid, [...deviceUdid])).orderBy(desc(schedules.createdAt)).limit(limit);
+    /**
+     * Delete assets. With `tenantId`, every id must belong to that tenant, or
+     * nothing is deleted and the answer is false (the caller's 404).
+     */
+    async deleteAssets(assetIds: string[], tenantId?: string): Promise<boolean> {
+        if (tenantId !== undefined) {
+            const unique = [...new Set(assetIds)];
+            if (unique.some((id) => !isUuid(id))) return false;
+            const owned = unique.length ? await this.connection.db.select({ id: assets.id }).from(assets)
+                .where(and(inArray(assets.id, unique), eq(assets.tenantId, tenantId))) : [];
+            if (owned.length !== unique.length) return false;
         }
-        return typeof deviceUdid === 'string' && deviceUdid
-            ? query.where(eq(schedules.deviceUdid, deviceUdid)).orderBy(desc(schedules.createdAt)).limit(limit)
-            : query.orderBy(desc(schedules.createdAt)).limit(limit);
+        await this.purgeAssetIds(assetIds);
+        return true;
     }
 
-    async schedule(id: string): Promise<ScheduleRow | null> {
-        const [row] = await this.connection.db.select().from(schedules).where(eq(schedules.id, id)).limit(1);
+    /**
+     * Newest first. `deviceUdid` narrows to one phone, or to a set of phones (an
+     * operator's). `tenantId` narrows to one tenant's rows. For a single phone
+     * with `tenantId` left undefined, only the rows of the tenant that owns the
+     * phone now are returned — a phone moved to another tenant does not carry its
+     * old tenant's history along; pass `null` for every tenant's rows.
+     */
+    async listSchedules(limit = 100, deviceUdid?: string | readonly string[], tenantId?: string | null): Promise<ScheduleRow[]> {
+        const where = this.listFilter(schedules, deviceUdid, tenantId);
+        if (!where) return [];
+        return this.connection.db.select().from(schedules).where(where.condition).orderBy(desc(schedules.createdAt)).limit(limit);
+    }
+
+    /** One schedule; with `tenantId`, only when it belongs to that tenant. */
+    async schedule(id: string, tenantId?: string): Promise<ScheduleRow | null> {
+        if (!isUuid(id) || (tenantId !== undefined && !isUuid(tenantId))) return null;
+        const [row] = await this.connection.db.select().from(schedules)
+            .where(tenantId === undefined ? eq(schedules.id, id) : and(eq(schedules.id, id), eq(schedules.tenantId, tenantId))).limit(1);
         return row ?? null;
     }
 
-    /** Newest first. `deviceUdid` narrows to one phone, or to a set of phones (an operator's). */
-    async listExecutions(limit = 100, deviceUdid?: string | readonly string[]): Promise<ExecutionRow[]> {
-        const query = this.connection.db.select().from(executions);
-        if (Array.isArray(deviceUdid)) {
-            if (!deviceUdid.length) return [];
-            return query.where(inArray(executions.deviceUdid, [...deviceUdid])).orderBy(desc(executions.createdAt)).limit(limit);
-        }
-        return typeof deviceUdid === 'string' && deviceUdid
-            ? query.where(eq(executions.deviceUdid, deviceUdid)).orderBy(desc(executions.createdAt)).limit(limit)
-            : query.orderBy(desc(executions.createdAt)).limit(limit);
+    /** Newest first; the same narrowing as listSchedules. */
+    async listExecutions(limit = 100, deviceUdid?: string | readonly string[], tenantId?: string | null): Promise<ExecutionRow[]> {
+        const where = this.listFilter(executions, deviceUdid, tenantId);
+        if (!where) return [];
+        return this.connection.db.select().from(executions).where(where.condition).orderBy(desc(executions.createdAt)).limit(limit);
     }
 
-    async execution(id: string): Promise<ExecutionDetail | null> {
-        const [row] = await this.connection.db.select().from(executions).where(eq(executions.id, id)).limit(1);
+    private listFilter(
+        table: typeof schedules | typeof executions, deviceUdid: string | readonly string[] | undefined, tenantId: string | null | undefined,
+    ): { condition: SQL | undefined } | null {
+        const conditions: SQL[] = [];
+        if (Array.isArray(deviceUdid)) {
+            if (!deviceUdid.length) return null;
+            conditions.push(inArray(table.deviceUdid, [...deviceUdid]));
+        } else if (typeof deviceUdid === 'string' && deviceUdid) {
+            conditions.push(eq(table.deviceUdid, deviceUdid));
+            if (tenantId === undefined) conditions.push(sql`${table.tenantId} = ${deviceTenantSql(deviceUdid)}`);
+        }
+        if (typeof tenantId === 'string') {
+            if (!isUuid(tenantId)) return null;
+            conditions.push(eq(table.tenantId, tenantId));
+        }
+        return { condition: conditions.length ? and(...conditions) : undefined };
+    }
+
+    /** One execution with its log; with `tenantId`, only when it belongs to that tenant. */
+    async execution(id: string, tenantId?: string): Promise<ExecutionDetail | null> {
+        if (!isUuid(id) || (tenantId !== undefined && !isUuid(tenantId))) return null;
+        const [row] = await this.connection.db.select().from(executions)
+            .where(tenantId === undefined ? eq(executions.id, id) : and(eq(executions.id, id), eq(executions.tenantId, tenantId))).limit(1);
         if (!row) return null;
         const logs = await this.connection.db.select({ line: executionLogs.line }).from(executionLogs)
             .where(eq(executionLogs.executionId, id)).orderBy(executionLogs.id);
@@ -277,8 +397,10 @@ export class SchedulerRepository {
             const conditions = onlyScheduleId
                 ? sql`status = 'active' and next_run_at <= ${now} and id = ${onlyScheduleId}::uuid`
                 : sql`status = 'active' and next_run_at <= ${now}`;
+            // A suspended tenant's schedules stay due and are not queued until it is active again.
             const result = await tx.execute(sql`select id, device_udid, plugin_id, task_type, task_version, payload,
-                timing, run_window_minutes, next_run_at from scheduler.schedules where ${conditions}
+                timing, run_window_minutes, next_run_at, tenant_id from scheduler.schedules where ${conditions}
+                and tenant_id not in (select id from auth.tenants where status <> 'active')
                 order by next_run_at for update skip locked limit 100`);
             for (const row of result.rows as unknown as DueScheduleRow[]) {
                 // One savepoint per schedule: a row that fails (a queue error, a
@@ -303,6 +425,7 @@ export class SchedulerRepository {
         const { occurrence } = plan;
         const occurrenceColumns = {
             scheduleId: row.id, deviceUdid: row.device_udid,
+            ...(row.tenant_id ? { tenantId: row.tenant_id } : {}),
             pluginId: row.plugin_id, taskType: row.task_type, taskVersion: row.task_version, payload: row.payload,
             scheduledFor: occurrence.scheduledFor,
             deadlineAt: new Date(occurrence.scheduledFor.getTime() + row.run_window_minutes * 60_000),
@@ -463,7 +586,7 @@ export class SchedulerRepository {
         let created: ExecutionRow | undefined;
         await this.connection.db.transaction(async (tx) => {
             [created] = await tx.insert(executions).values({
-                scheduleId: source.scheduleId, deviceUdid: source.deviceUdid,
+                scheduleId: source.scheduleId, deviceUdid: source.deviceUdid, tenantId: source.tenantId,
                 pluginId: source.pluginId, taskType: source.taskType, taskVersion: source.taskVersion, payload: source.payload,
                 scheduledFor: now, deadlineAt: new Date(now.getTime() + runWindowMinutes * 60_000),
             }).returning();

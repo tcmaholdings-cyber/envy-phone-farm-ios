@@ -4,9 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type {
-    AuthStore, GrantRecord, GroupRecord, MembershipRecord, NewGrant, NewSession, NewUser, SessionRecord, UserPatch, UserRecord,
+    AuthStore, GrantRecord, GroupRecord, MembershipRecord, NewGrant, NewSession, NewUser, SessionRecord, TenantFilter, UserPatch, UserRecord,
 } from '../src/auth/store.js';
 import { AuthConflictError } from '../src/auth/store.js';
+import type { TenantPatch, TenantRecord, TenantStore } from '../src/auth/tenants.js';
+import { DEFAULT_TENANT_ID, DEFAULT_TENANT_SLUG, type TenantQuotas } from '../src/tenancy.js';
+
+export { DEFAULT_TENANT_ID };
+
+const byTenant = (tenantId: TenantFilter) => (row: { tenantId: string | null }) => tenantId === undefined || row.tenantId === tenantId;
 
 /** An in-memory AuthStore with the same contract as PgAuthStore (unique names, cascades). */
 export class MemoryAuthStore implements AuthStore {
@@ -16,7 +22,7 @@ export class MemoryAuthStore implements AuthStore {
     grants: GrantRecord[] = [];
     sessions: SessionRecord[] = [];
 
-    async listUsers() { return [...this.users].sort((a, b) => a.username.localeCompare(b.username)); }
+    async listUsers(tenantId?: TenantFilter) { return this.users.filter(byTenant(tenantId)).sort((a, b) => a.username.localeCompare(b.username)); }
     async userById(id: string) { return this.users.find((user) => user.id === id) ?? null; }
     async userByUsername(username: string) { return this.users.find((user) => user.username === username) ?? null; }
     async createUser(input: NewUser) {
@@ -40,16 +46,17 @@ export class MemoryAuthStore implements AuthStore {
         this.sessions = this.sessions.filter((session) => session.userId !== id);
         return this.users.length < before;
     }
-    async listGroups() { return [...this.groups]; }
+    async listGroups(tenantId?: TenantFilter) { return this.groups.filter(byTenant(tenantId)); }
     async groupById(id: string) { return this.groups.find((group) => group.id === id) ?? null; }
-    async createGroup(input: { name: string; description: string }) {
-        if (this.groups.some((group) => group.name === input.name)) throw new AuthConflictError('taken');
+    async createGroup(input: { tenantId: string; name: string; description: string }) {
+        if (this.groups.some((group) => group.name === input.name && group.tenantId === input.tenantId)) throw new AuthConflictError('taken');
         const group: GroupRecord = { ...input, id: crypto.randomUUID(), createdAt: new Date() };
         this.groups.push(group);
         return group;
     }
     async updateGroup(id: string, patch: Partial<Pick<GroupRecord, 'name' | 'description'>>) {
-        if (patch.name && this.groups.some((group) => group.name === patch.name && group.id !== id)) throw new AuthConflictError('taken');
+        const tenantId = this.groups.find((entry) => entry.id === id)?.tenantId;
+        if (patch.name && this.groups.some((group) => group.name === patch.name && group.id !== id && group.tenantId === tenantId)) throw new AuthConflictError('taken');
         const group = this.groups.find((entry) => entry.id === id);
         if (!group) return null;
         Object.assign(group, patch);
@@ -62,7 +69,10 @@ export class MemoryAuthStore implements AuthStore {
         this.grants = this.grants.filter((grant) => grant.groupId !== id);
         return this.groups.length < before;
     }
-    async listMemberships() { return [...this.memberships]; }
+    async listMemberships(tenantId?: TenantFilter) {
+        const groups = new Set(this.groups.filter(byTenant(tenantId)).map(({ id }) => id));
+        return this.memberships.filter(({ groupId }) => groups.has(groupId));
+    }
     async groupIdsForUser(userId: string) { return this.memberships.filter((entry) => entry.userId === userId).map(({ groupId }) => groupId); }
     async addMember(groupId: string, userId: string) {
         if (!this.memberships.some((entry) => entry.groupId === groupId && entry.userId === userId)) this.memberships.push({ groupId, userId });
@@ -72,7 +82,12 @@ export class MemoryAuthStore implements AuthStore {
         this.memberships = this.memberships.filter((entry) => !(entry.groupId === groupId && entry.userId === userId));
         return this.memberships.length < before;
     }
-    async listGrants() { return [...this.grants]; }
+    async listGrants(tenantId?: TenantFilter) {
+        if (tenantId === undefined) return [...this.grants];
+        const users = new Set(this.users.filter(byTenant(tenantId)).map(({ id }) => id));
+        const groups = new Set(this.groups.filter(byTenant(tenantId)).map(({ id }) => id));
+        return this.grants.filter((grant) => (grant.userId && users.has(grant.userId)) || (grant.groupId && groups.has(grant.groupId)));
+    }
     async grantsForSubjects(userId: string, groupIds: readonly string[]) {
         return this.grants.filter((grant) => grant.userId === userId || (grant.groupId !== null && groupIds.includes(grant.groupId)));
     }
@@ -107,6 +122,31 @@ export class MemoryAuthStore implements AuthStore {
     }
 }
 
+/** An in-memory TenantStore; starts with the default tenant, like migration 0006. */
+export class MemoryTenantStore implements TenantStore {
+    tenants: TenantRecord[] = [{ id: DEFAULT_TENANT_ID, slug: DEFAULT_TENANT_SLUG, name: 'Beloura', status: 'active', quotas: {}, createdAt: new Date(0) }];
+    assignments = new Map<string, string>();
+    constructor(private readonly users?: MemoryAuthStore) {}
+    async listTenants() { return [...this.tenants].sort((a, b) => a.name.localeCompare(b.name)); }
+    async tenantById(id: string) { return this.tenants.find((tenant) => tenant.id === id) ?? null; }
+    async tenantBySlug(slug: string) { return this.tenants.find((tenant) => tenant.slug === slug) ?? null; }
+    async createTenant(input: { slug: string; name: string; quotas: TenantQuotas }) {
+        if (this.tenants.some((tenant) => tenant.slug === input.slug)) throw new AuthConflictError('taken');
+        const tenant: TenantRecord = { ...input, id: crypto.randomUUID(), status: 'active', createdAt: new Date() };
+        this.tenants.push(tenant);
+        return tenant;
+    }
+    async updateTenant(id: string, patch: TenantPatch) {
+        const tenant = this.tenants.find((entry) => entry.id === id);
+        if (!tenant) return null;
+        Object.assign(tenant, patch);
+        return tenant;
+    }
+    async deviceAssignments() { return new Map(this.assignments); }
+    async assignDevice(udid: string, tenantId: string) { this.assignments.set(udid, tenantId); }
+    async countUsers(tenantId: string) { return (this.users?.users ?? []).filter((user) => user.tenantId === tenantId).length; }
+}
+
 /** A controllable clock for session-expiry tests. */
 export function testClock(start = Date.UTC(2026, 8, 23, 12)) {
     let now = start;
@@ -134,28 +174,52 @@ export function sessionCookie(response: { headers: Record<string, unknown> }): {
     return { value: decodeURIComponent(raw.slice('pf_session='.length).split(';')[0] ?? ''), raw };
 }
 
-export interface FakeSchedule { id: string; deviceUdid: string; status: string; pluginId: string; taskType: string; taskVersion: number; payload: Record<string, unknown>; timing: unknown; nextRunAt: Date | null; runWindowMinutes: number; createdAt: Date }
-export interface FakeExecution { id: string; deviceUdid: string; status: string; pluginId: string; taskType: string; taskVersion: number; payload: Record<string, unknown>; scheduledFor: Date; error: string | null; createdAt: Date }
+export interface FakeSchedule { id: string; deviceUdid: string; tenantId?: string; status: string; pluginId: string; taskType: string; taskVersion: number; payload: Record<string, unknown>; timing: unknown; nextRunAt: Date | null; runWindowMinutes: number; createdAt: Date }
+export interface FakeExecution { id: string; deviceUdid: string; tenantId?: string; status: string; pluginId: string; taskType: string; taskVersion: number; payload: Record<string, unknown>; scheduledFor: Date; error: string | null; createdAt: Date }
 
-/** A SchedulerRepository stand-in holding rows in memory; records the calls a test cares about. */
-export function fakeScheduler(schedules: FakeSchedule[] = [], executions: FakeExecution[] = []) {
+/**
+ * A SchedulerRepository stand-in holding rows in memory; records the calls a
+ * test cares about. Rows without a tenantId are the default tenant's, and the
+ * tenant filters behave like the real repository's.
+ */
+export function fakeScheduler(schedules: FakeSchedule[] = [], executions: FakeExecution[] = [], tenantOfDevice: (udid: string) => Promise<string> = async () => DEFAULT_TENANT_ID) {
     const calls: string[] = [];
-    const byUdid = <T extends { deviceUdid: string }>(rows: T[], udid?: string | readonly string[]) =>
-        Array.isArray(udid) ? rows.filter((row) => udid.includes(row.deviceUdid))
+    for (const row of [...schedules, ...executions]) row.tenantId ??= DEFAULT_TENANT_ID;
+    const assets: Array<{ id: string; tenantId: string; scheduleId: string | null; size: number; uploadedBy: string | null; relativePath: string }> = [];
+    const filter = async <T extends { deviceUdid: string; tenantId?: string }>(rows: T[], udid?: string | readonly string[], tenantId?: string | null) => {
+        let out = Array.isArray(udid) ? rows.filter((row) => udid.includes(row.deviceUdid))
             : typeof udid === 'string' && udid ? rows.filter((row) => row.deviceUdid === udid) : rows;
+        if (typeof udid === 'string' && udid && tenantId === undefined) {
+            const owner = await tenantOfDevice(udid);
+            out = out.filter((row) => row.tenantId === owner);
+        }
+        return typeof tenantId === 'string' ? out.filter((row) => row.tenantId === tenantId) : out;
+    };
     const scheduler = {
-        calls, schedules, executions,
-        async listSchedules(_limit: number, udid?: string | readonly string[]) { return byUdid(schedules, udid); },
-        async listExecutions(_limit: number, udid?: string | readonly string[]) { return byUdid(executions, udid); },
-        async schedule(id: string) { return schedules.find((row) => row.id === id) ?? null; },
-        async execution(id: string) { const row = executions.find((entry) => entry.id === id); return row ? { ...row, logs: [] } : null; },
+        calls, schedules, executions, assets,
+        uploadBudget: 5 * 1024 ** 3,
+        async listSchedules(_limit: number, udid?: string | readonly string[], tenantId?: string | null) { return filter(schedules, udid, tenantId); },
+        async listExecutions(_limit: number, udid?: string | readonly string[], tenantId?: string | null) { return filter(executions, udid, tenantId); },
+        async schedule(id: string, tenantId?: string) { return schedules.find((row) => row.id === id && (tenantId === undefined || row.tenantId === tenantId)) ?? null; },
+        async execution(id: string, tenantId?: string) {
+            const row = executions.find((entry) => entry.id === id && (tenantId === undefined || entry.tenantId === tenantId));
+            return row ? { ...row, logs: [] } : null;
+        },
         async activeExecution() { return null; },
-        async createTask(input: { deviceUdid: string; task: { pluginId: string; taskType: string; taskVersion: number; payload: Record<string, unknown> }; timing: unknown }) {
+        async tenantForDevice(udid: string) { return tenantOfDevice(udid); },
+        async uploadUsage(tenantId: string) {
+            return { usedBytes: assets.filter((asset) => asset.tenantId === tenantId).reduce((total, asset) => total + asset.size, 0), budgetBytes: scheduler.uploadBudget };
+        },
+        async createTask(input: { deviceUdid: string; task: { pluginId: string; taskType: string; taskVersion: number; payload: Record<string, unknown> }; timing: unknown }, _data?: unknown, _now?: Date, assetIds: string[] = []) {
             calls.push(`create:${input.deviceUdid}`);
+            const tenantId = await tenantOfDevice(input.deviceUdid);
+            const attachable = assetIds.every((id) => assets.some((asset) => asset.id === id && asset.tenantId === tenantId && !asset.scheduleId));
+            if (!attachable) throw Object.assign(new Error('Asset not found'), { statusCode: 404 });
             const row: FakeSchedule = {
-                id: crypto.randomUUID(), deviceUdid: input.deviceUdid, status: 'active', ...input.task, timing: input.timing,
+                id: crypto.randomUUID(), deviceUdid: input.deviceUdid, tenantId, status: 'active', ...input.task, timing: input.timing,
                 nextRunAt: null, runWindowMinutes: 30, createdAt: new Date(),
             };
+            for (const asset of assets) if (assetIds.includes(asset.id)) asset.scheduleId = row.id;
             schedules.push(row);
             return row;
         },
@@ -167,8 +231,27 @@ export function fakeScheduler(schedules: FakeSchedule[] = [], executions: FakeEx
         },
         async requestStop(id: string) { calls.push(`stop:${id}`); return executions.some((row) => row.id === id) ? 'queued' : 'not-found'; },
         async retryExecution(id: string) { calls.push(`retry:${id}`); return executions.find((row) => row.id === id) ?? null; },
-        async registerAssets(files: Array<{ relativePath: string }>) { return files.map((file) => ({ id: crypto.randomUUID(), ...file })); },
-        async deleteAssets() { calls.push('delete-assets'); },
+        async registerAssets(files: Array<{ relativePath: string; size: number }>, owner: { tenantId?: string | null; deviceUdid?: string; uploadedBy?: string | null } = {}) {
+            const tenantId = owner.tenantId ?? (owner.deviceUdid ? await tenantOfDevice(owner.deviceUdid) : DEFAULT_TENANT_ID);
+            const used = (await scheduler.uploadUsage(tenantId)).usedBytes;
+            if (used + files.reduce((total, file) => total + file.size, 0) > scheduler.uploadBudget) {
+                throw Object.assign(new Error('Uploads for this organisation are over quota'), { statusCode: 413, name: 'UploadQuotaError' });
+            }
+            return files.map((file) => {
+                const asset = { id: crypto.randomUUID(), tenantId, scheduleId: null, size: file.size, uploadedBy: owner.uploadedBy ?? null, relativePath: file.relativePath };
+                assets.push(asset);
+                return { id: asset.id, name: file.relativePath, mimeType: 'application/octet-stream' };
+            });
+        },
+        async deleteAssets(ids: string[], tenantId?: string) {
+            if (tenantId !== undefined && !ids.every((id) => assets.some((asset) => asset.id === id && asset.tenantId === tenantId))) return false;
+            calls.push('delete-assets');
+            for (const id of ids) {
+                const index = assets.findIndex((asset) => asset.id === id);
+                if (index >= 0) assets.splice(index, 1);
+            }
+            return true;
+        },
         async updateSchedule(id: string) { calls.push(`update:${id}`); return schedules.find((row) => row.id === id) ?? null; },
     };
     return scheduler;
@@ -208,18 +291,23 @@ export async function createAuthApp(options: {
     const { AccountService } = await import('../src/auth/accounts.js');
     const { createBuiltinAuthProvider } = await import('../src/auth/builtin.js');
     const { LoginThrottle } = await import('../src/auth/throttle.js');
+    const { TenantService } = await import('../src/auth/tenants.js');
+    const { MemoryAuditLog } = await import('../src/auth/audit.js');
     const { defaultDashboardTheme } = await import('../src/dashboard-theme.js');
     const { PluginRegistry } = await import('../src/registry.js');
     const { createTikTokPlugin } = await import('../src/tiktok-plugin.js');
     const store = new MemoryAuthStore();
+    const tenantStore = new MemoryTenantStore(store);
     const clock = options.clock ?? testClock();
-    const audit: Array<{ event: string; actor?: string; target?: string; ip?: string; detail?: string }> = [];
+    const audit: Array<import('../src/auth/accounts.js').AuditEvent> = [];
     const accounts = new AccountService({
-        store, now: clock.now,
+        store, tenants: tenantStore, now: clock.now,
         throttle: new LoginThrottle({ now: () => clock.now().getTime() }),
     });
-    const provider = createBuiltinAuthProvider(accounts);
-    const scheduler = fakeScheduler(options.schedules, options.executions);
+    const tenants = new TenantService(tenantStore);
+    const auditLog = new MemoryAuditLog();
+    const provider = createBuiltinAuthProvider(accounts, undefined, { tenants, auditLog });
+    const scheduler = fakeScheduler(options.schedules, options.executions, async (udid) => tenantStore.assignments.get(udid) ?? DEFAULT_TENANT_ID);
     const remote = fakeRemote();
     const registrations = {
         async start() {}, async close() {}, async candidates() { return []; },
@@ -233,8 +321,11 @@ export async function createAuthApp(options: {
         discoverDevices: async () => [], wdaStatuses: async () => [],
         ...options.extra,
     });
-    accounts.audit = (event) => audit.push(event);
-    return { app, store, accounts, provider, scheduler, remote, clock, audit };
+    // Record events for the test while still passing them on to the dashboard's audit log.
+    const forward = accounts.audit;
+    accounts.audit = (event) => { audit.push(event); forward(event); };
+    tenants.audit = (event) => { audit.push(event); forward(event); };
+    return { app, store, tenantStore, tenants, accounts, provider, scheduler, remote, clock, audit, auditLog };
 }
 
 /** A live session for `userId` without going through the sign-in form: returns the cookie value. */
@@ -247,7 +338,12 @@ export async function sessionFor(store: MemoryAuthStore, userId: string, now = n
     return token;
 }
 
-/** A user row with a placeholder hash (these tests never sign in with a password). */
-export async function seedUser(store: MemoryAuthStore, username: string, role: 'admin' | 'operator', displayName = username) {
-    return store.createUser({ username, role, displayName, passwordHash: 'scrypt$1$1$1$x$y', mustChangePassword: false });
+/**
+ * A user row with a placeholder hash (these tests never sign in with a password).
+ * Tenant users land in `tenantId` (the default tenant unless given); platform staff in none.
+ */
+export async function seedUser(store: MemoryAuthStore, username: string, role: 'platform' | 'admin' | 'operator', displayName = username, tenantId: string = DEFAULT_TENANT_ID) {
+    return store.createUser({
+        username, role, displayName, passwordHash: 'scrypt$1$1$1$x$y', mustChangePassword: false, tenantId: role === 'platform' ? null : tenantId,
+    });
 }

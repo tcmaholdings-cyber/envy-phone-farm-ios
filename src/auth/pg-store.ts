@@ -1,16 +1,24 @@
-import { and, asc, eq, inArray, lt, ne, or } from 'drizzle-orm';
+import { and, asc, count, eq, inArray, isNull, lt, ne, or, type SQL } from 'drizzle-orm';
 
 import type { DatabaseConnection } from '../database/client.js';
-import { authGrants, authGroupMembers, authGroups, authSessions, authUsers } from '../database/schema.js';
+import {
+    authGrants, authGroupMembers, authGroups, authSessions, authTenantDevices, authTenants, authUsers,
+} from '../database/schema.js';
+import type { TenantQuotas } from '../tenancy.js';
 import {
     AuthConflictError, type AuthStore, type GrantRecord, type GroupRecord, type MembershipRecord, type NewGrant,
-    type NewSession, type NewUser, type SessionRecord, type UserPatch, type UserRecord,
+    type NewSession, type NewUser, type SessionRecord, type TenantFilter, type UserPatch, type UserRecord,
 } from './store.js';
+import type { TenantPatch, TenantRecord, TenantStore } from './tenants.js';
 
 function isUniqueViolation(error: unknown): boolean {
     const candidate = error as { code?: string; cause?: { code?: string } };
     return candidate?.code === '23505' || candidate?.cause?.code === '23505';
 }
+
+/** A malformed id names nothing; checked first so it is a clean 404, not a uuid syntax error. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isUuid(value: string): boolean { return UUID_PATTERN.test(value); }
 
 async function conflictAware<T>(message: string, run: () => Promise<T>): Promise<T> {
     try {
@@ -27,11 +35,14 @@ export class PgAuthStore implements AuthStore {
 
     private get db() { return this.connection.db; }
 
-    async listUsers(): Promise<UserRecord[]> {
-        return this.db.select().from(authUsers).orderBy(asc(authUsers.username));
+    async listUsers(tenantId?: TenantFilter): Promise<UserRecord[]> {
+        const query = this.db.select().from(authUsers);
+        const filtered = tenantId === undefined ? query : query.where(tenantId === null ? isNull(authUsers.tenantId) : eq(authUsers.tenantId, tenantId));
+        return filtered.orderBy(asc(authUsers.username));
     }
 
     async userById(id: string): Promise<UserRecord | null> {
+        if (!isUuid(id)) return null;
         const [row] = await this.db.select().from(authUsers).where(eq(authUsers.id, id)).limit(1);
         return row ?? null;
     }
@@ -58,16 +69,19 @@ export class PgAuthStore implements AuthStore {
         return (await this.db.delete(authUsers).where(eq(authUsers.id, id)).returning({ id: authUsers.id })).length > 0;
     }
 
-    async listGroups(): Promise<GroupRecord[]> {
-        return this.db.select().from(authGroups).orderBy(asc(authGroups.name));
+    async listGroups(tenantId?: TenantFilter): Promise<GroupRecord[]> {
+        if (tenantId === null) return [];
+        const query = this.db.select().from(authGroups);
+        return (tenantId === undefined ? query : query.where(eq(authGroups.tenantId, tenantId))).orderBy(asc(authGroups.name));
     }
 
     async groupById(id: string): Promise<GroupRecord | null> {
+        if (!isUuid(id)) return null;
         const [row] = await this.db.select().from(authGroups).where(eq(authGroups.id, id)).limit(1);
         return row ?? null;
     }
 
-    async createGroup(input: { name: string; description: string }): Promise<GroupRecord> {
+    async createGroup(input: { tenantId: string; name: string; description: string }): Promise<GroupRecord> {
         return conflictAware('A group with that name already exists', async () => {
             const [row] = await this.db.insert(authGroups).values(input).returning();
             return row!;
@@ -85,8 +99,13 @@ export class PgAuthStore implements AuthStore {
         return (await this.db.delete(authGroups).where(eq(authGroups.id, id)).returning({ id: authGroups.id })).length > 0;
     }
 
-    async listMemberships(): Promise<MembershipRecord[]> {
-        return this.db.select({ groupId: authGroupMembers.groupId, userId: authGroupMembers.userId }).from(authGroupMembers);
+    async listMemberships(tenantId?: TenantFilter): Promise<MembershipRecord[]> {
+        if (tenantId === null) return [];
+        const columns = { groupId: authGroupMembers.groupId, userId: authGroupMembers.userId };
+        if (tenantId === undefined) return this.db.select(columns).from(authGroupMembers);
+        return this.db.select(columns).from(authGroupMembers)
+            .innerJoin(authGroups, eq(authGroups.id, authGroupMembers.groupId))
+            .where(eq(authGroups.tenantId, tenantId));
     }
 
     async groupIdsForUser(userId: string): Promise<string[]> {
@@ -106,8 +125,15 @@ export class PgAuthStore implements AuthStore {
         return rows.length > 0;
     }
 
-    async listGrants(): Promise<GrantRecord[]> {
-        return this.db.select().from(authGrants).orderBy(asc(authGrants.createdAt));
+    async listGrants(tenantId?: TenantFilter): Promise<GrantRecord[]> {
+        if (tenantId === null) return [];
+        if (tenantId === undefined) return this.db.select().from(authGrants).orderBy(asc(authGrants.createdAt));
+        // A grant belongs to its subject's tenant.
+        const inTenant: SQL = or(
+            inArray(authGrants.userId, this.db.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.tenantId, tenantId))),
+            inArray(authGrants.groupId, this.db.select({ id: authGroups.id }).from(authGroups).where(eq(authGroups.tenantId, tenantId))),
+        )!;
+        return this.db.select().from(authGrants).where(inTenant).orderBy(asc(authGrants.createdAt));
     }
 
     async grantsForSubjects(userId: string, groupIds: readonly string[]): Promise<GrantRecord[]> {
@@ -123,6 +149,7 @@ export class PgAuthStore implements AuthStore {
     }
 
     async deleteGrant(id: string): Promise<GrantRecord | null> {
+        if (!isUuid(id)) return null;
         const [row] = await this.db.delete(authGrants).where(eq(authGrants.id, id)).returning();
         return row ?? null;
     }
@@ -157,5 +184,55 @@ export class PgAuthStore implements AuthStore {
 
     async close(): Promise<void> {
         await this.connection.close();
+    }
+}
+
+/** Tenants and phone ownership in schema `auth` (drizzle/0006_tenants.sql). */
+export class PgTenantStore implements TenantStore {
+    constructor(private readonly connection: DatabaseConnection) {}
+
+    private get db() { return this.connection.db; }
+
+    async listTenants(): Promise<TenantRecord[]> {
+        return this.db.select().from(authTenants).orderBy(asc(authTenants.name));
+    }
+
+    async tenantById(id: string): Promise<TenantRecord | null> {
+        if (!isUuid(id)) return null;
+        const [row] = await this.db.select().from(authTenants).where(eq(authTenants.id, id)).limit(1);
+        return row ?? null;
+    }
+
+    async tenantBySlug(slug: string): Promise<TenantRecord | null> {
+        const [row] = await this.db.select().from(authTenants).where(eq(authTenants.slug, slug)).limit(1);
+        return row ?? null;
+    }
+
+    async createTenant(input: { slug: string; name: string; quotas: TenantQuotas }): Promise<TenantRecord> {
+        return conflictAware('That short name is already taken', async () => {
+            const [row] = await this.db.insert(authTenants).values(input).returning();
+            return row!;
+        });
+    }
+
+    async updateTenant(id: string, patch: TenantPatch): Promise<TenantRecord | null> {
+        if (!Object.keys(patch).length) return this.tenantById(id);
+        const [row] = await this.db.update(authTenants).set(patch).where(eq(authTenants.id, id)).returning();
+        return row ?? null;
+    }
+
+    async deviceAssignments(): Promise<Map<string, string>> {
+        const rows = await this.db.select({ udid: authTenantDevices.udid, tenantId: authTenantDevices.tenantId }).from(authTenantDevices);
+        return new Map(rows.map(({ udid, tenantId }) => [udid, tenantId]));
+    }
+
+    async assignDevice(udid: string, tenantId: string): Promise<void> {
+        await this.db.insert(authTenantDevices).values({ udid, tenantId })
+            .onConflictDoUpdate({ target: authTenantDevices.udid, set: { tenantId, assignedAt: new Date() } });
+    }
+
+    async countUsers(tenantId: string): Promise<number> {
+        const [row] = await this.db.select({ value: count() }).from(authUsers).where(eq(authUsers.tenantId, tenantId));
+        return Number(row?.value ?? 0);
     }
 }

@@ -485,10 +485,11 @@ dialog#calibrate-dialog { width: min(760px, calc(100% - 28px)); }
 .auth-form .form-actions { margin-top: var(--s-1); }
 
 /* ---------- role-based visibility (the server enforces; this only hides) ---------- */
-body[data-role="operator"] a[href="/devices/register"],
-body[data-role="operator"] #open-passcode,
-body[data-role="operator"] #open-rackslot,
-body[data-role="operator"] #open-remove { display: none; }
+/* Farm setup is platform staff only: a tenant admin (data-role="admin") and an operator never see it. */
+body[data-role] a[href="/devices/register"],
+body[data-role] #open-passcode,
+body[data-role] #open-rackslot,
+body[data-role] #open-remove { display: none; }
 body[data-device-access="view"] #open-accounts,
 body[data-device-access="view"] #open-calibrate,
 body[data-device-access="view"] .remote-controls,

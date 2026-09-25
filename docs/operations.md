@@ -75,7 +75,7 @@ Three layers, from the outside in. Set up all three on every farm host.
 | `GET /health` | anyone | Liveness: `{"ok":true,"release":"<sha>"}`. It only says the web process answers. |
 | `GET /health/ready` | anyone (no session) | `200` when all four checks pass, else `503`. Body: `{"ok":…,"checks":{"database","appium","wdaService","worker"}}`, each `{"ok":true}` or `{"ok":false,"reason":…}` with reason `unreachable`, `timeout`, `no heartbeat` or `stale`; `worker` also carries `ageSeconds`. The reasons are fixed words; the real error goes to `logs/web.log` as `readiness check failed`. Each check is bounded at 3 s. |
 | `GET /metrics` | `Authorization: Bearer $PHONE_FARM_METRICS_TOKEN` | Prometheus text. `404` while the token is unset, `401` for a wrong one. |
-| `GET /api/devices/:udid/wda-log?lines=N` | admins | The phone's last N (up to 1000) supervisor lines, from the wda-service. |
+| `GET /api/devices/:udid/wda-log?lines=N` | platform staff | The phone's last N (up to 1000) supervisor lines, from the wda-service. |
 
 The four readiness checks: `database` runs `select 1`; `appium` asks Appium's
 `/status` on `APPIUM_HOST:APPIUM_PORT`; `wdaService` needs the socket's
@@ -237,7 +237,7 @@ time and instantly during the failure cooldown.
 
 1. Prepare it (install guide §5), connect it, `xcrun xctrace list devices` shows it.
 2. `npm run wda:prepare -- --udid <udid>` from the GUI session.
-3. Dashboard → **Register a phone** (admins) → checks → **Finish registration**. Pick free `wdaLocalPort` / `mjpegLocalPort` (the wizard proposes the next ones), set the **rack** (access can be granted per rack) and the **rack slot** so the phone can be found later. The model is detected and saved automatically.
+3. Dashboard → **Register a phone** (platform staff) → checks → **Finish registration**. Pick free `wdaLocalPort` / `mjpegLocalPort` (the wizard proposes the next ones), set the **rack** (access can be granted per rack) and the **rack slot** so the phone can be found later. The model is detected and saved automatically.
 4. Device page → *Touch points* → calibrate; run a `doomscroll` once.
 
 ### Signing on another Mac
@@ -261,13 +261,19 @@ More than ~100 phones need more than one Apple Team: build one artifact per Team
 With `PHONE_FARM_AUTH_PLUGIN=builtin` ([configuration](configuration.md#built-in-accounts))
 everyone signs in with their own account.
 
-**First admins** (on the host, once, after `npm run db:migrate`):
+**First accounts** (on the host, once, after `npm run db:migrate`). The farm
+operator's own staff are **platform** accounts; a customer organisation's
+admin is an **admin** of that tenant ([tenants.md](tenants.md)):
 
 ```sh
-npm run users -- create kash --role admin --name "Kash"
-npm run users -- create rex --role admin --name "Rex"
+npm run users -- create kash --role platform --name "Kash"
+npm run users -- create rex --role platform --name "Rex"
+npm run users -- create acme-boss --role admin --tenant acme --name "Acme boss"   # after creating tenant "acme"
 npm run users -- list
 ```
+
+Upgrading from a release without tenants turns every existing `admin` into
+`platform` and puts every operator in the default tenant, `beloura`.
 
 Each `create` prints a temporary password on stdout, once — nothing else
 stores it. Hand it over privately; the person must choose their own password
@@ -280,8 +286,9 @@ everywhere.
 
 | Role | Can |
 | --- | --- |
-| Admin | Everything: all phones, registering phones, device settings (name, passcode, rack, slot, disconnect, remove), the Team page. |
-| Operator | Only the phones granted to them, at the granted level. Never device settings, registration or the Team page. |
+| Platform | Everything, in every organisation: all phones, registering phones, device settings (name, passcode, rack, slot, disconnect, remove), the Organisations page, every Team page and the whole audit log. |
+| Admin | Everything inside their own organisation: all its phones, its Team page (people, groups, grants), its media and its audit log. Never device settings, registration, or anything of another organisation. |
+| Operator | Only the phones granted to them in their organisation, at the granted level. Never device settings, registration or the Team page. |
 
 **Access levels** (per phone)
 
@@ -298,7 +305,7 @@ matching grant the phone does not exist for them (its pages and API answer
 404). Grants follow the phones: move a phone to rack 2 and rack-1 access to it
 ends at once.
 
-**Adding a VA** (admin, from **Team** in the navigation):
+**Adding a VA** (an organisation's admin, or platform staff with the Team page's switcher on that organisation):
 
 1. **Add person** → username, display name, role *Operator*, optional groups →
    **Save**. Copy the temporary password from the dialog — it is shown once.
@@ -310,11 +317,12 @@ Groups ("Night shift", "Rack 1 team") save repeating grants: grant the group
 once, then add or remove members. **Disable** blocks sign-in and ends the
 person's sessions at once without losing their setup; **Delete** removes the
 account, its grants and memberships. The last active admin cannot be demoted,
-disabled or deleted, and nobody can disable or delete their own account.
+disabled or deleted (per organisation; likewise the last platform account),
+and nobody can disable or delete their own account.
 
 **Rack and model on existing phones.** Models fill themselves in the first
 time the dashboard sees each phone connected (open the grid once with the
-phones plugged in). Racks are set by an admin: per phone on the device page
+phones plugged in). Racks are set by platform staff: per phone on the device page
 (*Rack & slot*), or in bulk on the host:
 
 ```sh
@@ -323,9 +331,11 @@ npm run devices -- set-rack 1 --all              # every registered phone
 npm run devices -- set-rack 2 <udid> <udid> …    # just these
 ```
 
-Every sign-in and every user, group and grant change is written to
-`logs/web.log` as an `audit` line with the actor, e.g.
-`grep '"audit"' logs/web.log | tail`.
+Every change — each state-changing request, sign-in, and user, group, grant
+or organisation change — is recorded in the append-only audit log: the
+**Audit** page (CSV export there too), `GET /api/audit`, and an `audit` line
+in `logs/web.log` (`grep '"audit"' logs/web.log | tail`). See
+[tenants.md](tenants.md#audit-log).
 
 ## Retiring a phone
 

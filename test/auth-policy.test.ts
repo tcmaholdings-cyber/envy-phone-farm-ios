@@ -3,15 +3,17 @@ import test from 'node:test';
 
 import { FULL_ACCESS, NO_ACCESS, requestAccessFor } from '../src/auth/access.js';
 import {
-    effectiveLevel, grantAppliesToUser, grantMatchesDevice, hasAnyOperateGrant, isAdmin, levelSatisfies, maxLevel,
+    effectiveLevel, grantAppliesToUser, grantMatchesDevice, hasAnyOperateGrant, isPlatform, levelSatisfies, maxLevel,
     type PolicyDevice, type PolicyGrant, type PolicyUser,
 } from '../src/auth/policy.js';
 
-const operator: PolicyUser = { id: 'u1', role: 'operator' };
-const admin: PolicyUser = { id: 'a1', role: 'admin' };
-const phone: PolicyDevice = { udid: 'udid-1', rack: '1', model: 'iPhone 12 mini' };
-const other: PolicyDevice = { udid: 'udid-2', rack: '2', model: 'iPhone SE (2nd generation)' };
-const bare: PolicyDevice = { udid: 'udid-3' };
+// Everything here lives in one tenant; test/tenant-policy.test.ts covers crossing tenants.
+const T = 'tenant-1';
+const operator: PolicyUser = { id: 'u1', role: 'operator', tenantId: T };
+const admin: PolicyUser = { id: 'a1', role: 'platform', tenantId: null };
+const phone: PolicyDevice = { udid: 'udid-1', rack: '1', model: 'iPhone 12 mini', tenantId: T };
+const other: PolicyDevice = { udid: 'udid-2', rack: '2', model: 'iPhone SE (2nd generation)', tenantId: T };
+const bare: PolicyDevice = { udid: 'udid-3', tenantId: T };
 
 test('levels: operate satisfies view, view does not satisfy operate, nothing satisfies anything', () => {
     assert.equal(levelSatisfies('operate', 'view'), true);
@@ -68,14 +70,14 @@ test('an operator with no grants sees nothing', () => {
     assert.equal(effectiveLevel(operator, [], [], phone), null);
 });
 
-test('an admin operates everything without grants; a disabled admin gets nothing', () => {
+test('platform staff operate everything without grants; disabled platform staff get nothing', () => {
     assert.equal(effectiveLevel(admin, [], [], phone), 'operate');
     assert.equal(effectiveLevel(admin, [], [], bare), 'operate');
     assert.equal(effectiveLevel({ ...admin, disabled: true }, [], [], phone), null);
-    assert.equal(isAdmin(admin), true);
-    assert.equal(isAdmin({ ...admin, disabled: true }), false);
-    assert.equal(isAdmin(operator), false);
-    assert.equal(isAdmin(null), false);
+    assert.equal(isPlatform(admin), true);
+    assert.equal(isPlatform({ ...admin, disabled: true }), false);
+    assert.equal(isPlatform(operator), false);
+    assert.equal(isPlatform(null), false);
 });
 
 test('a disabled or missing user gets nothing, whatever the grants say', () => {
@@ -135,17 +137,25 @@ test('hasAnyOperateGrant: an operate grant of the user or a group, or an admin',
 test('request access: no user sees nothing; no scoped access means everything (legacy providers); operators are scoped', () => {
     assert.equal(NO_ACCESS.levelFor(phone), null);
     assert.equal(FULL_ACCESS.levelFor(phone), 'operate');
-    assert.equal(requestAccessFor(null).admin, false);
+    assert.equal(requestAccessFor(null).platform, false);
     const legacy = requestAccessFor({ id: 'x', roles: [] });
-    assert.equal(legacy.admin, true);
+    assert.equal(legacy.platform, true);
     assert.equal(legacy.levelFor(bare), 'operate');
     const scoped = requestAccessFor({
         id: 'u1', roles: ['operator'],
-        access: { role: 'operator', groupIds: ['g1'], grants: [{ groupId: 'g1', scopeType: 'model', scopeValue: 'iPhone 12 mini', level: 'view' }] },
+        access: { role: 'operator', tenantId: T, groupIds: ['g1'], grants: [{ groupId: 'g1', scopeType: 'model', scopeValue: 'iPhone 12 mini', level: 'view' }] },
     });
-    assert.equal(scoped.admin, false);
+    assert.equal(scoped.platform, false);
+    assert.equal(scoped.tenantId, T);
     assert.equal(scoped.levelFor(phone), 'view');
     assert.equal(scoped.levelFor(other), null);
     assert.equal(scoped.anyOperate, false);
-    assert.equal(requestAccessFor({ id: 'a', roles: ['admin'], access: { role: 'admin', groupIds: [], grants: [] } }).admin, true);
+    // `admin` without a tenant is what a provider written before tenants meant: everything.
+    assert.equal(requestAccessFor({ id: 'a', roles: ['admin'], access: { role: 'admin', groupIds: [], grants: [] } }).platform, true);
+    assert.equal(requestAccessFor({ id: 'p', roles: ['platform'], access: { role: 'platform', groupIds: [], grants: [] } }).platform, true);
+    const tenantAdmin = requestAccessFor({ id: 'a', roles: ['admin'], access: { role: 'admin', tenantId: T, groupIds: [], grants: [] } });
+    assert.equal(tenantAdmin.platform, false);
+    assert.equal(tenantAdmin.tenantAdmin, true);
+    assert.equal(tenantAdmin.levelFor(phone), 'operate');
+    assert.equal(tenantAdmin.levelFor({ ...phone, tenantId: 'tenant-2' }), null);
 });

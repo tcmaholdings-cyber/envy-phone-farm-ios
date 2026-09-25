@@ -1,11 +1,19 @@
 /**
- * Device access policy — pure functions, no I/O.
+ * Access policy — pure functions, no I/O.
  *
- * An admin can do everything. An operator can see and act on a phone only
- * through a grant: to the user, or to a group the user belongs to. A grant
- * matches a phone by scope (every phone, a rack, a model, or one UDID) and
- * carries a level; the effective level is the highest level of every grant that
- * matches. `view` shows the phone; `operate` also drives it.
+ * Three roles (docs/tenants.md):
+ * - `platform` — Beloura staff. Every tenant, every phone, farm setup. No tenant of their own.
+ * - `admin`    — one tenant's administrator: every phone of that tenant, and its
+ *                users, groups and grants. Nothing of any other tenant.
+ * - `operator` — within one tenant, only the phones granted to them.
+ *
+ * Tenancy comes first: a resource (phone, schedule, execution, asset, user,
+ * group) of another tenant does not exist for anyone but platform staff, and
+ * the dashboard answers 404 for it. Within the tenant, an operator reaches a
+ * phone only through a grant: to the user, or to a group the user belongs to.
+ * A grant matches a phone by scope (every phone, a rack, a model, or one UDID)
+ * and carries a level; the effective level is the highest level of every grant
+ * that matches. `view` shows the phone; `operate` also drives it.
  */
 
 export const ACCESS_LEVELS = ['view', 'operate'] as const;
@@ -14,12 +22,16 @@ export type AccessLevel = typeof ACCESS_LEVELS[number];
 export const SCOPE_TYPES = ['all', 'rack', 'model', 'device'] as const;
 export type ScopeType = typeof SCOPE_TYPES[number];
 
-export const USER_ROLES = ['admin', 'operator'] as const;
+export const USER_ROLES = ['platform', 'admin', 'operator'] as const;
 export type UserRole = typeof USER_ROLES[number];
+/** The roles a tenant's own users can hold. */
+export const TENANT_ROLES = ['admin', 'operator'] as const;
 
 export interface PolicyUser {
     id: string;
     role: UserRole;
+    /** The user's tenant; null or absent for platform staff. */
+    tenantId?: string | null;
     disabled?: boolean;
 }
 
@@ -35,6 +47,8 @@ export interface PolicyDevice {
     udid: string;
     rack?: string | null;
     model?: string | null;
+    /** The phone's tenant. Unknown means no tenant user can reach it (platform still can). */
+    tenantId?: string | null;
 }
 
 const RANK: Record<AccessLevel, number> = { view: 1, operate: 2 };
@@ -84,8 +98,41 @@ export function grantAppliesToUser(grant: PolicyGrant, userId: string, groupIds:
     return false;
 }
 
-export function isAdmin(user: PolicyUser | null | undefined): boolean {
-    return Boolean(user && !user.disabled && user.role === 'admin');
+function active(user: PolicyUser | null | undefined): user is PolicyUser {
+    return Boolean(user && !user.disabled);
+}
+
+/** Beloura staff: every tenant. */
+export function isPlatform(user: PolicyUser | null | undefined): boolean {
+    return active(user) && user.role === 'platform';
+}
+
+/** A tenant's administrator (never true without a tenant). */
+export function isTenantAdmin(user: PolicyUser | null | undefined): boolean {
+    return active(user) && user.role === 'admin' && Boolean(user.tenantId);
+}
+
+/**
+ * True when `user` may know that a resource of `tenantId` exists at all:
+ * platform staff always, anyone else only for their own tenant. An unknown
+ * tenant (null/undefined) is visible to platform staff only.
+ */
+export function canSeeTenant(user: PolicyUser | null | undefined, tenantId: string | null | undefined): boolean {
+    if (!active(user)) return false;
+    if (user.role === 'platform') return true;
+    return Boolean(user.tenantId) && Boolean(tenantId) && user.tenantId === tenantId;
+}
+
+/** Managing users, groups and grants of `tenantId`: platform staff, or that tenant's admin. */
+export function canManageTeam(user: PolicyUser | null | undefined, tenantId: string | null | undefined): boolean {
+    return isPlatform(user) || (isTenantAdmin(user) && canSeeTenant(user, tenantId));
+}
+
+/** The roles `actor` may give to someone: platform staff any, a tenant admin only tenant roles. */
+export function assignableRoles(actor: PolicyUser | null | undefined): readonly UserRole[] {
+    if (isPlatform(actor)) return USER_ROLES;
+    if (isTenantAdmin(actor)) return TENANT_ROLES;
+    return [];
 }
 
 /**
@@ -99,8 +146,11 @@ export function effectiveLevel(
     grants: readonly PolicyGrant[],
     device: PolicyDevice,
 ): AccessLevel | null {
-    if (!user || user.disabled) return null;
+    if (!active(user)) return null;
+    if (user.role === 'platform') return 'operate';
+    if (!canSeeTenant(user, device.tenantId)) return null;
     if (user.role === 'admin') return 'operate';
+    if (user.role !== 'operator') return null;
     let best: AccessLevel | null = null;
     for (const grant of grants) {
         if (!isAccessLevel(grant.level)) continue;
@@ -113,7 +163,8 @@ export function effectiveLevel(
 
 /** True when some grant of the user carries `operate` (uploads are not tied to one phone). */
 export function hasAnyOperateGrant(user: PolicyUser | null | undefined, groupIds: readonly string[], grants: readonly PolicyGrant[]): boolean {
-    if (!user || user.disabled) return false;
-    if (user.role === 'admin') return true;
+    if (!active(user)) return false;
+    if (user.role === 'platform' || isTenantAdmin(user)) return true;
+    if (user.role !== 'operator' || !user.tenantId) return false;
     return grants.some((grant) => grant.level === 'operate' && grantAppliesToUser(grant, user.id, groupIds));
 }

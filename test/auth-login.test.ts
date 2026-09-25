@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 
-import { createAuthApp, sessionCookie, TEST_DEVICES, useDevicesFile, type MemoryAuthStore } from './auth-support.js';
+import { createAuthApp, DEFAULT_TENANT_ID, sessionCookie, TEST_DEVICES, useDevicesFile, type MemoryAuthStore } from './auth-support.js';
 import { inject } from './support.js';
 
 await useDevicesFile(TEST_DEVICES);
@@ -10,9 +10,9 @@ const { hashPassword } = await import('../src/auth/password.js');
 
 const PASSWORD = 'correct horse battery';
 
-async function addUser(store: MemoryAuthStore, username: string, role: 'admin' | 'operator', options: { password?: string; displayName?: string; mustChange?: boolean } = {}) {
+async function addUser(store: MemoryAuthStore, username: string, role: 'platform' | 'admin' | 'operator', options: { password?: string; displayName?: string; mustChange?: boolean } = {}) {
     const user = await store.createUser({
-        username, role, displayName: options.displayName ?? username,
+        username, role, displayName: options.displayName ?? username, tenantId: role === 'platform' ? null : DEFAULT_TENANT_ID,
         passwordHash: await hashPassword(options.password ?? PASSWORD), mustChangePassword: options.mustChange ?? false,
     });
     return user;
@@ -59,7 +59,7 @@ test('without a session, pages redirect to sign-in, the API answers 401, and onl
 test('signing in sets an HttpOnly, SameSite=Lax session cookie and stores only its hash', async (context) => {
     const { app, store, audit } = await createAuthApp();
     context.after(() => app.close());
-    const user = await addUser(store, 'kash', 'admin', { displayName: 'Kash <Owner>' });
+    const user = await addUser(store, 'kash', 'platform', { displayName: 'Kash <Owner>' });
     const response = await login(app, 'Kash', PASSWORD, { next: '/tasks' });
     assert.equal(response.statusCode, 303);
     assert.equal(response.headers.location, '/tasks');
@@ -83,9 +83,9 @@ test('signing in sets an HttpOnly, SameSite=Lax session cookie and stores only i
     assert.match(home.body, /<span class="nav-user">Kash &lt;Owner&gt;<\/span>/);
     assert.match(home.body, /<form class="nav-logout" method="post" action="\/logout"><button class="button secondary app-logout" type="submit">Log out<\/button><\/form>/);
     assert.match(home.body, /<a class="nav-link" href="\/team">Team<\/a>/);
-    assert.match(home.body, /<body class="page-grid">/, 'an admin page carries no operator marker');
+    assert.match(home.body, /<body class="page-grid">/, 'a platform page carries no role marker');
     const me = await inject(app, { method: 'GET', url: '/api/me', cookies: { pf_session: cookie.value } });
-    assert.deepEqual(me.json(), { id: user.id, username: 'kash', displayName: 'Kash <Owner>', role: 'admin', mustChangePassword: false });
+    assert.deepEqual(me.json(), { id: user.id, username: 'kash', displayName: 'Kash <Owner>', role: 'platform', tenantId: null, mustChangePassword: false });
 });
 
 test('the cookie is Secure behind the HTTPS tunnel (loopback peer) and not when the proto header comes from elsewhere', async (context) => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createAuthApp, seedUser, sessionFor, TEST_DEVICES, useDevicesFile } from './auth-support.js';
+import { createAuthApp, DEFAULT_TENANT_ID, seedUser, sessionFor, TEST_DEVICES, useDevicesFile } from './auth-support.js';
 import { inject } from './support.js';
 
 await useDevicesFile(TEST_DEVICES);
@@ -31,7 +31,9 @@ test('adding a person returns a temporary password once and stores only its hash
     assert.ok(await verifyPassword(temporaryPassword, stored.passwordHash));
     assert.ok(!stored.passwordHash.includes(temporaryPassword));
     assert.deepEqual(t.store.memberships, [{ groupId: group.id, userId: user.id }]);
-    assert.deepEqual(t.audit.find(({ event }) => event === 'user.created'), { event: 'user.created', actor: 'kash', target: 'maria.va', detail: 'role=operator' });
+    assert.deepEqual(t.audit.find(({ event }) => event === 'user.created'), {
+        event: 'user.created', actor: 'kash', actorId: t.kash.id, actorRole: 'admin', tenantId: DEFAULT_TENANT_ID, target: 'maria.va', detail: 'role=operator',
+    });
     assert.ok(!JSON.stringify(t.audit).includes(temporaryPassword), 'never in the audit log');
     const page = await t.call('GET', '/team');
     assert.ok(!page.body.includes(temporaryPassword), 'never in the page');
@@ -146,7 +148,7 @@ test('the Team page escapes every name and shows what each operator can reach', 
     const t = await team();
     context.after(() => t.app.close());
     const hostile = await seedUser(t.store, 'hostile', 'operator', '<img src=x onerror=alert(1)>');
-    const group = await t.store.createGroup({ name: '"><script>alert(2)</script>', description: '<b>bold</b>' });
+    const group = await t.store.createGroup({ tenantId: DEFAULT_TENANT_ID, name: '"><script>alert(2)</script>', description: '<b>bold</b>' });
     await t.store.addMember(group.id, hostile.id);
     await t.store.createGrant({ userId: null, groupId: group.id, scopeType: 'rack', scopeValue: '1', level: 'view' });
     await t.store.createGrant({ userId: hostile.id, groupId: null, scopeType: 'device', scopeValue: 'udid-loose', level: 'operate' });

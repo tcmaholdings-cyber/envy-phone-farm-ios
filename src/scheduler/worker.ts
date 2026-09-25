@@ -1,5 +1,6 @@
 import type { JobWithMetadata } from 'pg-boss';
 
+import { pruneAuditLog } from '../auth/audit.js';
 import { assertDatabaseReady, createDatabaseConnection } from '../database/client.js';
 import { activeDevices, loadRegisteredDevices, type RegisteredDevice } from '../devices/registry.js';
 import { configuredPluginModules, loadPlugins } from '../loader.js';
@@ -254,6 +255,8 @@ export async function startWorker(plugins: PluginRegistry): Promise<WorkerRuntim
     const cleanupTimer = setInterval(() => {
         void repository.cleanup().catch(console.error);
         void repository.sweepOrphanedAssets().catch(console.error);
+        // Audit rows past PHONE_FARM_AUDIT_RETENTION_DAYS (default 365; the database keeps at least 30).
+        void pruneAuditLog(connection.pool).catch(console.error);
     }, 60 * 60_000);
     const reconcileTimer = setInterval(() => void repository.reconcileQueueStates().catch(console.error), 60_000);
     const heartbeat = startWorkerHeartbeat(connection.pool, () => workingQueues.size, { host: hostId });

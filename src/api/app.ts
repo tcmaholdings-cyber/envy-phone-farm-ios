@@ -3,14 +3,17 @@ import formbody from '@fastify/formbody';
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import crypto from 'node:crypto';
-import { mkdir, open, readFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
 import { FULL_ACCESS, requestAccessFor, type RequestAccess } from '../auth/access.js';
+import type { AuditLog } from '../auth/audit.js';
 import { isBuiltinAuthProvider } from '../auth/builtin.js';
+import { clientIp } from '../auth/net.js';
 import { levelSatisfies, type AccessLevel } from '../auth/policy.js';
+import { SINGLE_TENANT, type DeviceTenants } from '../auth/tenants.js';
 import { buildRouteRequirements, routeKey, type RouteRequirement } from '../auth/route-access.js';
 import { registerBuiltinAuthRoutes, safeNextPath, type ShellOptions } from '../auth/routes.js';
 import { connectedDevices, type Device } from '../devices/discovery.js';
@@ -35,7 +38,8 @@ import { brandHtml, brandingFromEnv, footerHtml, logoContentType, type Branding 
 import type { AuthenticatedUser, AuthProvider, PluginNavLink } from '../plugin.js';
 import type { PluginRegistry } from '../registry.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming } from '../types.js';
-import { ScheduleTransitionError, type SchedulerRepository } from '../scheduler/repository.js';
+import { DEFAULT_TENANT_ID, maxUploadBytes } from '../tenancy.js';
+import { ScheduleTransitionError, UploadQuotaError, type SchedulerRepository } from '../scheduler/repository.js';
 import { PROMETHEUS_CONTENT_TYPE, renderMetrics } from '../observability/metrics.js';
 import { checkReadiness, createDefaultProbes, type ObservabilityProbes } from '../observability/probes.js';
 import { AgentClient, AgentRequestError, FleetRemoteControl } from '../agent/client.js';
@@ -64,6 +68,8 @@ export interface CreateAppOptions {
     hosts?: HostDirectory;
     /** Multi-host test seam: the fetch used to call other hosts' agents. */
     agentFetch?: typeof fetch;
+    /** Where audit rows go; defaults to the built-in provider's (auth.audit_log), else the server log. */
+    auditLog?: AuditLog | null;
 }
 
 /** What GET /agent/status answers: this host's phones with their USB and WDA state. */
@@ -248,7 +254,8 @@ function wantsPage(request: FastifyRequest): boolean {
 
 
 export async function createApp(options: CreateAppOptions): Promise<FastifyInstance> {
-    const app = Fastify({ logger: options.logger ?? false, bodyLimit: 50 * 1024 * 1024 });
+    // Random request ids: they are what ties an audit row to the server log, across web replicas.
+    const app = Fastify({ logger: options.logger ?? false, bodyLimit: 50 * 1024 * 1024, genReqId: () => crypto.randomUUID() });
     const routes: RegisteredRoute[] = [];
     const requirements = buildRouteRequirements(options.plugins.list());
     appRoutes.set(app, { routes, requirements });
@@ -257,7 +264,11 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     });
     await app.register(formbody);
     await app.register(cookie);
-    await app.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 * 1024, files: 20 } });
+    // One uploaded file: PHONE_FARM_MAX_UPLOAD_BYTES, default 200 MiB. A bigger
+    // file fails the request with 413; each tenant also has a total budget.
+    await app.register(multipart, { limits: { fileSize: maxUploadBytes(), files: 20 } });
+
+    app.addHook('onRequest', async (request, reply) => { reply.header('x-request-id', request.id); });
 
     // Server-rendered HTML must never be cached — a stale page + fresh assets
     // (or vice versa) breaks the dashboard after a deploy.
@@ -335,6 +346,46 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         });
     }
 
+    // The audit log: one row per state-changing request, after the response,
+    // with the outcome. Route pattern and ids only — never the body, the query
+    // string or typed text (src/auth/audit.ts). A failed write is logged, not
+    // turned into a failed request.
+    const auditLog = options.auditLog !== undefined ? options.auditLog : isBuiltinAuthProvider(provider) ? provider.auditLog ?? null : null;
+    const stringParam = (value: unknown) => (typeof value === 'string' && value ? value : null);
+    app.addHook('onResponse', async (request, reply) => {
+        if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return;
+        try {
+            const user = requestUsers.get(request);
+            const access = user ? accessOf(request) : null;
+            const params = (request.params ?? {}) as Record<string, unknown>;
+            const body = (request.body && typeof request.body === 'object' ? request.body : {}) as Record<string, unknown>;
+            const route = request.routeOptions.url ?? null;
+            const targetUdid = stringParam(params.udid) ?? stringParam(body.deviceUdid) ?? stringParam(body.udid);
+            const assetIds = Array.isArray(body.assetIds) ? body.assetIds.filter((id): id is string => typeof id === 'string') : [];
+            const targetIds = [stringParam(params.id), stringParam(params.userId), ...assetIds].filter((id): id is string => Boolean(id));
+            // A tenant user's rows are their tenant's. Platform staff acting on a
+            // tenant's phone are recorded under that tenant, so its admin sees it.
+            let tenantId = access?.tenantId ?? null;
+            if (access?.platform) tenantId = targetUdid ? (await deviceTenants()).tenantOf(targetUdid) : tenantFilter(request) ?? null;
+            // The dashboard's remote control and the host agent's, which a peer dashboard calls.
+            const remoteAction = route === '/api/devices/:udid/remote/action' || route === '/agent/devices/:udid/remote/action';
+            const actionType = typeof body.type === 'string' && /^[A-Za-z]{1,20}$/.test(body.type) ? body.type : null;
+            const entry = {
+                tenantId, actorUserId: user?.id ?? null,
+                actorRole: user ? user.access?.role ?? user.roles[0] ?? null : null,
+                ip: clientIp(request) || null, method: request.method, route,
+                event: remoteAction ? 'remote.action' : 'http',
+                targetUdid, targetIds: targetIds.length ? targetIds : null, status: reply.statusCode, requestId: request.id,
+                // The action's kind (tap, swipe, type…) only; never coordinates or typed text.
+                detail: remoteAction && actionType ? `action=${actionType}` : null,
+            };
+            if (auditLog) await auditLog.record(entry);
+            else request.log.info({ audit: entry }, 'audit');
+        } catch (error) {
+            request.log.warn({ error: errorMessage(error) }, 'audit write failed');
+        }
+    });
+
     // Authorization, centrally: every route is looked up in the requirement
     // table (src/auth/route-access.ts). Admins, and users of a provider without
     // scoped access, pass straight through; operators are checked against the
@@ -346,21 +397,38 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         }
         return reply.code(statusCode).send({ error: message });
     };
-    const authorizeDevice = async (
-        request: FastifyRequest, reply: FastifyReply, access: RequestAccess, udid: unknown, level: AccessLevel, notFound = 'Device not found',
-    ) => {
-        const device = typeof udid === 'string' && udid ? (await loadRegisteredDevices()).find((entry) => entry.udid === udid) : undefined;
-        const granted = device ? access.levelFor(device) : null;
-        if (!granted) return deny(request, reply, 404, notFound);
-        if (!levelSatisfies(granted, level)) return deny(request, reply, 403, 'You have view-only access to this phone');
-        return undefined;
+    // Which tenant owns each phone (src/auth/tenants.ts): the built-in accounts
+    // keep it in auth.tenant_devices; without them one tenant owns everything.
+    const tenantService = isBuiltinAuthProvider(provider) ? provider.tenants : undefined;
+    const deviceTenants = async (): Promise<DeviceTenants> => (tenantService ? tenantService.deviceTenants() : SINGLE_TENANT);
+    /** Registered phones, each labelled with the tenant that owns it. */
+    const loadOwnedDevices = async () => {
+        const [devices, owners] = await Promise.all([loadRegisteredDevices(), deviceTenants()]);
+        return devices.map((device) => ({ ...device, tenantId: owners.tenantOf(device.udid) }));
     };
+    /**
+     * Refuse (and answer) unless the caller has `level` on the phone. True when
+     * refused. A boolean, not the reply: a Fastify reply is thenable, so
+     * awaiting one would resolve to undefined and hide that it was sent.
+     */
+    const refuseDevice = async (
+        request: FastifyRequest, reply: FastifyReply, access: RequestAccess, udid: unknown, level: AccessLevel, notFound = 'Device not found',
+    ): Promise<boolean> => {
+        const device = typeof udid === 'string' && udid ? (await loadOwnedDevices()).find((entry) => entry.udid === udid) : undefined;
+        const granted = device ? access.levelFor(device) : null;
+        if (!granted) { deny(request, reply, 404, notFound); return true; }
+        if (!levelSatisfies(granted, level)) { deny(request, reply, 403, 'You have view-only access to this phone'); return true; }
+        return false;
+    };
+    const authorizeDevice = async (
+        request: FastifyRequest, reply: FastifyReply, access: RequestAccess, udid: unknown, level: AccessLevel, notFound?: string,
+    ) => ((await refuseDevice(request, reply, access, udid, level, notFound)) ? reply : undefined);
     if (provider) {
         app.addHook('preHandler', async (request, reply) => {
             const url = request.routeOptions.url;
             if (!url || provider.isPublicPath(pathOf(request))) return;
             const access = accessOf(request);
-            if (access.admin) return;
+            if (access.platform) return;
             const requirement = requirements.get(routeKey(request.method, url));
             const params = (request.params ?? {}) as Record<string, string | undefined>;
             const body = (request.body && typeof request.body === 'object' ? request.body : {}) as Record<string, unknown>;
@@ -369,6 +437,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 case 'signed-in':
                 case 'token':
                     return;
+                case 'tenant-admin':
+                    return access.tenantAdmin ? undefined : deny(request, reply, 403, 'Admin access required');
                 case 'any-operate':
                     return access.anyOperate ? undefined : deny(request, reply, 403, 'You need operate access to at least one phone');
                 case 'device':
@@ -380,24 +450,25 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                     if (keys.length && keys.every((key) => key === 'coordinates')) {
                         return authorizeDevice(request, reply, access, params.udid, 'operate');
                     }
-                    const refused = await authorizeDevice(request, reply, access, params.udid, 'view');
-                    return refused ?? deny(request, reply, 403, 'Only an admin can change device settings');
+                    if (await refuseDevice(request, reply, access, params.udid, 'view')) return reply;
+                    return deny(request, reply, 403, 'Only platform staff can change device settings');
                 }
                 case 'schedule-create':
                     return authorizeDevice(request, reply, access, body.deviceUdid, 'operate');
                 case 'schedule': {
-                    const schedule = params.id ? await options.scheduler.schedule(params.id) : null;
-                    if (!schedule) return deny(request, reply, 404, 'Schedule not found');
+                    // Fetched within the caller's tenant: another tenant's schedule is not found.
+                    const schedule = params.id ? await options.scheduler.schedule(params.id, access.tenantId ?? '') : null;
+                    if (!schedule || !access.canSeeTenant(schedule.tenantId)) return deny(request, reply, 404, 'Schedule not found');
                     return authorizeDevice(request, reply, access, schedule.deviceUdid, requirement.level, 'Schedule not found');
                 }
                 case 'execution': {
-                    const execution = params.id ? await options.scheduler.execution(params.id) : null;
-                    if (!execution) return deny(request, reply, 404, 'Execution not found');
+                    const execution = params.id ? await options.scheduler.execution(params.id, access.tenantId ?? '') : null;
+                    if (!execution || !access.canSeeTenant(execution.tenantId)) return deny(request, reply, 404, 'Execution not found');
                     return authorizeDevice(request, reply, access, execution.deviceUdid, requirement.level, 'Execution not found');
                 }
                 default:
-                    // 'admin', and any route nobody declared: admins only.
-                    return deny(request, reply, 403, 'Admin access required');
+                    // 'platform', and any route nobody declared: platform staff only.
+                    return deny(request, reply, 403, 'Platform access required');
             }
         });
     }
@@ -511,8 +582,13 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const user = request ? requestUsers.get(request) : undefined;
         if (!provider || !request || !user) return '';
         const parts: string[] = [];
-        if (teamEnabled && accessOf(request).admin) {
+        const access = accessOf(request);
+        if (teamEnabled && (access.platform || access.tenantAdmin)) {
             parts.push(`<a class="nav-link" href="/team"${current === '/team' ? ' aria-current="page"' : ''}>Team</a>`);
+            parts.push(`<a class="nav-link" href="/audit"${current === '/audit' ? ' aria-current="page"' : ''}>Audit</a>`);
+        }
+        if (teamEnabled && access.platform && user.access) {
+            parts.push(`<a class="nav-link" href="/tenants"${current === '/tenants' ? ' aria-current="page"' : ''}>Organisations</a>`);
         }
         if (user.displayName) parts.push(`<span class="nav-user">${escapeHtml(user.displayName)}</span>`);
         const logoutPath = provider.logoutPath;
@@ -618,7 +694,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const access = accessOf(request);
         let out = html.replaceAll('__AUTH_NAV__', authNav(request));
         const markers = [
-            ...(access.admin ? [] : ['data-role="operator"']),
+            // Platform staff see everything; a tenant admin or operator does not get farm-setup controls.
+            ...(access.platform ? [] : [access.tenantAdmin ? 'data-role="admin"' : 'data-role="operator"']),
             ...(deviceLevel === 'view' ? ['data-device-access="view"'] : []),
         ];
         if (markers.length) out = out.replace('<body ', `<body ${markers.join(' ')} `);
@@ -631,8 +708,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         if (!themed) return page(shell.title, shell.main, authNav(request), shell.bare ? [] : navLinks, branding, footer);
         const v = themed.versions;
         const access = request ? accessOf(request) : FULL_ACCESS;
-        const nav = shell.bare ? '' : `<nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/">Devices</a><a class="nav-link" href="/tasks">Tasks</a>${access.admin ? '<a class="nav-link" href="/devices/register">Register</a>' : ''}${pluginNavHtml}${authNav(request, shell.current)}</nav>`;
-        const scripts = (shell.scripts ?? []).map((name) => `<script type="module" src="/assets/${escapeHtml(name)}?v=${escapeHtml(v[name] ?? '')}"></script>`).join('');
+        const nav = shell.bare ? '' : `<nav class="topbar-nav" aria-label="Main"><a class="nav-link" href="/">Devices</a><a class="nav-link" href="/tasks">Tasks</a>${access.platform ? '<a class="nav-link" href="/devices/register">Register</a>' : ''}${pluginNavHtml}${authNav(request, shell.current)}</nav>`;
+        const scripts = (shell.htmx ? `<script src="/assets/htmx.min.js?v=${escapeHtml(v['htmx.min.js'] ?? '')}"></script>` : '')
+            + (shell.scripts ?? []).map((name) => `<script type="module" src="/assets/${escapeHtml(name)}?v=${escapeHtml(v[name] ?? '')}"></script>`).join('');
         return `<!doctype html>
 <html lang="en">
 <head>
@@ -654,7 +732,11 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     };
 
     const renderActivity = async (deviceUdid: string, message?: string, canOperate = true): Promise<string> => {
-        const executions = await options.scheduler.listExecutions(25, deviceUdid);
+        // Only the runs of the tenant that owns the phone now: a phone moved from
+        // another tenant must not show that tenant's captions and logs.
+        const owner = (await deviceTenants()).tenantOf(deviceUdid);
+        const executions = (await options.scheduler.listExecutions(25, deviceUdid))
+            .filter((execution) => (execution.tenantId ?? DEFAULT_TENANT_ID) === owner);
         const execution = executions.find(({ status }) => status === 'running') ?? executions[0];
         const errorBanner = message
             ? `<div class="banner err run-error" role="alert"><strong>Could not start the automation</strong><p>${escapeHtml(message)}</p></div>` : '';
@@ -740,20 +822,34 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         id: plugin.id, version: plugin.version, displayName: plugin.displayName,
         tasks: plugin.tasks.map(({ type, version, displayName }) => ({ type, version, displayName })),
     })));
-    /** Registered phones this request may see, each with the caller's level on it. */
+    /**
+     * Platform staff see every tenant; `?tenant=<id>` narrows a list to one.
+     * Anyone else is always confined to their own tenant, whatever they ask for.
+     */
+    const tenantFilter = (request: FastifyRequest): string | undefined => {
+        const access = accessOf(request);
+        if (!access.platform) return access.tenantId ?? '';
+        const requested = (request.query as { tenant?: unknown } | undefined)?.tenant;
+        return typeof requested === 'string' && requested ? requested : undefined;
+    };
+    /** Registered phones this request may see, each with its tenant and the caller's level on it. */
     const visibleDevices = async (request: FastifyRequest) => {
         const access = accessOf(request);
-        return (await registeredWithStatus()).flatMap((device) => {
-            const level = access.levelFor(device);
-            return level ? [{ ...device, access: level }] : [];
+        const tenant = tenantFilter(request);
+        const [devices, owners] = await Promise.all([registeredWithStatus(), deviceTenants()]);
+        return devices.flatMap((device) => {
+            const owned = { ...device, tenantId: owners.tenantOf(device.udid) };
+            if (tenant !== undefined && owned.tenantId !== tenant) return [];
+            const level = access.levelFor(owned);
+            return level ? [{ ...owned, access: level }] : [];
         });
     };
     /** Phones whose schedules and runs this request may list: UDID → level. Null means every phone. */
     const listableUdids = async (request: FastifyRequest, only?: string): Promise<Map<string, AccessLevel> | null> => {
         const access = accessOf(request);
-        if (access.admin) return null;
+        if (access.platform) return null;
         const visible = new Map<string, AccessLevel>();
-        for (const device of await loadRegisteredDevices()) {
+        for (const device of await loadOwnedDevices()) {
             const level = access.levelFor(device);
             if (level && (!only || device.udid === only)) visible.set(device.udid, level);
         }
@@ -889,7 +985,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         if (await options.scheduler.activeExecution(request.params.udid)) {
             return reply.code(409).send({ error: 'Stop the running automation before removing this device' });
         }
-        for (const schedule of await options.scheduler.listSchedules(500, request.params.udid)) {
+        for (const schedule of await options.scheduler.listSchedules(500, request.params.udid, null)) {
             if (!['cancelled', 'completed'].includes(schedule.status)) {
                 await options.scheduler.setScheduleStatus(schedule.id, 'cancelled');
             }
@@ -1166,29 +1262,33 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return reply.code(202).send({ ok: true, message: 'The shared WDA supervisor will reconnect automatically' });
     });
 
-    app.get<{ Querystring: { deviceUdid?: string } }>('/api/schedules', async (request) => {
+    // Lists: the caller's tenant only (in the query and again here), and within
+    // it only the phones they can see. Platform staff may narrow with ?tenant=.
+    app.get<{ Querystring: { deviceUdid?: string; tenant?: string } }>('/api/schedules', async (request) => {
         const scope = await listableUdids(request, request.query.deviceUdid);
+        const tenant = tenantFilter(request);
         if (!scope) {
-            const schedules = await options.scheduler.listSchedules(200, request.query.deviceUdid);
+            const schedules = await options.scheduler.listSchedules(200, request.query.deviceUdid, tenant);
             return { schedules: schedules.map((schedule) => ({ ...schedule, access: 'operate' })) };
         }
         if (!scope.size) return { schedules: [] };
-        const schedules = await options.scheduler.listSchedules(200, [...scope.keys()]);
+        const schedules = await options.scheduler.listSchedules(200, [...scope.keys()], tenant);
         return {
-            schedules: schedules.filter(({ deviceUdid }) => scope.has(deviceUdid))
+            schedules: schedules.filter(({ deviceUdid, tenantId }) => scope.has(deviceUdid) && tenantId === tenant)
                 .map((schedule) => ({ ...schedule, access: scope.get(schedule.deviceUdid) })),
         };
     });
-    app.get<{ Querystring: { deviceUdid?: string } }>('/api/executions', async (request) => {
+    app.get<{ Querystring: { deviceUdid?: string; tenant?: string } }>('/api/executions', async (request) => {
         const scope = await listableUdids(request, request.query.deviceUdid);
+        const tenant = tenantFilter(request);
         if (!scope) {
-            const executions = await options.scheduler.listExecutions(200, request.query.deviceUdid);
+            const executions = await options.scheduler.listExecutions(200, request.query.deviceUdid, tenant);
             return { executions: executions.map((execution) => ({ ...execution, access: 'operate' })) };
         }
         if (!scope.size) return { executions: [] };
-        const executions = await options.scheduler.listExecutions(200, [...scope.keys()]);
+        const executions = await options.scheduler.listExecutions(200, [...scope.keys()], tenant);
         return {
-            executions: executions.filter(({ deviceUdid }) => scope.has(deviceUdid))
+            executions: executions.filter(({ deviceUdid, tenantId }) => scope.has(deviceUdid) && tenantId === tenant)
                 .map((execution) => ({ ...execution, access: scope.get(execution.deviceUdid) })),
         };
     });
@@ -1256,33 +1356,62 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return execution ?? reply.code(409).send({ error: 'Execution is not retryable' });
     });
 
+    // Uploads belong to the uploader's tenant (platform staff name one with
+    // ?tenant=, default the default tenant) and count against its budget. The
+    // file on disk is named by a random UUID, never by what the browser sent.
     app.post('/api/assets', async (request, reply) => {
+        const access = accessOf(request);
+        const tenantId = access.platform ? tenantFilter(request) ?? DEFAULT_TENANT_ID : access.tenantId ?? '';
+        if (tenantService && !(await tenantService.store.tenantById(tenantId))) return reply.code(404).send({ error: 'Organisation not found' });
+        const { usedBytes, budgetBytes } = await options.scheduler.uploadUsage(tenantId);
+        let remaining = budgetBytes - usedBytes;
         const dataRoot = path.resolve(process.env.SCHEDULER_DATA_DIR ?? '.scheduler-data');
         const uploadDirectory = path.join(dataRoot, 'uploads');
         await mkdir(uploadDirectory, { recursive: true });
         const created: Array<{ relativePath: string; originalName: string; mimeType: string; size: number; sha256: string }> = [];
-        for await (const part of request.files()) {
-            const id = crypto.randomUUID();
-            const relativePath = path.join('uploads', id);
-            const handle = await open(path.join(dataRoot, relativePath), 'wx', 0o600);
-            const hash = crypto.createHash('sha256');
-            let size = 0;
-            try {
-                for await (const chunk of part.file) {
-                    const buffer = Buffer.from(chunk);
-                    size += buffer.length;
-                    hash.update(buffer);
-                    await handle.write(buffer);
+        const written: string[] = [];
+        try {
+            for await (const part of request.files()) {
+                const relativePath = path.join('uploads', crypto.randomUUID());
+                const file = path.join(dataRoot, relativePath);
+                const handle = await open(file, 'wx', 0o600);
+                written.push(file);
+                const hash = crypto.createHash('sha256');
+                let size = 0;
+                try {
+                    // A file over the per-file cap makes this loop throw (413); one
+                    // that would overrun the tenant's budget stops it here.
+                    for await (const chunk of part.file) {
+                        const buffer = Buffer.from(chunk);
+                        size += buffer.length;
+                        if (size > remaining) throw new UploadQuotaError(budgetBytes);
+                        hash.update(buffer);
+                        await handle.write(buffer);
+                    }
+                } finally {
+                    await handle.close();
                 }
-            } finally {
-                await handle.close();
+                remaining -= size;
+                created.push({ relativePath, originalName: path.basename(part.filename || 'upload').slice(0, 255), mimeType: part.mimetype, size, sha256: hash.digest('hex') });
             }
-            created.push({ relativePath, originalName: part.filename, mimeType: part.mimetype, size, sha256: hash.digest('hex') });
+            const uploadedBy = requestUsers.get(request)?.id ?? null;
+            return reply.code(201).send(await options.scheduler.registerAssets(created, { tenantId, uploadedBy }));
+        } catch (error) {
+            // Nothing half-uploaded stays on disk or counts against the budget.
+            await Promise.all(written.map((file) => rm(file, { force: true })));
+            throw error;
         }
-        return reply.code(201).send(await options.scheduler.registerAssets(created));
     });
-    app.delete<{ Body: { assetIds: string[] } }>('/api/assets', async (request, reply) => {
-        await options.scheduler.deleteAssets(request.body.assetIds ?? []);
+    app.delete<{ Body: { assetIds?: unknown } }>('/api/assets', async (request, reply) => {
+        const ids = request.body?.assetIds;
+        if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === 'string')) {
+            return reply.code(400).send({ error: 'assetIds must be a list of asset ids' });
+        }
+        // A tenant admin deletes only their tenant's media; one foreign id and nothing is deleted.
+        const access = accessOf(request);
+        if (!(await options.scheduler.deleteAssets(ids, access.platform ? undefined : access.tenantId ?? ''))) {
+            return reply.code(404).send({ error: 'Asset not found' });
+        }
         return reply.code(204).send();
     });
 
@@ -1290,6 +1419,10 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         if (plugin.registerRoutes) await plugin.registerRoutes({
             app, routePrefix: `/plugins/${plugin.id}`, scheduler: options.scheduler, remote,
             loadDevices: loadRegisteredDevices, saveDevices: saveRegisteredDevices, mutateDevices: mutateRegisteredDevices, renderActivity,
+            requestActor: (request) => {
+                const user = requestUsers.get(request);
+                return user ? { userId: user.id, tenantId: accessOf(request).tenantId } : null;
+            },
         });
     }
 
@@ -1323,7 +1456,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             return serve(request, reply);
         });
         app.get('/api/fragments/devices', async (request, reply) => {
-            const admin = accessOf(request).admin;
+            const admin = accessOf(request).platform;
             const [devices, supervisor] = await Promise.all([
                 visibleDevices(request),
                 // One supervisor read per poll. If the socket is down we cannot tell
@@ -1334,7 +1467,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
             const active = devices.filter((device) => !device.disabled);
             const disabled = devices.filter((device) => device.disabled);
             const refreshMs = gridPollSeconds(active.length) * 1000;
-            // Disconnect / Reconnect change device settings: admins only.
+            // Disconnect / Reconnect change device settings: platform staff only.
             const toggleButton = (udid: string, label: string, next: boolean) => !admin ? '' :
                 `<button type="button" id="toggle-${deviceKey(udid)}" class="button secondary device-toggle" data-toggle-device="${encodeURIComponent(udid)}" data-disabled="${next}">${label}</button>`;
             let online = 0;
@@ -1381,7 +1514,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 : '';
             return reply.type('text/html').send(`<section id="device-list" class="device-list" hx-get="/api/fragments/devices" hx-trigger="every ${gridPollSeconds(active.length)}s" hx-swap="outerHTML" data-refresh-ms="${refreshMs}">${summary}${cards || (admin
                 ? `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones yet</h2><p>${disabled.length ? 'Every registered phone is disconnected. Reconnect one below, or register another.' : 'Plug an iPhone in over USB, trust this Mac, then register it.'}</p><a class="button primary" href="/devices/register">Register a phone</a></div>`
-                : `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones shared with you</h2><p>${disabled.length ? 'Your phones are disconnected right now. An admin can reconnect them.' : 'An admin has not given you access to any phone yet. Ask them to add you on the Team page.'}</p></div>`)}${disabledPanel}</section>`);
+                : accessOf(request).tenantAdmin
+                    ? `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones yet</h2><p>${disabled.length ? 'Your phones are disconnected right now. The farm operator can reconnect them.' : 'Your organisation has no phones yet. The farm operator assigns phones to it.'}</p></div>`
+                    : `<div class="empty-state"><div class="empty-icon" aria-hidden="true"></div><h2>No phones shared with you</h2><p>${disabled.length ? 'Your phones are disconnected right now. An admin can reconnect them.' : 'An admin has not given you access to any phone yet. Ask them to add you on the Team page.'}</p></div>`)}${disabledPanel}</section>`);
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/summary', async (request, reply) => {
             const [connectedList, registeredList] = await Promise.all([connectedDevices(), loadRegisteredDevices()]);
@@ -1415,15 +1550,15 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         });
         app.get<{ Params: { udid: string } }>('/api/devices/:udid/fragments/activity', async (request, reply) => {
             const access = accessOf(request);
-            const device = access.admin ? undefined : (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
-            const canOperate = access.admin || levelSatisfies(device ? access.levelFor(device) : null, 'operate');
+            const device = access.platform ? undefined : (await loadOwnedDevices()).find(({ udid }) => udid === request.params.udid);
+            const canOperate = access.platform || levelSatisfies(device ? access.levelFor(device) : null, 'operate');
             return reply.type('text/html').send(await renderActivity(request.params.udid, undefined, canOperate));
         });
     }
 
     app.get('/', async (request, reply) => {
         if (themed) return reply.type('text/html').send(personalize(themed.indexHtml, request));
-        const admin = accessOf(request).admin;
+        const admin = accessOf(request).platform;
         const devices = await visibleDevices(request);
         const cards = devices.map((device) => `<div class="card"><h2>${escapeHtml(device.name)}</h2><p class="muted"><code>${escapeHtml(device.udid)}</code>${device.hostName ? ` · host ${escapeHtml(device.hostName)}` : ''}</p><p>${device.disabled ? 'Disconnected' : device.connected ? `Online · iOS ${escapeHtml(device.connected.osVersion)}` : 'Offline'}</p><a class="button" href="/devices/${encodeURIComponent(device.udid)}">Open device</a></div>`).join('');
         const connected = admin ? await connectedDevices() : [];
@@ -1437,7 +1572,7 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return reply.type('text/html').send(personalize(themed.registerDeviceHtml, request));
     });
     app.get<{ Params: { udid: string } }>('/devices/:udid', async (request, reply) => {
-        const device = (await loadRegisteredDevices()).find(({ udid }) => udid === request.params.udid);
+        const device = (await loadOwnedDevices()).find(({ udid }) => udid === request.params.udid);
         if (!device) return reply.code(404).type('text/html').send(renderPage('Not found', '<section class="card"><h1>Device not found</h1><p class="muted">No registered phone has this UDID. It may have been removed, or the link is from another farm.</p><p><a class="button" href="/">Back to devices</a></p></section>', request));
         const access = accessOf(request);
         const level = access.levelFor(device);
@@ -1447,8 +1582,8 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
                 ? options.dashboardTheme.renderDevice(themed.deviceHtml, device) : themed.deviceHtml;
             return reply.type('text/html').send(personalize(rendered.replaceAll('__DEVICE_UDID__', encodeURIComponent(device.udid)), request, level));
         }
-        const schedules = await options.scheduler.listSchedules(50, device.udid);
-        const executions = await options.scheduler.listExecutions(50, device.udid);
+        const schedules = (await options.scheduler.listSchedules(50, device.udid)).filter(({ tenantId }) => (tenantId ?? DEFAULT_TENANT_ID) === device.tenantId);
+        const executions = (await options.scheduler.listExecutions(50, device.udid)).filter(({ tenantId }) => (tenantId ?? DEFAULT_TENANT_ID) === device.tenantId);
         const panels: string[] = [];
         for (const plugin of options.plugins.list()) {
             for (const panel of [...(plugin.devicePanels ?? [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))) {
@@ -1462,12 +1597,12 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const scheduleRows = schedules.map((item) => `<tr><td>${escapeHtml(item.pluginId)}/${escapeHtml(item.taskType)}</td><td>${escapeHtml(JSON.stringify(item.timing))}<br><span class="muted">Next: ${escapeHtml(item.nextRunAt?.toISOString() ?? '—')}</span></td><td>${escapeHtml(item.status)}</td><td>${!canOperate ? '' : item.status === 'active' ? `<button data-schedule="${item.id}" data-status="paused">Pause</button>` : item.status === 'paused' ? `<button data-schedule="${item.id}" data-status="active">Resume</button>` : ''} ${canOperate && !['cancelled', 'completed'].includes(item.status) ? `<button data-schedule="${item.id}" data-status="cancelled">Cancel</button>` : ''}</td></tr>`).join('');
         const executionRows = executions.map((item) => `<tr><td>${escapeHtml(item.pluginId)}/${escapeHtml(item.taskType)}</td><td>${escapeHtml(item.status)}<br><span class="muted">${escapeHtml(item.scheduledFor.toISOString())}</span></td><td><a href="/api/executions/${item.id}"><code>${escapeHtml(item.id)}</code></a></td><td>${!canOperate ? '' : ['queued', 'running'].includes(item.status) ? `<button data-stop="${item.id}">Stop</button>` : ['failed', 'stopped'].includes(item.status) ? `<button data-retry="${item.id}">Retry</button>` : ''}</td></tr>`).join('');
         const udidJs = encodeURIComponent(device.udid);
-        const passcodeCard = !access.admin ? '' : !isLocalDevice(device, hostId)
+        const passcodeCard = !access.platform ? '' : !isLocalDevice(device, hostId)
             // The passcode lives on the owning Mac only (never in Postgres).
             ? `<section class="card"><h2>Unlock passcode</h2><p class="muted">${device.passcodeSet ? 'A passcode is set' : 'No passcode set'} on host ${escapeHtml(device.hostId ?? '')}. Set it from that host's dashboard.</p></section>`
             : `<section class="card"><h2>Unlock passcode</h2><p class="muted">${device.passcode ? 'A passcode is set.' : 'No passcode set.'} Stored only on this Mac (devices.json or device-secrets.json), never shown.</p><form id="pc"><input id="pcv" type="password" inputmode="numeric" placeholder="4+ digits" autocomplete="new-password"> <button class="button secondary">Save</button> <button type="button" id="pcc" class="button secondary">Clear</button> <span id="pcr" class="muted"></span></form></section><script>(function(){var f=document.getElementById('pc'),v=document.getElementById('pcv'),r=document.getElementById('pcr');async function set(p){r.textContent='…';var x=await fetch('/api/devices/${udidJs}',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({passcode:p})});if(x.ok){r.textContent=p?'Saved.':'Cleared.';v.value=''}else{r.textContent=((await x.json().catch(function(){return{}})).error)||'Failed'}}f.addEventListener('submit',function(e){e.preventDefault();if(!/^\\d{4,}$/.test(v.value.trim())){r.textContent='4+ digits';return}set(v.value.trim())});document.getElementById('pcc').addEventListener('click',function(){if(confirm('Clear passcode?'))set('')})})();</script>`;
         const controls = `<script>document.addEventListener('click',async function(e){var b=e.target.closest('button');if(!b)return;var url,body,method='POST';if(b.dataset.schedule){url='/api/schedules/'+b.dataset.schedule+'/status';body={status:b.dataset.status}}else if(b.dataset.stop){url='/api/executions/'+b.dataset.stop+'/stop'}else if(b.dataset.retry){url='/api/executions/'+b.dataset.retry+'/retry'}else if(b.dataset.remove){if(!confirm('Remove this device? Its schedules will be cancelled.'))return;url='/api/devices/'+encodeURIComponent(b.dataset.remove);method='DELETE'}else{return}b.disabled=true;var r=await fetch(url,{method:method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):'{}'});if(r.ok){location.href=b.dataset.remove?'/':location.href;if(!b.dataset.remove)location.reload()}else{b.disabled=false;alert((await r.json().catch(function(){return{}})).error||'Request failed')}});</script>`;
-        return reply.type('text/html').send(renderPage(device.name, `<h1>${escapeHtml(device.name)}</h1><p><code>${escapeHtml(device.udid)}</code></p>${panels.join('')}<section class="card"><h2>Scheduled and recurring jobs</h2><table><tr><th>Task</th><th>Timing</th><th>Status</th><th>Actions</th></tr>${scheduleRows || '<tr><td colspan="4">No schedules.</td></tr>'}</table></section><section class="card"><h2>Execution history</h2><table><tr><th>Task</th><th>Status</th><th>ID/logs</th><th>Actions</th></tr>${executionRows || '<tr><td colspan="4">No executions.</td></tr>'}</table></section>${passcodeCard}${access.admin ? `<section class="card"><h2>Danger zone</h2><p class="muted">Removing a device cancels its schedules and forgets its configuration. WebDriverAgent stays installed on the phone.</p><button data-remove="${escapeHtml(device.udid)}" class="button secondary">Remove device</button></section>` : ''}${controls}`, request));
+        return reply.type('text/html').send(renderPage(device.name, `<h1>${escapeHtml(device.name)}</h1><p><code>${escapeHtml(device.udid)}</code></p>${panels.join('')}<section class="card"><h2>Scheduled and recurring jobs</h2><table><tr><th>Task</th><th>Timing</th><th>Status</th><th>Actions</th></tr>${scheduleRows || '<tr><td colspan="4">No schedules.</td></tr>'}</table></section><section class="card"><h2>Execution history</h2><table><tr><th>Task</th><th>Status</th><th>ID/logs</th><th>Actions</th></tr>${executionRows || '<tr><td colspan="4">No executions.</td></tr>'}</table></section>${passcodeCard}${access.platform ? `<section class="card"><h2>Danger zone</h2><p class="muted">Removing a device cancels its schedules and forgets its configuration. WebDriverAgent stays installed on the phone.</p><button data-remove="${escapeHtml(device.udid)}" class="button secondary">Remove device</button></section>` : ''}${controls}`, request));
     });
     app.get('/tasks', async (request, reply) => reply.type('text/html').send(
         themed ? personalize(themed.tasksHtml, request)
@@ -1478,8 +1613,19 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     if (isBuiltinAuthProvider(provider)) {
         registerBuiltinAuthRoutes(app, {
             provider, renderShell, accessOf,
-            loadDevices: loadRegisteredDevices,
-            log: (event) => app.log.info({ audit: event }, `audit ${event.event}`),
+            loadDevices: loadOwnedDevices,
+            tenantOfDevice: async (udid) => (await deviceTenants()).tenantOf(udid),
+            auditLog,
+            scheduler: options.scheduler,
+            log: (event) => {
+                app.log.info({ audit: event }, `audit ${event.event}`);
+                void auditLog?.record({
+                    tenantId: event.tenantId ?? null, actorUserId: event.actorId ?? null, actorRole: event.actorRole ?? null,
+                    ip: event.ip ?? null, method: null, route: null, event: event.event, targetUdid: null, targetIds: null,
+                    status: null, requestId: null,
+                    detail: [event.actor ? `actor=${event.actor}` : '', event.target ? `target=${event.target}` : '', event.detail ?? ''].filter(Boolean).join(' ') || null,
+                }).catch((error: unknown) => app.log.warn({ error: errorMessage(error) }, 'audit write failed'));
+            },
         });
     }
 

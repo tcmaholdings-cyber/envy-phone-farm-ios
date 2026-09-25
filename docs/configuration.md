@@ -47,6 +47,7 @@ big rack that feels sluggish, lower them on a two-phone bench.
 | --- | --- |
 | `DEVICES_CONFIG_PATH` | Path of the fleet file (default `devices.json`). |
 | `SCHEDULER_DATA_DIR` | Uploaded media for post-style tasks (default `.scheduler-data`). |
+| `PHONE_FARM_MAX_UPLOAD_BYTES` | Largest single uploaded file, in bytes (default `209715200`, 200 MiB). A bigger file fails the upload with 413. Each tenant's total is limited separately by its `maxUploadBytes` quota (default 5 GiB) — see [tenants.md](tenants.md#quotas). |
 | `XCODE_ORG_ID` | Apple Developer **Team ID** used to sign WebDriverAgent. |
 | `XCODE_SIGNING_ID` | Signing identity, normally `Apple Development`. |
 | `WDA_BUNDLE_ID` | Bundle id of the signed WebDriverAgent runner, unique per Team. |
@@ -63,22 +64,26 @@ big rack that feels sluggish, lower them on a two-phone bench.
 | `PHONE_FARM_AUTH_PLUGIN` | `builtin` for the accounts shipped with the farm (users, groups and per-phone access in Postgres — see [Built-in accounts](#built-in-accounts)), or an ESM module exporting an `AuthProvider` (`src/plugin.ts`). Unset = no sign-in (loopback only). Mandatory before `WEB_HOST` leaves loopback, **and before the dashboard is published through a tunnel**. |
 | `PHONE_FARM_SESSION_IDLE_HOURS` | Built-in accounts only. A session ends after this many hours without a request (default `12`). |
 | `PHONE_FARM_SESSION_MAX_DAYS` | Built-in accounts only. A session ends this many days after sign-in however active it is (default `7`). |
+| `PHONE_FARM_AUDIT_RETENTION_DAYS` | Built-in accounts only. The worker deletes audit rows older than this (default `365`; at least `30`, which the database enforces; `0` keeps them forever). |
 | `TIKTOK_BUNDLE_ID` | `com.zhiliaoapp.musically` — the TikTok app the built-in plugin drives. |
 
 ### Built-in accounts
 
 `PHONE_FARM_AUTH_PLUGIN=builtin` turns on sign-in with accounts stored in the
 same Postgres database (schema `auth`, created by `npm run db:migrate` —
-migration `drizzle/0002_builtin_auth.sql`). Nothing else is required; the
-database connection is `DATABASE_URL`.
+migrations `drizzle/0002_builtin_auth.sql` and `drizzle/0006_tenants.sql`).
+Nothing else is required; the database connection is `DATABASE_URL`.
 
 - **Users** have a username (lower-case), a display name, a role and a password
   hash (scrypt, per-user salt). Passwords are at least 12 characters. New users
   and reset passwords get a generated temporary password that is shown once and
   must be changed at first sign-in.
-- **Roles**: `admin` can do everything, including the Team page, registering
-  phones and device settings. `operator` sees and acts only on the phones
-  granted to them — see [the access model](operations.md#team-access-and-vas).
+- **Tenants and roles**: every person except platform staff belongs to one
+  tenant (organisation). `platform` (the farm operator's staff) sees every
+  tenant and alone registers and configures phones; `admin` runs one tenant
+  (its phones, people, groups and grants); `operator` sees and acts only on the
+  phones granted to them in their tenant. Another tenant's things answer 404.
+  See [tenants.md](tenants.md) and [the access model](operations.md#team-access-and-vas).
 - **Sessions** are server-side: the browser holds an `HttpOnly`,
   `SameSite=Lax` cookie `pf_session`; the database holds only a SHA-256 hash of
   it. The cookie is `Secure` whenever the request arrived over HTTPS — directly,
@@ -87,11 +92,14 @@ database connection is `DATABASE_URL`.
 - **Sign-in throttling**: after 5 failed attempts for one username, or 20 from
   one client IP, further attempts wait 30 s, doubling up to 15 min. Behind a
   Cloudflare tunnel the client IP is `CF-Connecting-IP`, trusted **only** when
-  the TCP peer is loopback (the local `cloudflared`). Throttle state is in
-  memory and resets when `web` restarts.
-- **Audit**: sign-ins (success, failure, throttled), sign-outs, password
-  changes and every user / group / grant change are logged by `web` as
-  `audit` entries naming the actor. Passwords and tokens never appear.
+  the TCP peer is loopback (the local `cloudflared`). The counts live in
+  `auth.login_throttle`: they survive a restart and are shared by every web replica.
+- **Audit**: every state-changing request, and every sign-in (success,
+  failure, throttled), sign-out, password change and user / group / grant /
+  tenant change, is written to the append-only `auth.audit_log` (and the
+  server log) with the actor, tenant, route pattern, target and outcome.
+  Request bodies, passwords, tokens and typed text never appear. Read it on
+  the **Audit** page or `GET /api/audit` ([tenants.md](tenants.md#audit-log)).
 
 Public without a session: `/login`, `/logout`, `/health`, `/health/ready`,
 and the stylesheet, fonts and logo the sign-in page uses. `/metrics` needs no
@@ -100,7 +108,8 @@ Everything else redirects a browser to `/login` or answers `401`.
 
 A third-party `AuthProvider` keeps working as before: every user it signs in
 can do everything, unless it returns `access` (`UserAccess` in
-`src/plugin.ts`) with the user, in which case the same per-phone rules apply.
+`src/plugin.ts`) with the user, in which case the same per-phone rules apply
+(and, with a `tenantId`, the tenant rules; an `admin` without one stays farm-wide).
 
 ### Branding
 
