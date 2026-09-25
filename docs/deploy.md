@@ -21,7 +21,7 @@ the host with `rsync`.
     .env  .env.devices  devices.json     configuration, secrets, registered phones (0600)
     .wda/                                signed WebDriverAgent build, supervisor locks, socket, per-phone logs
     .appium2/                            the pinned XCUITest driver
-    .scheduler-data/                     uploaded media and execution artefacts
+    .scheduler-data/                     uploaded media (uploads/, assets/)
     logs/                                agent logs and deploy.log (every deploy and rollback)
     backups/
   incoming/                              uploaded tarballs (the newest 5 are kept)

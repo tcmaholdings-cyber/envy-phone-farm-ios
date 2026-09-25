@@ -46,7 +46,7 @@ big rack that feels sluggish, lower them on a two-phone bench.
 | Key | Meaning |
 | --- | --- |
 | `DEVICES_CONFIG_PATH` | Path of the fleet file (default `devices.json`). |
-| `SCHEDULER_DATA_DIR` | Uploaded media for post-style tasks (default `.scheduler-data`). |
+| `SCHEDULER_DATA_DIR` | Directory for uploaded media (`uploads/`, `assets/`; default `.scheduler-data`). Back it up whole. |
 | `PHONE_FARM_MAX_UPLOAD_BYTES` | Largest single uploaded file, in bytes (default `209715200`, 200 MiB). A bigger file fails the upload with 413. Each tenant's total is limited separately by its `maxUploadBytes` quota (default 5 GiB) — see [tenants.md](tenants.md#quotas). |
 | `XCODE_ORG_ID` | Apple Developer **Team ID** used to sign WebDriverAgent. |
 | `XCODE_SIGNING_ID` | Signing identity, normally `Apple Development`. |
@@ -266,7 +266,7 @@ The safe default is loopback only. Options, in order of preference:
 | `devices.json` | fleet, passcodes, calibration | yes (encrypted) |
 | `device-secrets.json` | this host's passcodes with `PHONE_FARM_REGISTRY=postgres` (beside the real `devices.json`) | yes (encrypted) |
 | PostgreSQL volume `phone-farm-postgres` | schedules, executions, logs, asset index | yes — `pg_dump` |
-| `.scheduler-data/assets/` | uploaded media for post tasks | yes |
+| `.scheduler-data/` (`uploads/`, `assets/`) | uploaded media the asset index points at | yes — the whole directory |
 | `.wda/` | socket + locks | no |
 | `.appium2/` | pinned XCUITest driver | no (re-run `appium:install-driver`) |
 | `~/Library/Developer/Xcode/DerivedData/WebDriverAgent-*` | signed WDA build | no (re-run `wda:prepare`) |

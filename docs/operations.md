@@ -353,7 +353,7 @@ without `-f ../current/docker-compose.yml`:
 ```sh
 cd ~/phone-farm/shared && set -o pipefail
 docker compose -f ../current/docker-compose.yml exec -T postgres pg_dump -U phone_farm phone_farm | gzip > backups/pg-$(date +%F).sql.gz \
-  && tar czf backups/state-$(date +%F).tgz .env devices.json $(test -f device-secrets.json && echo device-secrets.json) .scheduler-data/assets \
+  && tar czf backups/state-$(date +%F).tgz .env devices.json $(test -f device-secrets.json && echo device-secrets.json) .scheduler-data \
   && curl -fsS -m 10 -o /dev/null "$BACKUP_PING_URL"   # a second push check: period 1 day, grace 2 h
 ```
 
@@ -361,8 +361,33 @@ docker compose -f ../current/docker-compose.yml exec -T postgres pg_dump -U phon
 ping runs only when both steps succeeded, so a missing ping means the backup
 is stale — see *Alert thresholds*.
 
-Restore: `gunzip -c backups/pg-….sql.gz | docker compose exec -T postgres psql -U phone_farm phone_farm`,
-put the files back (`.env`, `devices.json`, and `device-secrets.json` on a multi-host farm), run `npm run db:migrate`, restart the agents.
+`.scheduler-data` is archived whole: it holds every uploaded file the
+`scheduler.assets` rows point at — `uploads/` (the dashboard's media uploads,
+`POST /api/assets`) and `assets/` (media sent with a TikTok post) — and nothing
+else. The dump runs first, so a file uploaded between the two steps is in the
+archive without its row (harmless). The reverse can happen too: media is
+deleted when a post succeeds or is cancelled, a schedule is cancelled, history
+expires or an unattached upload is swept, and if that happens in the window the
+restored database holds an asset row whose file is missing. Such rows belong to
+finished, cancelled or orphaned work that will not run again. If
+`SCHEDULER_DATA_DIR` points somewhere else, archive that directory instead.
+
+Restore, with the agents stopped, in `~/phone-farm/shared` (the database
+restore needs the release's compose file, and the migrations run from
+`current/`, because `shared/` has no `docker-compose.yml` or `package.json`):
+
+```sh
+cd ~/phone-farm/shared
+gunzip -c backups/pg-….sql.gz | docker compose -f ../current/docker-compose.yml exec -T postgres psql -U phone_farm phone_farm
+tar xzf backups/state-….tgz
+cd ../current && npm run db:migrate
+```
+
+On a plain checkout run the same steps in `~/phone-farm`, without
+`-f ../current/docker-compose.yml` and without `cd ../current`. The `tar` step
+puts the files back: `.env`, `devices.json`, `device-secrets.json` on a
+multi-host farm, and `.scheduler-data/`, without which scheduled posts fail
+because their media is missing. Then restart the agents.
 
 ## Upgrading the software
 

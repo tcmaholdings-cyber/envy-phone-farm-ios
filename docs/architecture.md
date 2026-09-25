@@ -188,7 +188,7 @@ without the UI, for scripted or bulk (`--all`) setup.
 | `devices.json` | Registered devices (default `file` registry): `udid`, `name`, ports, `coordinateProfile`, per‑device `coordinates` overrides, `passcode`, `disabled`, `signingTeam`, `pluginData`. Git‑ignored, `0600`. |
 | `device-secrets.json` | With the Postgres registry: this host's device passcodes, beside the real `devices.json`. Git‑ignored, `0600`. |
 | `.env` | Configuration and secrets (DB URL, signing IDs, auth keys). Git‑ignored. Device passcodes live in `devices.json`, not here. |
-| `.scheduler-data/assets/` | Uploaded media for `post`‑style tasks, content‑addressed. |
+| `.scheduler-data/` | Uploaded media, indexed by `scheduler.assets` (`relative_path`): `uploads/<uuid>` from `POST /api/assets`, `assets/post-*/` from the TikTok post form. Directory set by `SCHEDULER_DATA_DIR`. |
 | `.wda/` | wda-service socket and locks; `.wda/logs/<udid>.log` per-phone WDA output. |
 | `.appium2/` | Isolated Appium home with the pinned XCUITest driver. |
 

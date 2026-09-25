@@ -162,6 +162,7 @@ function makeFlatHost(farm: Farm) {
     write(path.join(root, '.wda/prebuilt/x.xctestrun'), 'signed build\n');
     write(path.join(root, '.appium2/node_modules/driver/package.json'), '{}\n');
     write(path.join(root, '.scheduler-data/assets/clip.mp4'), 'video\n');
+    write(path.join(root, '.scheduler-data/uploads/0b7e1c2a-upload'), 'upload\n');
     write(path.join(root, 'logs/web.log'), 'old log\n');
     write(path.join(root, 'node_modules/dep/index.js'), 'installed\n');
     write(path.join(root, 'stray-notes.txt'), 'kept, moved with the code\n');
@@ -233,6 +234,7 @@ test('migrate-to-releases.sh moves state into shared/, keeps it reachable, and i
     assert.equal(readFileSync(path.join(farm.root, 'shared/.env'), 'utf8'), envBefore, 'state moved intact');
     assert.equal(readFileSync(path.join(farm.root, 'shared/.wda/prebuilt/x.xctestrun'), 'utf8'), 'signed build\n');
     assert.equal(readFileSync(path.join(farm.root, 'shared/.scheduler-data/assets/clip.mp4'), 'utf8'), 'video\n');
+    assert.equal(readFileSync(path.join(farm.root, 'shared/.scheduler-data/uploads/0b7e1c2a-upload'), 'utf8'), 'upload\n');
     for (const item of ['.env', 'devices.json', '.wda', '.appium2', '.scheduler-data', 'logs']) {
         assert.equal(readlinkSync(path.join(release, item)), `../../shared/${item}`, `release links ${item}`);
         assert.equal(readlinkSync(path.join(farm.root, item)), `shared/${item}`, `compatibility link for ${item}`);
@@ -253,6 +255,9 @@ test('migrate-to-releases.sh moves state into shared/, keeps it reachable, and i
     assert.match(archived, /\.env/);
     assert.match(archived, /devices\.json/);
     assert.match(archived, /x\.xctestrun/);
+    // Asset rows point at both media directories; losing either breaks scheduled posts.
+    assert.match(archived, /\.scheduler-data\/uploads\/0b7e1c2a-upload/);
+    assert.match(archived, /\.scheduler-data\/assets\/clip\.mp4/);
 
     const log = calls(farm);
     for (const name of ['web', 'worker', 'wda-service', 'appium']) {
