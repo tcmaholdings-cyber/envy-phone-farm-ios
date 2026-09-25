@@ -403,7 +403,7 @@ test('install-agents.sh points the agents at current and shared logs in the rele
     spawnSync('ln', ['-s', 'releases/abc', path.join(farm.root, 'current')]);
 
     // Detected from its own location, and from PHONE_FARM_ROOT.
-    for (const env of [{ PHONE_FARM_ROOT: '' }, {}]) {
+    for (const env of [{ PHONE_FARM_ROOT: '' }, {}] as Record<string, string>[]) {
         const result = run(farm, path.join(releaseDir, 'deploy/launchd/install-agents.sh'), ['--dry-run'], env);
         assert.equal(result.code, 0, result.err);
         assert.match(result.out, new RegExp(`<key>WorkingDirectory</key><string>${farm.root}/current</string>`));
