@@ -6,6 +6,7 @@ import { AccountService, type ResolvedSession } from './accounts.js';
 import { PgAuditLog, type AuditLog } from './audit.js';
 import { isHttpsRequest } from './net.js';
 import { PgAuthStore, PgTenantStore } from './pg-store.js';
+import { PgLoginThrottle } from './throttle.js';
 import { TenantService } from './tenants.js';
 
 /**
@@ -117,6 +118,8 @@ export async function createBuiltinAuthProviderFromEnv(): Promise<BuiltinAuthPro
     const accounts = new AccountService({
         store: new PgAuthStore(connection),
         tenants: tenantStore,
+        // In Postgres, so a restart or a second replica does not reset anyone's failed attempts.
+        throttle: new PgLoginThrottle(connection.pool),
         ...(Number.isFinite(idle) && idle > 0 ? { idleTimeoutMs: idle * 60 * 60_000 } : {}),
         ...(Number.isFinite(absolute) && absolute > 0 ? { absoluteTimeoutMs: absolute * 24 * 60 * 60_000 } : {}),
     });

@@ -6,6 +6,7 @@ import Fastify from 'fastify';
 import { clientIp, isHttpsRequest, isLoopbackAddress } from '../src/auth/net.js';
 import { generatePassword, hashPassword, MIN_PASSWORD_LENGTH, passwordProblem, verifyPassword } from '../src/auth/password.js';
 import { LoginThrottle } from '../src/auth/throttle.js';
+import { BACKOFF_POLICY, EXPIRY_POLICY, throttleBackoffScenario, throttleExpiryScenario } from './throttle-scenarios.js';
 import { safeNextPath } from '../src/auth/routes.js';
 
 test('a password hash verifies the right password and nothing else, and never contains the password', async () => {
@@ -104,40 +105,14 @@ test('HTTPS is inferred from X-Forwarded-Proto / CF-Visitor only when the peer i
     assert.equal(await https('10.0.0.8', { 'x-forwarded-proto': 'https' }), false, 'not trusted from a non-loopback peer');
 });
 
-test('the throttle allows free attempts, then backs off exponentially, per username and per IP', () => {
+test('the throttle allows free attempts, then backs off exponentially, per username and per IP', async () => {
     let now = 0;
-    const throttle = new LoginThrottle({
-        now: () => now,
-        username: { freeAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 8_000 },
-        ip: { freeAttempts: 5, baseDelayMs: 1_000, maxDelayMs: 8_000 },
-    });
-    for (let index = 0; index < 3; index += 1) {
-        assert.equal(throttle.retryAfterMs('kash', '1.1.1.1'), 0);
-        throttle.recordFailure('kash', '1.1.1.1');
-    }
-    assert.equal(throttle.retryAfterMs('kash', '1.1.1.1'), 1_000, 'fourth attempt waits the base delay');
-    assert.equal(throttle.retryAfterMs('kash', '2.2.2.2'), 1_000, 'the username lock follows the name to a new IP');
-    assert.equal(throttle.retryAfterMs('rex', '1.1.1.1'), 0, 'other names from that IP are fine so far');
-    now += 1_000;
-    throttle.recordFailure('kash', '1.1.1.1');
-    assert.equal(throttle.retryAfterMs('kash', '3.3.3.3'), 2_000, 'doubles');
-    now += 2_000;
-    throttle.recordFailure('rex', '1.1.1.1');
-    // 5 failures from 1.1.1.1 now: the IP is at its free limit.
-    assert.equal(throttle.retryAfterMs('mikey', '1.1.1.1'), 1_000, 'the IP lock covers every username');
-    for (let index = 0; index < 10; index += 1) { now += 10_000; throttle.recordFailure('kash', '9.9.9.9'); }
-    assert.equal(throttle.retryAfterMs('kash', '8.8.8.8'), 8_000, 'capped at maxDelayMs');
-    throttle.recordSuccess('kash');
-    assert.equal(throttle.retryAfterMs('kash', '8.8.8.8'), 0, 'success clears the username');
+    await throttleBackoffScenario(new LoginThrottle({ now: () => now, ...BACKOFF_POLICY }), (ms) => { now += ms; });
 });
 
-test('throttle entries expire after a quiet period, and unknown names are counted like real ones', () => {
+test('throttle entries expire after a quiet period, and unknown names are counted like real ones', async () => {
     let now = 0;
-    const throttle = new LoginThrottle({ now: () => now, resetAfterMs: 60_000, username: { freeAttempts: 1, baseDelayMs: 5_000, maxDelayMs: 5_000 } });
-    throttle.recordFailure('nobody-at-all', '1.1.1.1');
-    assert.ok(throttle.retryAfterMs('nobody-at-all', '1.1.1.1') > 0);
-    now += 60_001;
-    assert.equal(throttle.retryAfterMs('nobody-at-all', '1.1.1.1'), 0);
+    await throttleExpiryScenario(new LoginThrottle({ now: () => now, ...EXPIRY_POLICY }), (ms) => { now += ms; });
 });
 
 test('post-login redirects stay on this site', () => {
