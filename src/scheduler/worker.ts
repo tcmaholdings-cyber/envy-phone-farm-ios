@@ -8,6 +8,7 @@ import { executeAutomation } from './executor.js';
 import { createQueue, ensureDeviceQueue, type ExecutionJob } from './queue.js';
 import { SchedulerRepository } from './repository.js';
 import { createTikTokPlugin } from '../tiktok-plugin.js';
+import { startWorkerHeartbeat } from '../observability/heartbeat.js';
 
 export interface WorkerRuntime { close(): Promise<void> }
 
@@ -66,12 +67,14 @@ export async function startWorker(plugins: PluginRegistry): Promise<WorkerRuntim
         void repository.sweepOrphanedAssets().catch(console.error);
     }, 60 * 60_000);
     const reconcileTimer = setInterval(() => void repository.reconcileQueueStates().catch(console.error), 60_000);
+    const heartbeat = startWorkerHeartbeat(connection.pool, () => workingQueues.size);
     return {
         async close() {
             clearInterval(materializeTimer);
             clearInterval(deviceTimer);
             clearInterval(cleanupTimer);
             clearInterval(reconcileTimer);
+            await heartbeat.stop();
             await boss.stop({ graceful: true, timeout: 30_000 });
             await connection.close();
         },

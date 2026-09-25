@@ -71,6 +71,17 @@ export const assets = schedulerSchema.table('assets', {
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
 }, (table) => [index('assets_schedule_idx').on(table.scheduleId), index('assets_execution_idx').on(table.executionId)]);
 
+// One row per host running a worker, refreshed every ~15 s
+// (src/observability/heartbeat.ts). /health/ready and /metrics read its age:
+// a worker that hangs or dies stops refreshing it.
+export const workerHeartbeats = schedulerSchema.table('worker_heartbeats', {
+    host: text('host').primaryKey(),
+    pid: integer('pid').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull(),
+    beatAt: timestamp('beat_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    queues: integer('queues').notNull().default(0),
+});
+
 // ---------- built-in accounts (PHONE_FARM_AUTH_PLUGIN=builtin) ----------
 // Only password hashes and session-token hashes are stored; never a raw
 // password or cookie token.
