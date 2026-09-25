@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
     chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, writeFileSync,
 } from 'node:fs';
@@ -21,7 +21,12 @@ const STUBS: Record<string, string> = {
 echo "launchctl $*" >> "$STUB_LOG"
 case "$1" in
   print) [ "\${FAKE_AGENTS_LOADED:-0}" = 1 ] ;;
-  list) exit 0 ;;
+  list)
+    if [ "$2" = com.phone-farm.worker ] && [ -n "\${FAKE_WORKER_PID:-}" ] && kill -0 "$FAKE_WORKER_PID" 2>/dev/null; then
+      printf '\\t"PID" = %s;\\n' "$FAKE_WORKER_PID"
+    fi
+    exit 0 ;;
+  kill) if [ -n "\${FAKE_WORKER_PID:-}" ]; then kill -TERM "$FAKE_WORKER_PID"; fi; exit 0 ;;
   *) exit 0 ;;
 esac`,
     npm: `#!/bin/bash
@@ -372,6 +377,34 @@ test('a release that never becomes ready is rolled back unless --skip-ready', ()
     const skipped = run(farm, path.join(farm.repo, 'scripts/deploy.sh'), ['--skip-ready', tarball], env);
     assert.equal(skipped.code, 0, skipped.err);
     assert.equal(currentId(farm), notReadyId);
+});
+
+test('deploy.sh drains the worker with SIGTERM and waits for it instead of killing it', async () => {
+    const farm = setup();
+    makeFlatHost(farm);
+    assert.equal(run(farm, path.join(farm.repo, 'scripts/migrate-to-releases.sh'), ['--yes']).code, 0);
+    commit(farm, 'src/api/server.ts', 'export const b = 1;\n', 'Next release');
+    // A stand-in worker that takes a moment to drain after SIGTERM.
+    const worker = spawn('bash', ['-c', 'trap "sleep 1; exit 0" TERM; while :; do sleep 0.1; done'], { stdio: 'ignore' });
+    const exited = new Promise((resolve) => worker.once('exit', resolve));
+    const result = await new Promise<{ code: number | null; err: string }>((resolve) => {
+        const child = spawn('bash', [path.join(farm.repo, 'scripts/deploy.sh'), release(farm)], {
+            env: {
+                PATH: `${farm.bin}:${process.env.PATH}`, HOME: farm.home, TMPDIR: os.tmpdir(), STUB_LOG: farm.log,
+                PHONE_FARM_ROOT: farm.root, PHONE_FARM_HEALTH_TIMEOUT: '4', FAKE_AGENTS_LOADED: '1',
+                FAKE_WORKER_PID: String(worker.pid),
+            },
+        });
+        let err = '';
+        child.stderr.on('data', (chunk) => { err += chunk; });
+        child.on('close', (code) => resolve({ code, err }));
+    });
+    await exited;
+    assert.equal(result.code, 0, result.err);
+    assert.match(result.err, new RegExp(`draining worker \\(pid ${worker.pid}, up to 165s\\)`), 'default wait = drain 120 + grace 15 + 30');
+    assert.match(result.err, /worker drained after \d+s/);
+    assert.match(calls(farm), /launchctl kill SIGTERM gui\/\d+\/com\.phone-farm\.worker/);
+    assert.doesNotMatch(calls(farm), /kickstart -k gui\/\d+\/com\.phone-farm\.worker/, 'never forced');
 });
 
 test('deploy.sh keeps only the newest releases, never the live one', () => {

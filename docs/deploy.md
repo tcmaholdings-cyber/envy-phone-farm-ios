@@ -106,9 +106,11 @@ re-run; deploying the release that is already live only re-checks health):
 7. **Flip**: write `RELEASED`, point `current` at the release (one `rename`).
 8. **Restart and verify**:
    - `web` is restarted and `GET /health` must report the new sha;
-   - the `worker` is sent SIGTERM and given up to
-     `PHONE_FARM_WORKER_DRAIN_SECONDS` (600) to finish its running tasks
-     before it is forced; launchd starts it again from the new release;
+   - the `worker` is sent SIGTERM: it stops taking jobs and lets running
+     tasks finish for its drain window (`WORKER_DRAIN_SECONDS`, 120 s, then
+     `WORKER_KILL_GRACE_SECONDS`), and exits; launchd starts it again from the
+     new release. The deploy waits that long plus 30 s
+     (`PHONE_FARM_WORKER_STOP_TIMEOUT` overrides) before forcing it;
    - `wda-service` is restarted only when its code changed (`src/devices/`,
      `src/types.ts`, `Patches/` or the lockfile; `--restart-wda always|never`
      overrides). Restarting it relaunches WebDriverAgent on every phone;
@@ -172,8 +174,9 @@ once, in place:
    `backups/` to `~/phone-farm-backups/migrate-<timestamp>/state.tgz` (0700),
    plus a `pg_dump` when the Docker Postgres answers, the launchd plists and a
    listing of the tree. `.appium2/` and `logs/` are moved but not archived.
-2. **Stops** the web, worker, wda-service and appium agents (running tasks are
-   interrupted: pick a quiet moment). `db` and any other agent, such as a
+2. **Stops** the web, worker, wda-service and appium agents. The worker gets
+   its drain window (`WORKER_DRAIN_SECONDS`) to finish running tasks; longer
+   ones are stopped, so pick a quiet moment. `db` and any other agent, such as a
    tunnel, are left alone.
 3. **Moves** host state into `shared/` and everything else, `node_modules`
    included, into `releases/<id>/` (`<id>` = the checkout's git sha, or

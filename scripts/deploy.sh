@@ -36,7 +36,8 @@
 #
 # Environment: PHONE_FARM_ROOT (~/phone-farm), PHONE_FARM_LAUNCHD_PREFIX (com.phone-farm),
 # PHONE_FARM_KEEP_RELEASES (5), PHONE_FARM_HEALTH_TIMEOUT (120 s),
-# PHONE_FARM_WORKER_DRAIN_SECONDS (600), PHONE_FARM_HEALTH_URL (from WEB_HOST/WEB_PORT).
+# PHONE_FARM_WORKER_STOP_TIMEOUT (the worker's WORKER_DRAIN_SECONDS + WORKER_KILL_GRACE_SECONDS
+# + 30 s), PHONE_FARM_HEALTH_URL (from WEB_HOST/WEB_PORT).
 #
 # Exit: 0 live and healthy · 1 failed before the flip (nothing changed) ·
 #       2 unhealthy, rolled back to the previous release · 3 rollback unhealthy too.

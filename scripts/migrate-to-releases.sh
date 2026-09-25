@@ -93,7 +93,8 @@ Migrating $ROOT to the release layout
   release:  releases/$ID
   backup:   $BACKUP
   agents:   $([ "$AGENTS" = 1 ] && echo "stop web/worker/wda-service/appium ($PREFIX.*), reinstall from current" || echo "left alone (--no-agents)")
-  Running tasks are interrupted when the worker stops: pick a quiet moment.
+  The worker gets its drain window (WORKER_DRAIN_SECONDS) to finish running tasks,
+  then longer ones are stopped: pick a quiet moment.
 EOF
 if [ "$DRY" = 0 ] && [ "$YES" = 0 ]; then
     read -r -p "Continue? [y/N] " answer

@@ -19,7 +19,6 @@ LOCK_DIR="$ROOT/.deploy.lock"
 PREFIX=${PHONE_FARM_LAUNCHD_PREFIX:-com.phone-farm}
 KEEP_RELEASES=${PHONE_FARM_KEEP_RELEASES:-5}
 HEALTH_TIMEOUT=${PHONE_FARM_HEALTH_TIMEOUT:-120}
-WORKER_DRAIN_SECONDS=${PHONE_FARM_WORKER_DRAIN_SECONDS:-600}
 GUI_DOMAIN="gui/$(id -u)"
 
 # Files and directories that belong to the host, not to a release.
@@ -130,19 +129,33 @@ kickstart () {
     launchctl kickstart -k "$GUI_DOMAIN/$PREFIX.$name" && log "restarted $PREFIX.$name"
 }
 
-# Stop the worker with SIGTERM and wait for it to drain its running tasks; launchd
-# (KeepAlive) then starts it again from the new current. Falls back to
-# kickstart -k after WORKER_DRAIN_SECONDS.
+# How long to wait for a SIGTERMed worker to exit by itself before forcing it:
+# PHONE_FARM_WORKER_STOP_TIMEOUT, else the worker's own drain window
+# (WORKER_DRAIN_SECONDS, default 120) + its task kill grace
+# (WORKER_KILL_GRACE_SECONDS, default 15) + 30 s, read from shared/.env.
+worker_stop_timeout () {
+    if [ -n "${PHONE_FARM_WORKER_STOP_TIMEOUT:-}" ]; then echo "$PHONE_FARM_WORKER_STOP_TIMEOUT"; return; fi
+    local drain grace
+    drain=$(env_value WORKER_DRAIN_SECONDS); grace=$(env_value WORKER_KILL_GRACE_SECONDS)
+    [[ "$drain" =~ ^[0-9]+$ ]] || drain=120
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=15
+    echo $((drain + grace + 30))
+}
+
+# Stop the worker with SIGTERM: it stops taking jobs, lets running tasks finish
+# for its drain window, then exits; launchd (KeepAlive) starts it again from the
+# new current. Falls back to kickstart -k after worker_stop_timeout.
 restart_worker () {
-    local pid waited=0
+    local pid waited=0 limit
+    limit=$(worker_stop_timeout)
     if ! agent_loaded worker; then log "agent $PREFIX.worker is not loaded; skipping restart"; return 0; fi
     pid=$(agent_pid worker)
     if [ -z "$pid" ]; then kickstart worker; return; fi
-    log "draining worker (pid $pid, up to ${WORKER_DRAIN_SECONDS}s)"
+    log "draining worker (pid $pid, up to ${limit}s)"
     launchctl kill SIGTERM "$GUI_DOMAIN/$PREFIX.worker" || true
     while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited" -ge "$WORKER_DRAIN_SECONDS" ]; then
-            log "worker still running after ${WORKER_DRAIN_SECONDS}s; forcing restart"
+        if [ "$waited" -ge "$limit" ]; then
+            log "worker still running after ${limit}s; forcing restart"
             launchctl kickstart -k "$GUI_DOMAIN/$PREFIX.worker"
             return 0
         fi
