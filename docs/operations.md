@@ -8,7 +8,9 @@ backing up, upgrading. Commands assume the launchd agents from
 ([deploy.md](deploy.md)), or `cd ~/phone-farm` on a plain checkout. Relative
 paths such as `logs/` and `.wda/` resolve to `~/phone-farm/shared/` either way.
 Deploys, rollbacks and the one-time migration to releases are in
-[deploy.md](deploy.md).
+[deploy.md](deploy.md). Running several Macs against one Postgres (shared
+device registry, host agents over Tailscale, one Apple Team per ~100 phones)
+is in [multi-host.md](multi-host.md).
 
 ## Start / stop / restart
 
@@ -252,6 +254,8 @@ A farm host does not have to hold the Apple ID. Sign on a Mac that does, copy th
    in the host's `.env` (once).
 4. Restart `wda-service` on the host. Skip `wda:prepare` there; the wizard's *Prepare* step signs locally and does not apply.
 
+More than ~100 phones need more than one Apple Team: build one artifact per Team with `npm run wda:prepare -- --generic --team <TEAMID>`, set `WDA_XCTESTRUN_<TEAMID>` on the hosts and give each phone its `signingTeam` — see *Signing teams* in [multi-host.md](multi-host.md#signing-teams).
+
 ## Team access and VAs
 
 With `PHONE_FARM_AUTH_PLUGIN=builtin` ([configuration](configuration.md#built-in-accounts))
@@ -339,7 +343,7 @@ without `-f ../current/docker-compose.yml`:
 ```sh
 cd ~/phone-farm/shared && set -o pipefail
 docker compose -f ../current/docker-compose.yml exec -T postgres pg_dump -U phone_farm phone_farm | gzip > backups/pg-$(date +%F).sql.gz \
-  && tar czf backups/state-$(date +%F).tgz .env devices.json .scheduler-data/assets \
+  && tar czf backups/state-$(date +%F).tgz .env devices.json $(test -f device-secrets.json && echo device-secrets.json) .scheduler-data/assets \
   && curl -fsS -m 10 -o /dev/null "$BACKUP_PING_URL"   # a second push check: period 1 day, grace 2 h
 ```
 
@@ -348,7 +352,7 @@ ping runs only when both steps succeeded, so a missing ping means the backup
 is stale — see *Alert thresholds*.
 
 Restore: `gunzip -c backups/pg-….sql.gz | docker compose exec -T postgres psql -U phone_farm phone_farm`,
-put the two files back, run `npm run db:migrate`, restart the agents.
+put the files back (`.env`, `devices.json`, and `device-secrets.json` on a multi-host farm), run `npm run db:migrate`, restart the agents.
 
 ## Upgrading the software
 

@@ -34,7 +34,8 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 | `src/plugin.ts` | **stable** plugin + auth interfaces; `src/registry.ts` resolves `{pluginId, taskType, taskVersion}` |
 | `src/auth/` | built-in accounts (`PHONE_FARM_AUTH_PLUGIN=builtin`): `policy.ts` (pure access rules), `route-access.ts` (the route → requirement table every request is checked against), `accounts.ts` (sign-in, sessions, Team rules), `pg-store.ts` (schema `auth`), `routes.ts` (login, password, Team pages + API), `cli.ts` (`npm run users`) |
 | `src/scheduler/` | pg-boss queue, recurrence, executor, worker |
-| `src/devices/` | discovery (usbmux), `devices.json` registry, registration wizard, WDA supervisor + remote, per-phone WDA logs (`wda-log.ts`), coordinate profiles |
+| `src/devices/` | discovery (usbmux), the device registry (`registry.ts`: `devices.json` by default, `fleet.devices` via `registry-pg.ts` with `PHONE_FARM_REGISTRY=postgres`), host identity, registration wizard, WDA supervisor + remote, per-phone WDA logs (`wda-log.ts`), coordinate profiles |
+| `src/hosts/`, `src/agent/` | multi-host (`docs/multi-host.md`): host lease + directory (`fleet.hosts`); the `/agent/*` token, listener and client that reach another host's phones |
 | `src/observability/` | `/health/ready` probes, Prometheus `/metrics` rendering, the worker heartbeat (`scheduler.worker_heartbeats`) |
 | `src/tiktok/`, `src/tiktok-plugin.ts` | the built-in plugin and its standalone entrypoints |
 | `static/dashboard/templates/*.html` | server templates with `__PLACEHOLDER__` slots (`__BRAND__`, `__BRAND_TITLE__`, `__FOOTER__`, `__PLUGIN_NAV__`, `__AUTH_NAV__`, TikTok slots) |
@@ -52,9 +53,13 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 2. **`web` and `worker` load identical plugins.** A schedule that can be created must be executable.
 3. **Loopback by default.** `assertSafeBind` refuses a non-loopback `WEB_HOST`
    without `PHONE_FARM_AUTH_PLUGIN`. Appium and Postgres bind 127.0.0.1. Keep it so.
+   The only other listener is the multi-host agent (`PHONE_FARM_AGENT_BIND`,
+   `src/agent/listener.ts`): `/agent/*` only, bearer token required, never a wildcard address.
 4. **Secrets never enter the tree, logs, summaries or HTML.** Passcodes live only
-   in `devices.json` (0600) and are redacted by the API (`hasPasscode`).
-   `.env`, `devices.json` and `.appium2/` are git-ignored on purpose. Brand artwork
+   in `devices.json` (0600), or with the Postgres registry in the owning host's
+   `device-secrets.json` (0600) — never in Postgres, which only has `has_passcode` —
+   and are redacted by the API (`hasPasscode`). `.env`, `devices.json`,
+   `device-secrets.json` and `.appium2/` are git-ignored on purpose. Brand artwork
    in `static/brand/` is tracked (it is not secret); secrets never go there.
 5. **Escape everything rendered.** Templates are trusted code; device/user values
    go through `escapeHtml` (`src/html.ts`). Plugin panels too.

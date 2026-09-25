@@ -118,6 +118,24 @@ SIGTERM before it SIGKILLs the worker (the plist's `ExitTimeOut`). Keep it above
 `WORKER_DRAIN_SECONDS` + `WORKER_KILL_GRACE_SECONDS` + about 20 s, and re-run the
 installer after changing either.
 
+### Multi-host
+
+Several Macs sharing one Postgres, each owning its phones — see
+[multi-host.md](multi-host.md). A single Mac needs none of these.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `PHONE_FARM_REGISTRY` | `file` | Where registered phones live: `file` (`devices.json` on this host) or `postgres` (`fleet.devices`, shared by every host; run `npm run devices -- import-to-db` first). Every process on every host must agree. Anything else fails at startup. |
+| `PHONE_FARM_HOST_ID` | the hostname | This Mac's id: letters, digits, `.`, `_`, `-`, up to 63. The worker works and `wda-service` supervises only phones with this `host_id`. Set it explicitly on multi-host farms. |
+| `PHONE_FARM_HOST_NAME` | the id | Display name shown on other hosts' grid cards (`fleet.hosts.display_name`). |
+| `PHONE_FARM_DEVICE_SECRETS_PATH` | `device-secrets.json` beside the real `devices.json` | With the Postgres registry, this host's passcodes (0600, git-ignored). Postgres only stores `has_passcode`. |
+| `PHONE_FARM_AGENT_TOKEN` | — | Shared bearer token for the `/agent/*` host-agent routes, identical on every host, at least 32 characters (`openssl rand -hex 32`). Unset = the agent answers 404 and this dashboard cannot reach other hosts' phones. A secret. |
+| `PHONE_FARM_AGENT_BIND` | — | `<ip>:<port>` for the agent listener, normally this Mac's Tailscale IP (`100.101.74.35:3001`). Serves only `/agent/*`. Refuses `0.0.0.0`/`::`, hostnames, and a missing or short token. The dashboard's own bind (`WEB_HOST`) is unaffected. |
+| `PHONE_FARM_AGENT_URL` | — | The URL other dashboards use to reach this host's agent, published in `fleet.hosts` by the lease (`http://100.101.74.35:3001`). Plain `http(s)://host:port`, no credentials. |
+| `PHONE_FARM_REGISTRY_POOL_SIZE` | `3` | Postgres connections the registry opens per process. |
+| `PHONE_FARM_REGISTRY_CACHE_MS` | `2000` | How long a registry read is reused within a process. Writes in the same process invalidate it at once; other processes and hosts see a change within this time. |
+| `WDA_XCTESTRUN_<TEAM>` | — | Prebuilt WDA for phones whose `signingTeam` is `<TEAM>` (upper-cased; other characters become `_`). Falls back to `WDA_XCTESTRUN`. Build with `npm run wda:prepare -- --generic --team <TEAMID>`. |
+
 ### Monitoring
 
 See *Monitoring and alerts* in [operations.md](operations.md#monitoring-and-alerts).
@@ -148,7 +166,7 @@ See *Monitoring and alerts* in [operations.md](operations.md#monitoring-and-aler
 | `WDA_SERVICE_SOCKET` | `.wda/wda-service.sock` | Path of the supervisor's control socket. |
 | `WDA_PROJECT_PATH`, `XCUITEST_DRIVER_PATH`, `WDA_BOOTSTRAP_PATH` | derived from `.appium2` | Override where the WebDriverAgent project / XCUITest driver are found. |
 | `WDA_URL`, `WDA_REMOTE_PORT`, `MJPEG_REMOTE_PORT` | — / `8100` / `9100` | Used by the standalone TikTok entrypoints when run by hand outside the worker. |
-| `WDA_XCTESTRUN` | — | Path to a copied `.xctestrun` from `wda:prepare -- --generic` on another Mac. When set, WDA runs that pre-signed build and this host needs no Team, signing identity or Apple ID — only Xcode. See *Signing on another Mac* in `operations.md`. |
+| `WDA_XCTESTRUN` | — | Path to a copied `.xctestrun` from `wda:prepare -- --generic` on another Mac. When set, WDA runs that pre-signed build and this host needs no Team, signing identity or Apple ID — only Xcode. See *Signing on another Mac* in `operations.md`. A phone with a `signingTeam` prefers `WDA_XCTESTRUN_<TEAM>` (see [Multi-host](#multi-host)). |
 | `ALLOW_PROVISIONING_DEVICE_REGISTRATION` | `false` | `true` lets `xcodebuild` register a newly connected UDID with the Team automatically during `wda:prepare`. |
 | `SHOW_XCODE_LOG` | `false` | Verbose Xcode output from Appium sessions (debugging only). |
 | `DOOMSCROLL_PERSONALITY`, `TIKTOK_SWITCH_ACCOUNT` | set per task | Internal: passed from the task payload to the subprocess by the plugin. Not operator configuration. |
@@ -172,6 +190,7 @@ while the processes are stopped. Mode `0600`.
     "model": "iPhone 12 mini",                   // filled in from USB discovery; access can be granted per model
     "passcode": "123456",                        // unlock code; never returned by the API
     "disabled": false,                           // true = keep the entry, supervise nothing
+    "signingTeam": "ABCDE12345",                 // optional: Apple Team whose WDA build it runs (WDA_XCTESTRUN_<TEAM>)
     "pluginData": {
       "com.git-agni.tiktok": { "accounts": ["@handle"] }   // per-plugin, per-device, non-secret
     }
@@ -197,7 +216,14 @@ Rules:
   the first time it sees the phone connected over USB and the field is empty;
   it never overwrites a value. The registration wizard sets it at once. Team
   access can be granted per model.
+- `signingTeam` (optional) is an Apple Team ID or alias (letters, digits, `_`;
+  stored upper-case). The phone's WDA is launched from `WDA_XCTESTRUN_<TEAM>`,
+  else `WDA_XCTESTRUN`; changing it relaunches the phone's WDA. Set it with
+  `PATCH /api/devices/:udid` (`""` clears it). See [multi-host.md](multi-host.md#signing-teams).
 - `pluginData` is per plugin id and never holds secrets.
+- With `PHONE_FARM_REGISTRY=postgres` this file is no longer read: the same
+  fields live in `fleet.devices` with a `hostId`, and passcodes move to
+  `device-secrets.json` (see [multi-host.md](multi-host.md)).
 - The worker re-reads the file every 30 s; `wda-service` and `web` watch it
   too. Prefer `PATCH /api/devices/:udid` over editing while running.
 
@@ -211,6 +237,7 @@ Rules:
 | 8100 + n | WebDriverAgent of device *n* (USB forward) |
 | 9100 + n | MJPEG stream of device *n* (USB forward) |
 | `.wda/wda-service.sock` | `wda-service` control socket (`/health`, `/devices`, `/devices/:udid/logs`) |
+| `PHONE_FARM_AGENT_BIND` (e.g. 3001) | Multi-host only, and the one exception to loopback: the host agent (`/agent/*` only, bearer token) on this Mac's Tailscale IP, never `0.0.0.0` |
 
 ## Exposure — reaching the dashboard from another machine
 
@@ -227,6 +254,7 @@ The safe default is loopback only. Options, in order of preference:
 | --- | --- | --- |
 | `.env` | settings + secrets | yes (encrypted) |
 | `devices.json` | fleet, passcodes, calibration | yes (encrypted) |
+| `device-secrets.json` | this host's passcodes with `PHONE_FARM_REGISTRY=postgres` (beside the real `devices.json`) | yes (encrypted) |
 | PostgreSQL volume `phone-farm-postgres` | schedules, executions, logs, asset index | yes — `pg_dump` |
 | `.scheduler-data/assets/` | uploaded media for post tasks | yes |
 | `.wda/` | socket + locks | no |
