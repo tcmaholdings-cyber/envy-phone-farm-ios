@@ -8,6 +8,7 @@ import { diagnoseWdaLaunchFailure, wdaUnavailableTooLong } from './diagnostics.j
 import { resolveDeveloperDir } from './xcode-env.js';
 import { resolveTargetUdid } from './target-device.js';
 import { wdaLaunchArgs } from './runner-args.js';
+import { LineSplitter } from '../wda-log.js';
 
 function delay(milliseconds: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -154,10 +155,14 @@ async function stopRunner(): Promise<void> {
     releaseForwarding();
 }
 
-function observeOutput(chunk: Buffer, stderr: boolean): void {
-    const output = chunk.toString();
-    (stderr ? process.stderr : process.stdout).write(output);
-    const diagnosis = diagnoseWdaLaunchFailure(output);
+// Diagnose complete lines, not raw chunks: a pipe chunk can end mid-line, so
+// "Unlock iPhone to Continue" split across two reads would otherwise be missed.
+function observeLines(lines: string[]): void {
+    for (const line of lines) observeLine(line);
+}
+
+function observeLine(line: string): void {
+    const diagnosis = diagnoseWdaLaunchFailure(line);
     if (diagnosis?.startsWith('Unlock')) {
         locked = true;
         report('unlock-required', diagnosis);
@@ -192,10 +197,19 @@ async function startRunner(): Promise<void> {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     child = running;
-    running.stdout?.on('data', (chunk: Buffer) => observeOutput(chunk, false));
-    running.stderr?.on('data', (chunk: Buffer) => observeOutput(chunk, true));
+    const stdoutLines = new LineSplitter();
+    const stderrLines = new LineSplitter();
+    running.stdout?.on('data', (chunk: Buffer) => {
+        process.stdout.write(chunk);
+        observeLines(stdoutLines.push(chunk));
+    });
+    running.stderr?.on('data', (chunk: Buffer) => {
+        process.stderr.write(chunk);
+        observeLines(stderrLines.push(chunk));
+    });
     running.once('error', (error) => report('error', `Unable to start xcodebuild: ${error.message}`));
     running.once('exit', (code, signal) => {
+        observeLines([...stdoutLines.flush(), ...stderrLines.flush()]);
         if (child === running) child = undefined;
         releaseForwarding();
         if (!stopping) {

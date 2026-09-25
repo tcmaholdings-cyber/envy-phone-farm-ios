@@ -53,6 +53,11 @@ Fastify app on `WEB_PORT` (default 3000).
   and concurrent screenshot requests for a device collapse onto one WDA round
   trip (`src/devices/screenshot-cache.ts`). The grid's own cadence widens past
   ten phones. See *Fleet-scale polling* in [configuration.md](configuration.md).
+- Health and monitoring (`src/observability/`): `GET /health` (liveness +
+  release sha), `GET /health/ready` (Postgres, Appium, wda-service socket,
+  worker heartbeat; 200/503) and `GET /metrics` (Prometheus text, bearer
+  `PHONE_FARM_METRICS_TOKEN`). See *Monitoring and alerts* in
+  [operations.md](operations.md#monitoring-and-alerts).
 - Loads plugins (`PHONE_FARM_PLUGINS`) and the auth provider
   (`PHONE_FARM_AUTH_PLUGIN`); mounts each plugin's **panels** on the device
   page and its **routes** under `/plugins/<pluginId>`.
@@ -81,6 +86,8 @@ Headless. Owns task execution.
   the device + WDA + Appium to be ready, builds a `TaskExecutionContext`, and
   calls the task's `execute()`. Handles attempts, retry policy, stop requests,
   and the run‑window deadline.
+- Every 15 s it upserts its host's row in `scheduler.worker_heartbeats`
+  (pid, start time, queue count); `/health/ready` fails when it goes stale.
 - Must load the **same plugin versions** as `web`.
 
 ### `wda-service` — `src/devices/wda-service.ts`
@@ -91,7 +98,12 @@ Persistent WebDriverAgent supervisor, controlled over a Unix socket
   `xcodebuild test-without-building` as needed and USB‑forwarding WDA
   (`8100`, `8101`, …) and MJPEG (`9100`, `9101`, …).
 - `GET /health` on the socket reports per‑device `{ physical, wda, appium,
-  message }`. States: `ready`, `unlock-required`, `error`, …
+  message, restarts, notReadySince, disconnectedSince }`. States: `ready`,
+  `unlock-required`, `error`, …
+- Every line a phone's supervisor child prints (its xcodebuild output and
+  `[wda-state]` markers) goes to `.wda/logs/<udid>.log`, rotated at 5 MB × 3,
+  and the last 200 lines stay in memory: `GET /devices/:udid/logs` on the
+  socket, `GET /api/devices/:udid/wda-log` (admins) on the dashboard.
 - Single‑supervisor by design; a lock prevents duplicates.
 
 ### `appium` — `appium --address 127.0.0.1 --port 4725`
@@ -137,13 +149,13 @@ without the UI, for scripted or bulk (`--all`) setup.
 
 | Store | Contents |
 | --- | --- |
-| PostgreSQL `scheduler.*` | `schedules`, `executions`, `execution_attempts`, `execution_logs`, `assets`. Drizzle ORM; migrations in `drizzle/`. |
+| PostgreSQL `scheduler.*` | `schedules`, `executions`, `execution_attempts`, `execution_logs`, `assets`, `worker_heartbeats` (one row per host, refreshed every 15 s). Drizzle ORM; migrations in `drizzle/`. |
 | PostgreSQL `pgboss.*` | Job queue (one partitioned queue per device). |
 | PostgreSQL `drizzle.*` | Applied‑migration ledger. |
 | `devices.json` | Registered devices: `udid`, `name`, ports, `coordinateProfile`, per‑device `coordinates` overrides, `passcode`, `disabled`, `pluginData`. Git‑ignored, `0600`. |
 | `.env` | Configuration and secrets (DB URL, signing IDs, auth keys). Git‑ignored. Device passcodes live in `devices.json`, not here. |
 | `.scheduler-data/assets/` | Uploaded media for `post`‑style tasks, content‑addressed. |
-| `.wda/` | wda-service socket and locks. |
+| `.wda/` | wda-service socket and locks; `.wda/logs/<udid>.log` per-phone WDA output. |
 | `.appium2/` | Isolated Appium home with the pinned XCUITest driver. |
 
 ## The task model
@@ -190,6 +202,7 @@ in `src/scheduler/recurrence.ts`; the next occurrence is written to
 | `src/tiktok/` | TikTok automation entrypoints (`doomscroll.ts`, `post.ts`), OCR, coordinates |
 | `src/tiktok-plugin.ts` | The built‑in plugin: task definitions, device panel, routes |
 | `src/plugin.ts` | **Stable plugin & auth interfaces** |
+| `src/observability/` | Readiness probes, Prometheus text rendering, the worker heartbeat |
 | `src/auth/` | Built-in accounts: access policy, route requirement table, sessions and sign-in, Team pages/API, `npm run users` |
 | `src/registry.ts` | `PluginRegistry` — task resolution and validation |
 | `src/loader.ts` | Dynamic import of `PHONE_FARM_PLUGINS` / `PHONE_FARM_AUTH_PLUGIN` |

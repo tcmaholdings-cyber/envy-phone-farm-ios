@@ -5,7 +5,9 @@ import type {
     WdaServiceDevicesResponse,
     WdaServiceErrorResponse,
     WdaServiceHealthResponse,
+    WdaServiceLogsResponse,
 } from './wda-service-protocol.js';
+import { MAX_LOG_LINES } from './wda-service-protocol.js';
 
 function sendJson(response: ServerResponse, statusCode: number, value: unknown): void {
     response.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
@@ -36,6 +38,21 @@ export function createWdaServiceHttpServer(
             }
             if (method === 'GET' && url.pathname === '/devices') {
                 const body: WdaServiceDevicesResponse = { devices: connections.statuses() };
+                sendJson(response, 200, body);
+                return;
+            }
+            const logs = method === 'GET' ? /^\/devices\/([^/]+)\/logs$/.exec(url.pathname) : null;
+            if (logs) {
+                const udid = decodeURIComponent(logs[1]!);
+                const requested = Number(url.searchParams.get('lines') ?? 200);
+                const limit = Number.isSafeInteger(requested) && requested > 0 ? Math.min(requested, MAX_LOG_LINES) : 200;
+                const lines = await connections.logs?.(udid, limit);
+                if (!lines) {
+                    const body: WdaServiceErrorResponse = { error: 'Unknown device' };
+                    sendJson(response, 404, body);
+                    return;
+                }
+                const body: WdaServiceLogsResponse = { udid, lines };
                 sendJson(response, 200, body);
                 return;
             }

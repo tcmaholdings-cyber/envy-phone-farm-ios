@@ -19,7 +19,7 @@ export const LOGOUT_PATH = '/logout';
 export const PASSWORD_PATH = '/account/password';
 
 /** Reachable without a session: the sign-in page and only what it needs to render. */
-const PUBLIC_PATHS = new Set([LOGIN_PATH, LOGOUT_PATH, '/health', '/assets/styles.css', '/assets/brand-logo']);
+const PUBLIC_PATHS = new Set([LOGIN_PATH, LOGOUT_PATH, '/health', '/health/ready', '/assets/styles.css', '/assets/brand-logo']);
 
 export function isBuiltinPublicPath(path: string): boolean {
     return PUBLIC_PATHS.has(path) || /^\/assets\/fonts\/[^/]+$/.test(path);

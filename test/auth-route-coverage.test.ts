@@ -26,7 +26,7 @@ test('public routes are exactly the sign-in page and what it needs to render', a
     const report = routeAccessReport(app).filter(({ method }) => method !== 'HEAD');
     const publicRoutes = report.filter(({ requirement }) => requirement?.kind === 'public').map(({ method, url }) => `${method} ${url}`).sort();
     assert.deepEqual(publicRoutes, [
-        'GET /assets/fonts/:file', 'GET /assets/styles.css', 'GET /health', 'GET /login', 'POST /login', 'POST /logout',
+        'GET /assets/fonts/:file', 'GET /assets/styles.css', 'GET /health', 'GET /health/ready', 'GET /login', 'POST /login', 'POST /logout',
     ]);
     // The provider's own notion of "public" (checked before authentication) must agree with the table.
     for (const { url, requirement } of report) {

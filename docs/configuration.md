@@ -93,9 +93,10 @@ database connection is `DATABASE_URL`.
   changes and every user / group / grant change are logged by `web` as
   `audit` entries naming the actor. Passwords and tokens never appear.
 
-Public without a session: `/login`, `/logout`, `/health`, and the stylesheet,
-fonts and logo the sign-in page uses. Everything else redirects a browser to
-`/login` or answers `401`.
+Public without a session: `/login`, `/logout`, `/health`, `/health/ready`,
+and the stylesheet, fonts and logo the sign-in page uses. `/metrics` needs no
+session either but checks its own bearer token (`PHONE_FARM_METRICS_TOKEN`).
+Everything else redirects a browser to `/login` or answers `401`.
 
 A third-party `AuthProvider` keeps working as before: every user it signs in
 can do everything, unless it returns `access` (`UserAccess` in
@@ -112,6 +113,20 @@ can do everything, unless it returns `access` (`UserAccess` in
 `PHONE_FARM_LAUNCHD_PREFIX` (default `com.phone-farm`) — label prefix used by
 `deploy/launchd/install-agents.sh`; not read by the application itself.
 
+### Monitoring
+
+See *Monitoring and alerts* in [operations.md](operations.md#monitoring-and-alerts).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `PHONE_FARM_METRICS_TOKEN` | — | Bearer token for `GET /metrics` (Prometheus). Unset = the endpoint answers 404. Long and random (`openssl rand -hex 32`); it is a secret. |
+| `PHONE_FARM_HEARTBEAT_URL` | — | Healthchecks.io / Uptime Kuma push URL. When set, `install-agents.sh` installs the `<prefix>.heartbeat` agent, which pings it every 60 s while `GET /health/ready` answers 200. It is a credential: keep it in `.env`; it is never written into a plist. |
+| `PHONE_FARM_READY_URL` | `http://127.0.0.1:$WEB_PORT/health/ready` | What the heartbeat agent checks. Change it only when the dashboard is not reachable on loopback. |
+| `PHONE_FARM_WORKER_STALE_SECONDS` | `60` | `/health/ready` fails the `worker` check when the freshest worker heartbeat (written every 15 s) is older than this. |
+| `WDA_LOG_DIR` | `.wda/logs` | Where `wda-service` writes each phone's supervisor + xcodebuild output, `<udid>.log`. |
+| `WDA_LOG_MAX_BYTES` / `WDA_LOG_FILES` | `5242880` / `3` | Rotate a phone's log at 5 MB, keeping `<udid>.log.1` … `.3`. |
+| `WDA_LOG_RECENT_LINES` | `200` | Lines per phone kept in memory for the socket and `GET /api/devices/:udid/wda-log`. |
+
 ### Advanced / tuning (rarely needed)
 
 | Key | Default | Meaning |
@@ -122,7 +137,7 @@ can do everything, unless it returns `access` (`UserAccess` in
 | `SCHEDULER_HISTORY_DAYS` | `30` | Execution history kept by the cleanup pass. |
 | `SCHEDULER_ORPHAN_ASSET_HOURS` | — | Age after which uploaded media with no remaining schedule is deleted. |
 | `PUBLIC_ORIGIN` | — | The browser-facing origin (`https://farm.example`) when the dashboard sits behind a reverse proxy; counted as trusted by the CSRF guard. |
-| `PHONE_FARM_RELEASE_FILE` | `RELEASED` | JSON file whose contents `/health` reports as `release` (deploy stamps). |
+| `PHONE_FARM_RELEASE_FILE` | `RELEASED` | JSON file (deploy stamp) whose `sha` `/health` reports as `release`. |
 | `WDA_SERVICE_SOCKET` | `.wda/wda-service.sock` | Path of the supervisor's control socket. |
 | `WDA_PROJECT_PATH`, `XCUITEST_DRIVER_PATH`, `WDA_BOOTSTRAP_PATH` | derived from `.appium2` | Override where the WebDriverAgent project / XCUITest driver are found. |
 | `WDA_URL`, `WDA_REMOTE_PORT`, `MJPEG_REMOTE_PORT` | — / `8100` / `9100` | Used by the standalone TikTok entrypoints when run by hand outside the worker. |
@@ -188,7 +203,7 @@ Rules:
 | 5432 | PostgreSQL (docker, bound to 127.0.0.1) |
 | 8100 + n | WebDriverAgent of device *n* (USB forward) |
 | 9100 + n | MJPEG stream of device *n* (USB forward) |
-| `.wda/wda-service.sock` | `wda-service` control socket (`/health`) |
+| `.wda/wda-service.sock` | `wda-service` control socket (`/health`, `/devices`, `/devices/:udid/logs`) |
 
 ## Exposure — reaching the dashboard from another machine
 

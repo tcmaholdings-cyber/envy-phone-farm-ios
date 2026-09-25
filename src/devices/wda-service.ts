@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { DeviceConnectionManager } from './connection-manager.js';
 import { createWdaServiceHttpServer } from './wda-service-http.js';
+import { WdaLogStore, wdaLogOptionsFromEnv } from './wda-log.js';
 import { requestWdaService } from './wda-service-client.js';
 import { wdaServiceSocketPath } from './wda-service-protocol.js';
 
@@ -56,7 +57,10 @@ await unlink(socketPath).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== 'ENOENT') throw error;
 });
 
-const connections = new DeviceConnectionManager();
+// Per-phone xcodebuild output: rotated files under WDA_LOG_DIR (.wda/logs) + the last lines in memory.
+const logOptions = wdaLogOptionsFromEnv();
+const connections = new DeviceConnectionManager({ logs: new WdaLogStore(logOptions) });
+console.log(`WDA supervisor logs: ${logOptions.directory}/<udid>.log`);
 let stopping = false;
 let ready = false;
 const server = createWdaServiceHttpServer(connections, () => void shutdown('request'), () => ready);
