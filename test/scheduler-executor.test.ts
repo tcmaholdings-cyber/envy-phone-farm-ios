@@ -187,6 +187,32 @@ test('waitForDevice falls back to the registry identity when the cached sweep pr
     assert.deepEqual(found, { udid: 'phone-a', name: 'Rack 1 · 3' });
 });
 
+test('a refused usbmuxd sweep is retried on the next poll, not a failure of every waiter', async () => {
+    let reads = 0;
+    const udids = createSharedSweep(async () => {
+        reads++;
+        if (reads === 1) throw new Error('connect ECONNREFUSED /var/run/usbmuxd');
+        return ['phone-a'];
+    });
+    const shared = dependencies({ connectedUdids: () => udids.get(0) });
+    const found = await Promise.all(Array.from({ length: 5 }, () => waitForDevice(execution(), registered, new AbortController().signal, shared)));
+    assert.equal(found.length, 5);
+    assert.ok(reads >= 2, 'the sweep is read again after the refusal');
+});
+
+test('a usbmuxd that stays down is reported as the reason when the window expires', async () => {
+    let polls = 0;
+    await assert.rejects(
+        waitForDevice({ deviceUdid: 'phone-a', deadlineAt: new Date(Date.now() + 50) }, registered, new AbortController().signal, dependencies({
+            connectedUdids: async () => { polls++; throw new Error('connect ECONNREFUSED /var/run/usbmuxd'); },
+            sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+            pollMs: 10,
+        })),
+        /Execution window expired: usbmuxd is unavailable \(connect ECONNREFUSED \/var\/run\/usbmuxd\)/,
+    );
+    assert.ok(polls > 1, 'it kept polling instead of failing on the first refusal');
+});
+
 test('waitForDevice reports why it gave up, and stops promptly when aborted', async () => {
     await assert.rejects(
         waitForDevice(execution(-1), registered, new AbortController().signal, dependencies({})),

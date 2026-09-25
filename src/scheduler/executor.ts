@@ -12,6 +12,10 @@ import type { PluginRegistry } from '../registry.js';
 import type { DeviceIdentity, TaskExecutionResult } from '../types.js';
 import { isEffectCommittedLine } from './effects.js';
 import type { SchedulerRepository } from './repository.js';
+import { createStartGate, taskStartConcurrency, taskStartWarmupMs } from './start-gate.js';
+
+/** One gate per worker process: every phone's task starts through it. */
+const taskStartGate = createStartGate(taskStartConcurrency());
 
 /** What the worker needs to know beyond the task's own result. */
 export interface AutomationOutcome extends TaskExecutionResult {
@@ -97,8 +101,19 @@ export async function waitForDevice(
     let lastProblem = 'device is offline';
     while (Date.now() <= execution.deadlineAt.getTime()) {
         if (signal.aborted) throw new Error('Execution stopped while waiting for the device');
-        const present = (await dependencies.connectedUdids()).includes(execution.deviceUdid);
-        if (!present) lastProblem = 'device is offline';
+        // A refused usbmuxd connection is transient (its accept backlog overflows
+        // when a batch of tasks starts at once), and one failed shared sweep is
+        // seen by every waiter at the same moment. Poll again, like an offline
+        // phone, instead of failing the whole batch on one refusal.
+        let present = false;
+        let sweepError: string | undefined;
+        try {
+            present = (await dependencies.connectedUdids()).includes(execution.deviceUdid);
+        } catch (error) {
+            sweepError = error instanceof Error ? error.message : String(error);
+        }
+        if (sweepError) lastProblem = `usbmuxd is unavailable (${sweepError})`;
+        else if (!present) lastProblem = 'device is offline';
         else if (!await dependencies.endpointReady(`http://127.0.0.1:${wdaPort}/status`)) lastProblem = `WDA is unavailable on port ${wdaPort}`;
         else if (!await dependencies.endpointReady(`${appiumBaseUrl()}/status`)) lastProblem = `Appium is unavailable at ${appiumBaseUrl()}`;
         else {
@@ -364,13 +379,23 @@ export async function executeAutomation(
             assets: await repository.executionAssets(execution),
             signal: controller.signal,
             log: (line) => repository.appendLogs(execution.id, attempt, [line]),
-            runProcess: (specification) => {
+            runProcess: async (specification) => {
+                if (taskStartGate.wouldWait()) {
+                    await repository.appendLogs(execution.id, attempt, ['Waiting for a start slot (PHONE_FARM_TASK_START_CONCURRENCY)']);
+                }
+                const release = await taskStartGate.acquire(controller.signal);
+                const warmup = setTimeout(release, taskStartWarmupMs());
                 launchedProcess = true;
-                return runPluginProcess(
-                    specification, environment, controller.signal,
-                    (lines) => repository.appendLogs(execution.id, attempt, lines),
-                    { onEffectCommitted: (line) => commitEffect(line) },
-                );
+                try {
+                    return await runPluginProcess(
+                        specification, environment, controller.signal,
+                        (lines) => repository.appendLogs(execution.id, attempt, lines),
+                        { onEffectCommitted: (line) => commitEffect(line) },
+                    );
+                } finally {
+                    clearTimeout(warmup);
+                    release();
+                }
             },
             commitEffect,
         };
