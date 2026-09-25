@@ -189,7 +189,17 @@ launchctl list | grep phone-farm
 tail -f logs/web.log
 ```
 
-See [operations.md](operations.md) for restart, logs and upgrades.
+Once the farm works, convert the checkout to versioned releases so upgrades
+and rollbacks are one command each (it moves the state, reinstalls the agents
+and is safe to re-run):
+
+```sh
+scripts/migrate-to-releases.sh           # ~/phone-farm -> current + releases/ + shared/
+```
+
+From then on deploy from your own machine with `scripts/deploy-remote.sh <user>@<host>`,
+not by copying files onto the host. See [deploy.md](deploy.md), and
+[operations.md](operations.md) for restart, logs and day-two work.
 
 ## 8. Register the phones
 

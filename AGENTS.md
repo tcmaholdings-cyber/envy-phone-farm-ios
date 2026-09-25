@@ -17,6 +17,7 @@ npm run db:generate                            # after editing src/database/sche
 npm run wda:prepare -- --udid <udid>           # sign/build WebDriverAgent (graphical session only)
 npm run users -- create <name> --role admin     # built-in accounts: first admin (prints a temp password once)
 npm run devices -- set-rack <rack> --all        # label every registered phone's rack
+scripts/deploy-remote.sh <user@host>            # build a release tarball, copy it, deploy it (docs/deploy.md)
 ```
 
 There is no server build step: TypeScript runs through `tsx`. Browser code in
@@ -38,7 +39,9 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 | `src/tiktok/`, `src/tiktok-plugin.ts` | the built-in plugin and its standalone entrypoints |
 | `static/dashboard/templates/*.html` | server templates with `__PLACEHOLDER__` slots (`__BRAND__`, `__BRAND_TITLE__`, `__FOOTER__`, `__PLUGIN_NAV__`, `__AUTH_NAV__`, TikTok slots) |
 | `test/` | `node:test` suites; `test/support.ts` has the CSRF-aware `inject()` |
-| `deploy/launchd/` | agent installer for always-on hosts |
+| `deploy/launchd/` | agent installer for always-on hosts (runs agents from `~/phone-farm/current`) |
+| `scripts/` | `release.sh` (tarball per commit), `deploy.sh` / `rollback.sh` / `migrate-to-releases.sh` (run on the host), `deploy-remote.sh` (laptop), `smoke.ts` (pre-flip import check) |
+| `.github/workflows/` | `ci.yml` (check + asset drift + release build), `release.yml` (tag → GitHub release asset) |
 | `docs/` | user-facing documentation (keep it truthful; it is part of the product) |
 
 ## Invariants — do not break these
@@ -61,8 +64,12 @@ There is no server build step: TypeScript runs through `tsx`. Browser code in
 7. **Coordinate profiles are typed constants** in two files that must match
    (`src/devices/coordinates.ts`, `src/tiktok/coordinates.ts`). Per-device
    overrides cover only the 15 calibratable points.
-8. **Idempotent operations.** Migrations, `wda:prepare`, the launchd installer
-   and the registry mutators are safe to re-run; keep new operations that way.
+8. **Idempotent operations.** Migrations, `wda:prepare`, the launchd installer,
+   the registry mutators and the deploy/rollback/migration scripts are safe to
+   re-run; keep new operations that way. Host state lives in `~/phone-farm/shared`
+   and is symlinked into each release: write files through the link (as
+   `saveRegisteredDevices` does), never rename over it. DB migrations must stay
+   compatible with the previous release, because rollback does not reverse them.
 9. **Every route is in the access table.** A new route needs an entry in
    `ROUTE_REQUIREMENTS` (`src/auth/route-access.ts`) or its plugin's
    `routeAccess`; `test/auth-route-coverage.test.ts` fails otherwise. Lists
