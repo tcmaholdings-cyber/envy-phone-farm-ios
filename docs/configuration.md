@@ -66,6 +66,9 @@ Loaded by every `npm run …` script (`--env-file-if-exists=.env`, then
 | --- | --- | --- |
 | `DATABASE_POOL_SIZE` | `10` | Max Postgres connections per process (`web` and `worker` each open a pool). |
 | `SCHEDULER_RUN_WINDOW_MINUTES` | `30` | Grace period after a schedule's time before the execution is abandoned as "window expired". A schedule's own `runWindowMinutes` overrides it. |
+| `PHONE_FARM_TASK_START_CONCURRENCY` | `4` | How many task subprocesses this worker starts at once; `0` means no limit. Starting a task opens an Appium session and a burst of WDA connections through usbmuxd, and a whole rack started together overflows usbmuxd (`connect ECONNREFUSED /var/run/usbmuxd` for every client on the host). Later tasks wait for a slot — their log says *Waiting for a start slot* — and 34 phones take about three minutes to all start. |
+| `PHONE_FARM_TASK_START_WARMUP_SECONDS` | `20` | How long a started task holds its start slot (it is freed earlier if the task exits). |
+| `PHONE_FARM_DISCOVERY_TTL_MS` | `2000` | How long a usbmux device sweep is reused. Waiting tasks share one sweep instead of each running three lockdown round trips per attached phone. `0` disables the cache. |
 | `SCHEDULER_MIN_TASK_GAP_MINUTES` | see `DEFAULT_MIN_SCHEDULE_GAP_MINUTES` in `src/scheduler/repository.ts` | Minimum spacing enforced between tasks on one device. |
 | `SCHEDULER_HISTORY_DAYS` | `30` | Execution history kept by the cleanup pass. |
 | `SCHEDULER_ORPHAN_ASSET_HOURS` | — | Age after which uploaded media with no remaining schedule is deleted. |
