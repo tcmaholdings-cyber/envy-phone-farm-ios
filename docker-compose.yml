@@ -1,3 +1,9 @@
+# Pinned so the Postgres volume (phone-farm_phone-farm-postgres) does not depend
+# on the directory compose runs from: a release deploy runs it from
+# releases/<id>/, which would otherwise start an empty database. Set
+# COMPOSE_PROJECT_NAME in .env only if your original checkout directory was not
+# named phone-farm (check with `docker volume ls | grep postgres`).
+name: phone-farm
 services:
   postgres:
     image: postgres:17-alpine

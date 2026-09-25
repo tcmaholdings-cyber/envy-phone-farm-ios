@@ -1,9 +1,14 @@
 # Operations runbook
 
 Day-two operations for a farm host: starting, stopping, watching, fixing,
-backing up, upgrading. Commands assume the repo at `~/phone-farm`, the launchd
-agents from `deploy/launchd/` and the label prefix set at install time
-(`$P` below, e.g. `com.envy.phone-farm`).
+backing up, upgrading. Commands assume the launchd agents from
+`deploy/launchd/`, the label prefix set at install time (`$P` below, e.g.
+`com.envy.phone-farm`), and that you run them from the live code:
+`cd ~/phone-farm/current` on a host in the release layout
+([deploy.md](deploy.md)), or `cd ~/phone-farm` on a plain checkout. Relative
+paths such as `logs/` and `.wda/` resolve to `~/phone-farm/shared/` either way.
+Deploys, rollbacks and the one-time migration to releases are in
+[deploy.md](deploy.md).
 
 ## Start / stop / restart
 
@@ -241,7 +246,8 @@ A farm host does not have to hold the Apple ID. Sign on a Mac that does, copy th
    *+* (or *Register Multiple Devices* with a tab-separated `Device ID / Device Name / Device Platform` file).
 2. On the signing Mac: `npm run wda:prepare -- --generic` → `.wda/prebuilt/Build/Products`.
    Automatic signing puts every registered device into the profile, so re-run it after each registration.
-3. Copy that folder to the host, e.g. `rsync -a .wda/prebuilt/Build/Products/ host:phone-farm/.wda/prebuilt/`,
+3. Copy that folder to the host, e.g. `rsync -a .wda/prebuilt/Build/Products/ host:phone-farm/shared/.wda/prebuilt/`
+   (`host:phone-farm/.wda/prebuilt/` on a host not yet migrated to releases),
    and set `WDA_XCTESTRUN=/Users/<user>/phone-farm/.wda/prebuilt/WebDriverAgentRunner_iphoneos<sdk>-arm64.xctestrun`
    in the host's `.env` (once).
 4. Restart `wda-service` on the host. Skip `wda:prepare` there; the wizard's *Prepare* step signs locally and does not apply.
@@ -325,11 +331,14 @@ without forgetting: **Disconnect** on the grid (`"disabled": true`).
 
 ## Backups
 
-Nightly, from a cron/launchd job on the host:
+Nightly, from a cron/launchd job on the host, run in `~/phone-farm/shared`
+(where the real files are; `tar` would archive the links in a release
+directory, not their contents). On a plain checkout run it in `~/phone-farm`
+without `-f ../current/docker-compose.yml`:
 
 ```sh
-set -o pipefail
-docker compose exec -T postgres pg_dump -U phone_farm phone_farm | gzip > backups/pg-$(date +%F).sql.gz \
+cd ~/phone-farm/shared && set -o pipefail
+docker compose -f ../current/docker-compose.yml exec -T postgres pg_dump -U phone_farm phone_farm | gzip > backups/pg-$(date +%F).sql.gz \
   && tar czf backups/state-$(date +%F).tgz .env devices.json .scheduler-data/assets \
   && curl -fsS -m 10 -o /dev/null "$BACKUP_PING_URL"   # a second push check: period 1 day, grace 2 h
 ```
@@ -343,14 +352,17 @@ put the two files back, run `npm run db:migrate`, restart the agents.
 
 ## Upgrading the software
 
+From the laptop, in a clean checkout of the tag or branch to run:
+
 ```sh
-git fetch && git checkout <tag>          # tags are the supported upgrade points
-npm install
-npm run appium:install-driver            # if the pinned XCUITest version changed
-npm run db:migrate                       # idempotent
-npm run check                            # typecheck + tests must pass before restarting
-deploy/launchd/install-agents.sh         # re-reads plists and restarts all agents
+scripts/deploy-remote.sh <user>@<host>       # build, copy, migrate the DB, flip, restart, health-check
+~/phone-farm/bin/rollback.sh     # on the host: back to the previous release
 ```
+
+[deploy.md](deploy.md) covers what each step does, the automatic rollback, and
+the one-time conversion of a plain checkout (`scripts/migrate-to-releases.sh`).
+Tags (`vX.Y.Z`) are the supported upgrade points; CI attaches a release
+tarball to each one.
 
 Read the release notes for `taskVersion` changes: a schedule persists the
 version it was created with and fails loudly, rather than silently running new
