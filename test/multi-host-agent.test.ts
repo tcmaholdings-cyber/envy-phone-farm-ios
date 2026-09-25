@@ -188,6 +188,20 @@ test('another host\'s passcode cannot be set from this dashboard', async (contex
     assert.match(response.json().error, /host mini-b/);
 });
 
+test('the plain pages name the host and send passcode edits for a remote phone to its host', async (context) => {
+    const app = await createApp({
+        plugins: new PluginRegistry([]), scheduler: { async activeExecution() { return null; }, async listSchedules() { return []; }, async listExecutions() { return []; } } as never,
+        hostId: 'mini-a', remote: fakeRemote() as never, discoverDevices: async () => [], wdaStatuses: async () => [],
+        hosts: staticHostDirectory([{ id: 'mini-b', displayName: 'Rack room B', agentUrl: null, ageSeconds: null }]),
+    });
+    context.after(() => app.close());
+    const index = await inject(app, { method: 'GET', url: '/' });
+    assert.match(index.body, /host Rack room B/);
+    const page = await inject(app, { method: 'GET', url: '/devices/phone-b' });
+    assert.match(page.body, /on host mini-b\. Set it from that host/);
+    assert.doesNotMatch(page.body, /id="pc"/, 'no passcode form for another host\'s phone');
+});
+
 test('grants still apply before any proxying: an ungranted remote phone is a 404', async (context) => {
     const b = await hostB(context);
     const { app, store } = await createAuthApp({
