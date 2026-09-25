@@ -236,6 +236,9 @@ test('migrate-to-releases.sh moves state into shared/, keeps it reachable, and i
     assert.ok(existsSync(path.join(release, 'node_modules/dep/index.js')), 'node_modules moved with the code');
     assert.ok(existsSync(path.join(release, 'stray-notes.txt')), 'unknown files are moved, not lost');
     assert.ok(existsSync(path.join(release, '.ready')));
+    for (const tool of ['bin/deploy.sh', 'bin/rollback.sh', 'bin/lib/release-common.sh']) {
+        assert.ok(existsSync(path.join(farm.root, tool)), `${tool} installed outside any release`);
+    }
     assert.equal(released(farm, id).id, id);
     assert.equal((lstatSync(path.join(farm.root, 'shared')).mode & 0o777), 0o700);
 
@@ -344,7 +347,8 @@ test('an unhealthy release is rolled back automatically; rollback.sh returns to 
     assert.equal(currentId(farm), firstId);
     assert.equal(released(farm, firstId).rolledBackFrom, goodId);
 
-    const forward = run(farm, path.join(farm.repo, 'scripts/rollback.sh'), [goodId]);
+    // ~/phone-farm/bin keeps working even when current is a release without the scripts.
+    const forward = run(farm, path.join(farm.root, 'bin/rollback.sh'), [goodId]);
     assert.equal(forward.code, 0, forward.err);
     assert.equal(currentId(farm), goodId);
     assert.notEqual(run(farm, path.join(farm.repo, 'scripts/rollback.sh'), [goodId]).code, 0, 'already current');

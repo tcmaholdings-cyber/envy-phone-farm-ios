@@ -356,7 +356,7 @@ From the laptop, in a clean checkout of the tag or branch to run:
 
 ```sh
 scripts/deploy-remote.sh <user>@<host>       # build, copy, migrate the DB, flip, restart, health-check
-~/phone-farm/current/scripts/rollback.sh     # on the host: back to the previous release
+~/phone-farm/bin/rollback.sh     # on the host: back to the previous release
 ```
 
 [deploy.md](deploy.md) covers what each step does, the automatic rollback, and

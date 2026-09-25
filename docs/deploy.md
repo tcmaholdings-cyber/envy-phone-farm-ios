@@ -25,6 +25,8 @@ the host with `rsync`.
     logs/                                agent logs and deploy.log (every deploy and rollback)
     backups/
   incoming/                              uploaded tarballs (the newest 5 are kept)
+  bin/                                   deploy.sh, rollback.sh: copies from the newest deployed release,
+                                         usable whatever current points at
   .history                               release ids in the order they went live
   .env, devices.json, .wda, logs, ...    compatibility links into shared/ (made by the migration)
 ```
@@ -80,7 +82,7 @@ deploy logic always matches the release. Options it does not know are passed to
 `deploy.sh`. On the host directly:
 
 ```sh
-~/phone-farm/current/scripts/deploy.sh ~/phone-farm/incoming/phone-farm-v1.4.0.tgz
+~/phone-farm/bin/deploy.sh ~/phone-farm/incoming/phone-farm-v1.4.0.tgz
 ```
 
 What `deploy.sh` does, in order (it holds a lock, and every step is safe to
@@ -142,9 +144,9 @@ shape (expand, then contract). The same rule already holds for task versions
 ## Rolling back
 
 ```sh
-~/phone-farm/current/scripts/rollback.sh --list     # releases on disk, * = live
-~/phone-farm/current/scripts/rollback.sh            # the release that was live before this one
-~/phone-farm/current/scripts/rollback.sh 0f9e8d7c6b5a
+~/phone-farm/bin/rollback.sh --list     # releases on disk, * = live
+~/phone-farm/bin/rollback.sh            # the release that was live before this one
+~/phone-farm/bin/rollback.sh 0f9e8d7c6b5a
 ```
 
 It re-points `current`, rewrites `RELEASED` with `rolledBackFrom`, restarts web

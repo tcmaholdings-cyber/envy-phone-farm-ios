@@ -191,6 +191,7 @@ fi
 
 if [ "$OK" = 1 ]; then
     log "release $RELEASE_ID is live"
+    install_tools "$DIR/scripts"
     prune_releases
     if [ -d "$ROOT/incoming" ]; then
         # shellcheck disable=SC2012

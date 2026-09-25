@@ -39,6 +39,7 @@
 #   --skip-db-backup   do not attempt pg_dump
 set -euo pipefail
 SCRIPT_NAME=migrate
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=lib/release-common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/release-common.sh"
 
@@ -58,7 +59,7 @@ done
 JOURNAL="$ROOT/.migrating"
 BACKUP_ROOT=${PHONE_FARM_BACKUP_DIR:-$HOME/phone-farm-backups}
 # Entries of the root that are layout, not checkout content.
-LAYOUT=(shared releases current incoming .migrating .history .deploy.lock .current.tmp)
+LAYOUT=(shared releases current incoming bin .migrating .history .deploy.lock .current.tmp)
 
 run () { if [ "$DRY" = 1 ]; then echo "  would: $*" >&2; else "$@"; fi; }
 is_layout () { local e; for e in "${LAYOUT[@]}"; do [ "$1" = "$e" ] && return 0; done; return 1; }
@@ -200,6 +201,9 @@ write_released "$ID"
 for item in "${SHARED_ITEMS[@]}"; do
     [ -e "$ROOT/$item" ] || [ -L "$ROOT/$item" ] || ln -s "shared/$item" "$ROOT/$item"
 done
+# Run from inside the old checkout, this script moved with it into the release.
+[ -d "$SCRIPT_DIR" ] || SCRIPT_DIR="$RELEASE/scripts"
+install_tools "$SCRIPT_DIR"
 rm -f "$JOURNAL"
 log "layout ready: current -> releases/$ID"
 

@@ -260,6 +260,19 @@ activate () {
     wait_ready || return 1
 }
 
+# Copy deploy.sh, rollback.sh and this library to <root>/bin so they stay
+# usable whatever current points at (a rollback target may predate them).
+# install_tools <scripts-dir>
+install_tools () {
+    local src=$1 file
+    [ -f "$src/rollback.sh" ] && [ -f "$src/lib/release-common.sh" ] || return 0
+    mkdir -p "$ROOT/bin/lib"
+    for file in deploy.sh rollback.sh lib/release-common.sh; do
+        cp "$src/$file" "$ROOT/bin/$file.tmp" && mv -f "$ROOT/bin/$file.tmp" "$ROOT/bin/$file"
+    done
+    chmod +x "$ROOT/bin/deploy.sh" "$ROOT/bin/rollback.sh"
+}
+
 # Release ids some running node process still uses as its working directory.
 releases_in_use () {
     command -v lsof >/dev/null 2>&1 || return 0
