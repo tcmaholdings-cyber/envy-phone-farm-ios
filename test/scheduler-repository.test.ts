@@ -7,7 +7,7 @@ import type { DatabaseConnection } from '../src/database/client.js';
 import type { ExecutionRow } from '../src/database/schema.js';
 import { PluginRegistry } from '../src/registry.js';
 import {
-    jobExpirySeconds, MAX_JOB_EXPIRY_SECONDS, planMaterialization, SchedulerRepository, type DueScheduleRow,
+    errorSummary, jobExpirySeconds, MAX_JOB_EXPIRY_SECONDS, planMaterialization, SchedulerRepository, type DueScheduleRow,
 } from '../src/scheduler/repository.js';
 import { createTikTokPlugin } from '../src/tiktok-plugin.js';
 
@@ -104,4 +104,32 @@ test('retryExecution refuses an execution whose side effect was committed', asyn
     const repository = new SchedulerRepository(connection as unknown as DatabaseConnection, boss as unknown as PgBoss, plugins);
     assert.equal(await repository.retryExecution('x'), null);
     assert.equal(enqueued, false);
+});
+
+test('errorSummary logs the root cause, not drizzle\'s query text with its params', () => {
+    const wrapped = new Error('Failed query: insert ... params: @account,secret caption', { cause: new Error('duplicate key') });
+    assert.equal(errorSummary(wrapped), 'duplicate key');
+    assert.equal(errorSummary(new Error('plain')), 'plain');
+    assert.equal(errorSummary('text'), 'text');
+});
+
+test('materializeRow creates a missing device queue before sending the job', async () => {
+    const calls: string[] = [];
+    const chain = {
+        values: () => chain, onConflictDoNothing: () => chain, returning: async () => [{ id: 'execution-1' }],
+        set: () => chain, where: async () => undefined,
+    };
+    const tx = { insert: () => chain, update: () => chain };
+    const boss = {
+        getQueue: async (name: string) => { calls.push(`get ${name}`); return null; },
+        createQueue: async (name: string) => { calls.push(`create ${name}`); },
+        send: async (name: string) => { calls.push(`send ${name}`); return 'job-1'; },
+    };
+    class Exposed extends SchedulerRepository {
+        run(row: DueScheduleRow) { return this.materializeRow(tx as never, row, now); }
+    }
+    const repository = new Exposed({ db: {} } as unknown as DatabaseConnection, boss as unknown as PgBoss, plugins);
+    assert.equal(await repository.run(dueRow()), true);
+    assert.deepEqual(calls.map((call) => call.split(' ')[0]), ['get', 'create', 'send']);
+    assert.equal(new Set(calls.map((call) => call.split(' ')[1])).size, 1, 'same queue name throughout');
 });

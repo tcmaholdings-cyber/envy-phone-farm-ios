@@ -95,6 +95,12 @@ export type StartAttemptResult =
 
 type Transaction = Parameters<Parameters<DatabaseConnection['db']['transaction']>[0]>[0];
 
+/** The root cause's message only — drizzle wraps it in "Failed query … params: …". */
+export function errorSummary(error: unknown): string {
+    if (!(error instanceof Error)) return String(error);
+    return error.cause instanceof Error ? error.cause.message : error.message;
+}
+
 function taskEnvelope(row: Pick<ScheduleRow, 'pluginId' | 'taskType' | 'taskVersion' | 'payload'>): TaskEnvelope {
     return { pluginId: row.pluginId, taskType: row.taskType, taskVersion: row.taskVersion, payload: row.payload };
 }
@@ -281,7 +287,9 @@ export class SchedulerRepository {
                 try {
                     if (await tx.transaction((savepoint) => this.materializeRow(savepoint, row, now))) count++;
                 } catch (error) {
-                    console.error(`Could not queue schedule ${row.id}:`, error);
+                    // Not the error object: drizzle's message embeds the query
+                    // params, which carry the task payload (account, caption).
+                    console.error(`Could not queue schedule ${row.id}: ${errorSummary(error)}`);
                 }
             }
         });
@@ -309,7 +317,10 @@ export class SchedulerRepository {
         }).where(eq(schedules.id, row.id));
         if (!execution || plan.kind === 'skip') return false;
         const policy = plan.definition.retryPolicy(row.payload);
-        const queueJobId = await this.boss.send(queueNameForDevice(row.device_udid), { executionId: execution.id }, {
+        // A pgboss schema restored without its queues would otherwise leave the
+        // schedule due forever; creating the queue is idempotent.
+        const queue = await ensureDeviceQueue(this.boss, row.device_udid);
+        const queueJobId = await this.boss.send(queue, { executionId: execution.id }, {
             db: fromDrizzle(tx, sql), retryLimit: policy.retryLimit,
             retryDelay: policy.retryDelaySeconds, retryBackoff: policy.retryBackoff,
             expireInSeconds: plan.expireInSeconds,
