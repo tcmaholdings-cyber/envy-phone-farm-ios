@@ -3,7 +3,7 @@ import formbody from '@fastify/formbody';
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import crypto from 'node:crypto';
-import { mkdir, open, readFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -36,8 +36,8 @@ import { brandHtml, brandingFromEnv, footerHtml, logoContentType, type Branding 
 import type { AuthenticatedUser, AuthProvider, PluginNavLink } from '../plugin.js';
 import type { PluginRegistry } from '../registry.js';
 import type { CreateTaskInput, JsonObject, ScheduleTiming } from '../types.js';
-import { DEFAULT_TENANT_ID } from '../tenancy.js';
-import { ScheduleTransitionError, type SchedulerRepository } from '../scheduler/repository.js';
+import { DEFAULT_TENANT_ID, maxUploadBytes } from '../tenancy.js';
+import { ScheduleTransitionError, UploadQuotaError, type SchedulerRepository } from '../scheduler/repository.js';
 import { PROMETHEUS_CONTENT_TYPE, renderMetrics } from '../observability/metrics.js';
 import { checkReadiness, createDefaultProbes, type ObservabilityProbes } from '../observability/probes.js';
 import { AgentClient, AgentRequestError, FleetRemoteControl } from '../agent/client.js';
@@ -259,7 +259,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
     });
     await app.register(formbody);
     await app.register(cookie);
-    await app.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 * 1024, files: 20 } });
+    // One uploaded file: PHONE_FARM_MAX_UPLOAD_BYTES, default 200 MiB. A bigger
+    // file fails the request with 413; each tenant also has a total budget.
+    await app.register(multipart, { limits: { fileSize: maxUploadBytes(), files: 20 } });
 
     // Server-rendered HTML must never be cached — a stale page + fresh assets
     // (or vice versa) breaks the dashboard after a deploy.
@@ -1294,30 +1296,51 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         return execution ?? reply.code(409).send({ error: 'Execution is not retryable' });
     });
 
+    // Uploads belong to the uploader's tenant (platform staff name one with
+    // ?tenant=, default the default tenant) and count against its budget. The
+    // file on disk is named by a random UUID, never by what the browser sent.
     app.post('/api/assets', async (request, reply) => {
+        const access = accessOf(request);
+        const tenantId = access.platform ? tenantFilter(request) ?? DEFAULT_TENANT_ID : access.tenantId ?? '';
+        if (tenantService && !(await tenantService.store.tenantById(tenantId))) return reply.code(404).send({ error: 'Organisation not found' });
+        const { usedBytes, budgetBytes } = await options.scheduler.uploadUsage(tenantId);
+        let remaining = budgetBytes - usedBytes;
         const dataRoot = path.resolve(process.env.SCHEDULER_DATA_DIR ?? '.scheduler-data');
         const uploadDirectory = path.join(dataRoot, 'uploads');
         await mkdir(uploadDirectory, { recursive: true });
         const created: Array<{ relativePath: string; originalName: string; mimeType: string; size: number; sha256: string }> = [];
-        for await (const part of request.files()) {
-            const id = crypto.randomUUID();
-            const relativePath = path.join('uploads', id);
-            const handle = await open(path.join(dataRoot, relativePath), 'wx', 0o600);
-            const hash = crypto.createHash('sha256');
-            let size = 0;
-            try {
-                for await (const chunk of part.file) {
-                    const buffer = Buffer.from(chunk);
-                    size += buffer.length;
-                    hash.update(buffer);
-                    await handle.write(buffer);
+        const written: string[] = [];
+        try {
+            for await (const part of request.files()) {
+                const relativePath = path.join('uploads', crypto.randomUUID());
+                const file = path.join(dataRoot, relativePath);
+                const handle = await open(file, 'wx', 0o600);
+                written.push(file);
+                const hash = crypto.createHash('sha256');
+                let size = 0;
+                try {
+                    // A file over the per-file cap makes this loop throw (413); one
+                    // that would overrun the tenant's budget stops it here.
+                    for await (const chunk of part.file) {
+                        const buffer = Buffer.from(chunk);
+                        size += buffer.length;
+                        if (size > remaining) throw new UploadQuotaError(budgetBytes);
+                        hash.update(buffer);
+                        await handle.write(buffer);
+                    }
+                } finally {
+                    await handle.close();
                 }
-            } finally {
-                await handle.close();
+                remaining -= size;
+                created.push({ relativePath, originalName: path.basename(part.filename || 'upload').slice(0, 255), mimeType: part.mimetype, size, sha256: hash.digest('hex') });
             }
-            created.push({ relativePath, originalName: part.filename, mimeType: part.mimetype, size, sha256: hash.digest('hex') });
+            const uploadedBy = requestUsers.get(request)?.id ?? null;
+            return reply.code(201).send(await options.scheduler.registerAssets(created, { tenantId, uploadedBy }));
+        } catch (error) {
+            // Nothing half-uploaded stays on disk or counts against the budget.
+            await Promise.all(written.map((file) => rm(file, { force: true })));
+            throw error;
         }
-        return reply.code(201).send(await options.scheduler.registerAssets(created));
     });
     app.delete<{ Body: { assetIds?: unknown } }>('/api/assets', async (request, reply) => {
         const ids = request.body?.assetIds;
